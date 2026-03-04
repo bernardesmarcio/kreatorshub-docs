@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 5.51 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+)*
+*Versão 5.52 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+)*
 
 ---
 
@@ -458,6 +458,19 @@ No campo `lifecycle_stage`, adicionar `dormant` à lista de valores válidos: `n
 
 **Como o contact_state é atualizado:** Toda mutação deve: (1) atualizar `contact_state`, (2) registrar em `contact_events`, (3) inserir em `segment_eval_queue` com `fields_changed`. Sempre os três juntos, sempre em `BEGIN/COMMIT`. Nunca atualizar `contact_state` diretamente sem passar por essas funções.
 
+### Campos array — estado dos producers (Sprint 9)
+
+| Campo | Producer | Status |
+|---|---|---|
+| `bought_product_ids` | `process_purchase_analytics` + `linkProducts.ts` (recalcula array completo após link) | ✅ Ativo |
+| `tag_ids` | Triggers DB em `crm.customer_tags` + `crm.lead_tags` (after insert/delete) | ✅ Ativo |
+| `import_ids` | Backfill aplicado — 31.389 parties | ✅ Populado — producer tempo real pendente (D8) |
+| `responded_form_ids` | Backfill aplicado — 12 parties | ✅ Populado — producer tempo real pendente (D7) |
+| `journey_ids` | — | ❌ 0% populado — producer não existe (D9) |
+| `segment_ids` | `apply_segment_membership_diff` | ✅ Ativo |
+
+> **Regra permanente:** campo array vazio = segmento que usa esse campo retorna zero membros silenciosamente, sem erro. Antes de migrar qualquer condition para GIN, validar divergência = 0 contra a fonte normalizada.
+
 **Mapeamento evento → fields_changed:**
 
 | Evento | fields_changed | Priority |
@@ -873,6 +886,16 @@ Tentativa de solução via JSONB (`product_stats` em `contact_state`) descartada
 
 **Regra permanente:** campos de summary com cardinalidade alta (por produto, por campanha) vivem em tabelas dedicadas, nunca em JSONB. JSONB é para campos globais estáveis e de baixa dimensionalidade.
 
+### Lição 18 — Campo array vazio = segmento silenciosamente errado (Sprint 9)
+
+`bought_product_ids` tinha 32% dos contatos com produtos faltando. O evaluator usava subquery em `commerce.transactions` (lenta mas correta). Ao migrar para GIN, contagens colapsaram: `linkProducts.ts` atualizava `commerce.transactions` com `product_id` mas não propagava para `contact_state.bought_product_ids`. O campo ficava com 1 produto quando o contato tinha 4. O producer de `process_purchase_analytics` faz `array_append` incremental — funciona apenas para compras novas via webhook, não para retroativos.
+
+**Fix:** (1) `linkProducts.ts` recalcula array completo após UPDATE transactions, (2) backfill cross-tenant corrigiu 3.454 contatos, (3) validação divergência = 0 antes de reaplicar GIN.
+
+Rollback bem executado evitou semanas de contagens erradas em produção.
+
+**Regra permanente:** antes de migrar qualquer condition de subquery para GIN, rodar validação de divergência com EXPLAIN ANALYZE e comparação de contagens por segmento. Divergência > 0 = não migrar. O rollback é a decisão correta.
+
 ---
 
 ## 20. Bugs e Dívidas Pendentes — Sprint 7+
@@ -882,6 +905,10 @@ Tentativa de solução via JSONB (`product_stats` em `contact_state`) descartada
 | # | Item | Status |
 |---|---|---|
 | D5 | Migrar pipeline SendGrid para versão unificada | Pendente Sprint 10 |
+| D7 | Producer `responded_form_ids` em tempo real (hoje só backfill) | Pendente |
+| D8 | Producer `import_ids` em tempo real (hoje só backfill) | Pendente |
+| D9 | `journey_ids` em `contact_state` — producer não existe | Pendente |
+| D10 | `has_tag` GIN Phase 2 — bloqueado por product tags transitivas não estarem em `tag_ids` | Pendente |
 
 ### D5 — Migrar pipeline SendGrid para versão unificada
 
@@ -936,3 +963,27 @@ O evaluator opera em dois tiers para equilibrar performance e expressividade:
 - `workers/analytics/src/types/segmentCondition.ts` — interfaces: `ProductStatCondition`, `EmailEngagementCondition`, `CrmCondition`
 - `workers/analytics/src/segment-rules-evaluator.ts` — avaliação in-memory para crm e email_engagement
 - `workers/analytics/src/segment-sql-builder.ts` — SQL builder para product_stat via EXISTS + `inferEvaluationMode()`
+
+### Estado do evaluator (Sprint 9)
+
+| Condition | Implementação | Performance |
+|---|---|---|
+| `bought_product` / `not_bought_product` | GIN `bought_product_ids && ARRAY[]` | ✅ 530x — ativo desde Sprint 9 |
+| `has_tag` / `not_has_tag` | 4 subqueries (diretas + product tags transitivas) | Bloqueado — product tags não estão em `tag_ids` |
+| `responded_form` / `not_responded_form` | Subquery `lead_form_submissions` | Phase 2 — após producer tempo real |
+| `from_import` / `not_from_import` | Subquery `lead_import_history` | Phase 2 — após producer tempo real |
+| Campos RFM / lifecycle / scores | Colunas diretas via `v_segment_base` | Já O(1) |
+
+### Soft-delete — segments e forms (Sprint 9)
+
+- `analytics.segments`: coluna `deleted_at timestamptz` adicionada. Soft-delete via `UPDATE SET deleted_at = NOW(), is_active = false` — nunca DELETE físico
+- `forms.forms` e `smart_forms.forms`: `deleted_at timestamptz` adicionado
+- 7 RPCs corrigidas para filtrar `deleted_at IS NULL`
+- `segment-eval-worker` filtra `deleted_at IS NULL` no claim
+- `refreshSegments` filtra `deleted_at IS NULL`
+- Dropdowns de automações no builder filtram deletados + aviso visual quando segmento/form foi deletado
+
+### Jobs stuck — prevenção (Sprint 9)
+
+`analytics.cleanup_stale_segment_eval_jobs(interval)` — RPC criada. Libera jobs claimed há mais que o threshold (default 10min). Chamada a cada ~60s no `segment-eval-worker`. Configurável via `SEGMENT_EVAL_STALE_MINUTES`.
+
