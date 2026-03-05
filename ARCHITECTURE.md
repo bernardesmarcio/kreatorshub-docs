@@ -717,7 +717,37 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 
 ---
 
-## 24. Sprints Futuros
+## 24. Sprint 11 — Pendente
+
+### Performance: Loading Timeout Recorrente (escola-do-fluxo)
+
+**Status:** Identificado, não resolvido
+**Tenant:** `escola-do-fluxo` (`48ef8a5c-283b-4943-8552-53e8f8e92c3a`)
+**User:** `68d43ac4-f65c-479a-a7b9-84889424965c`
+**Sentry Issues:** JAVASCRIPT-REACT-22, 21, 1S
+
+**Problema:** Watchdog `LOADING_TIMEOUT` recorrente — 10 queries ficam penduradas por >10s em múltiplas rotas (`/admin/analytics`, `/contatos`, `/admin/clients/*`). Logs do Supabase mostram status codes 520 (internal error) e 525 (SSL handshake failed) em RPCs como `get_user_features`, `get_tenant_account`, `get_dashboard_data`, `get_pareto_analysis`, `transactions`.
+
+**Ocorrências registradas no Sentry:**
+- 04/03: `/admin/analytics` — 10 fetching, 520/525 nos logs Supabase
+- 03/03: `/contatos` — 10 fetching
+- 12-27/02: `/admin/clients/*` — 17 páginas diferentes, 7 fetching (issue 1S, 21 ocorrências)
+
+**Hipóteses a investigar:**
+1. Queries pesadas para este tenant (volume de dados grande?)
+2. Conexão de rede instável do usuário (520/525 = falha SSL/conexão)
+3. RPCs lentas que excedem timeout do PostgREST (~30s default)
+4. Concorrência de queries — 10 RPCs simultâneas saturando pool de conexões
+
+**Ações necessárias:**
+- [ ] Verificar tamanho dos dados do tenant (transações, contatos, contact_state)
+- [ ] Profiling das RPCs mais lentas (`get_dashboard_data`, `get_pareto_analysis`, `get_analytics_data`)
+- [ ] Considerar lazy loading / paginação na página de analytics
+- [ ] Avaliar se 10 queries simultâneas no mount é necessário ou pode ser sequencial/priorizado
+
+---
+
+## 25. Sprints Futuros
 
 **Sprint 17 — Personalização e cache**
 - Vercel KV para cache de edge (`contact_state` hot path)
