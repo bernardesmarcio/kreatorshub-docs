@@ -2,9 +2,11 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 5.52 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+)*
+*Versão 6.0 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+)*
 
 ---
+
+# PARTE A — ARQUITETURA DA PLATAFORMA
 
 ## 1. Princípios que nunca mudam
 
@@ -62,7 +64,7 @@ O que fazer com o que sabemos.
 - `analytics-worker` → inteligência e segmentação (segment-eval-loop, refreshRfm, computeClusters, computeLookalikes, refreshFeatures). `refreshRfm` escreve em `contact_state` (`customer_features` dropada em Sprint 8)
 - `journeys-worker` → execução de nós de automação (`WORKER_ONLY=true`)
 - `journey-scheduler` → enfileira checks periódicos (`IS_SCHEDULER=true`): `checkSegmentEntries`, `checkFormEntries`, `checkEventEntries` (apenas `trigger_type='purchase'`), `enqueueReadyWaits`
-- **`journeys-event-worker`** → fan-out push-based de eventos (NOVO — Sprint 6). Processa `event_processing_jobs` + `backfill_jobs`
+- **`journeys-event-worker`** → fan-out push-based de eventos. Processa `event_processing_jobs` + `backfill_jobs`
 - `eduzz-enrichment` → import histórico Eduzz (`ENABLED_HANDLERS=eduzz:enrich_sales,eduzz:enrich_invoice`)
 - `email-campaign-worker` → envio de emails (`prepareEmailBatch`, `sendEmailBatch`, `retrySoftBounce`)
 - `analytics-backfill-worker` → jobs de backfill e product linking isolados do pipeline crítico (`ENABLED_JOB_TYPES=link_products`)
@@ -176,14 +178,9 @@ journeys-worker worker mode → `claim_next_job` → `processJourneyNode.ts`
 
 ### 4.5 Trigger event_entry — Arquitetura Push-Based
 
-**Status:** ✅ Operacional — Sprint 6 (26/02)
+**Status:** ✅ Operacional
 
-**Problema com design anterior (polling):** O design original usava `check_event_entries` com polling a cada 60s e marcava eventos como `processed = true` globalmente. Isso criava dois problemas:
-
-1. Ledger mutável — jornada criada após o evento nunca o via, mesmo dentro de sua janela de tempo
-2. Re-scan repetitivo — a cada 60s re-lia todo o histórico desde `last_activated_at`
-
-**Princípios do novo design:**
+**Princípios do design:**
 - `journey_events` é ledger imutável — append-only, NUNCA marcar `processed = true`
 - Cada jornada define sua própria janela via `last_activated_at`
 - Dedup via UNIQUE em `journey_enrollments`, não via flag no evento
@@ -214,16 +211,6 @@ Evento ocorre
 
 **Backfill — decisão explícita na ativação:** Não é automático. O usuário escolhe ao ativar a jornada: apenas novos eventos (padrão) ou incluir histórico (desde quando?). A fronteira é `backfill_to = last_activated_at` — os dois workers nunca processam o mesmo evento. Rate limiting via `pg_try_advisory_lock` (máximo 1 backfill ativo por tenant). Cursor estável avança por `(created_at, id)` — nunca re-lê histórico completo.
 
-**Comparativo design antigo vs novo:**
-
-| Aspecto | Design antigo (polling) | Design novo (push) |
-|---|---|---|
-| Latência | ~60s | < 5s |
-| `journey_events` | Mutável (`processed = true`) | Ledger imutável |
-| Jornada criada depois | Não via eventos históricos | Via backfill explícito |
-| Carga no scheduler | Proporcional a jornadas × tenants | Zero polling para event_entry |
-| Histórico | Re-scan completo a cada 60s | Cursor avança, sem re-scan |
-
 **Shared util — `journeyMatcher.ts`:** `workers/journeys-event/src/shared/journeyMatcher.ts`
 Lógica de filtro de jornada compartilhada entre `processEventJob.ts` e `processBackfillJob.ts`.
 
@@ -231,14 +218,12 @@ Lógica de filtro de jornada compartilhada entre `processEventJob.ts` e `process
 - `resolveProductIds(tenantId, ctx)` → resolve IDs reais de `commerce.products` (com cache in-memory por batch)
 - `matchesJourneyFilters(conditions, ctx, resolvedIds)` → avalia filtros de produto, campanha e URL
 
-**Scheduler — check_event_entries desabilitado:** A função SQL `journeys.enqueue_journey_checks()` foi atualizada em Sprint 6 (26/02) para remover `'event_entry'` do loop. O handler `checkEventEntries.ts` permanece no código como **fallback emergencial** — nunca deve ser agendado salvo incidente no journeys-event-worker.
+**Scheduler — check_event_entries desabilitado:** A função SQL `journeys.enqueue_journey_checks()` remove `'event_entry'` do loop. O handler `checkEventEntries.ts` permanece no código como **fallback emergencial** — nunca deve ser agendado salvo incidente no journeys-event-worker.
 
-**ATENÇÃO — trigger_type no banco:** O valor correto salvo no banco é `'event_entry'` (não `'event'`). O frontend foi corrigido em Sprint 6 (26/02):
+**ATENÇÃO — trigger_type no banco:** O valor correto salvo no banco é `'event_entry'` (não `'event'`). Arquivos relevantes:
 - `src/types/journey.ts`: TriggerType inclui `'event_entry'`
 - `JourneyBuilder.tsx`: `detectTriggerFromNodes()` salva `trigger_type: 'event_entry'`
 - `NodeInspector.tsx`: `sourceType` usa `'event_entry'`
-
-As 3 jornadas existentes com `trigger_type='event'` foram migradas via UPDATE.
 
 ---
 
@@ -322,8 +307,6 @@ Uma única RPC executada dentro do loop de `process_transactions_batch`. Substit
 2. `INSERT contact_state ON CONFLICT DO UPDATE` — snapshot vivo
 3. `INSERT segment_eval_queue priority=1` — fila de segmentação
 4. `INSERT tenant_distribution ON CONFLICT` — marca tenant como stale
-
-**Benchmark medido:** 7.170ms → 1.174ms por job (-83%), P95 de 13s → 1.2s (-91%).
 
 ---
 
@@ -434,7 +417,7 @@ workers/journeys-event/src/
 | `expire-soft-bounce-suppressions` | `0 * * * *` | Expira bounces suaves |
 | `cleanup-old-analytics-jobs` | `0 4 * * *` | Limpa jobs antigos |
 | `create-contact-events-partition` | `0 2 25 * *` | Cria partição mensal |
-| `cleanup-event-processing-jobs` | `0 3 * * *` | DELETE success com > 7 dias (Sprint 7+) |
+| `cleanup-event-processing-jobs` | `0 3 * * *` | DELETE success com > 7 dias |
 | `rfm-rolling-refresh` | `0 * * * *` | Recalcula RFM de 1/24 dos tenants por hora via `MOD(HASHTEXT(tenant_id), 24)` — garante atualização em até 24h para tenants sem atividade |
 
 ---
@@ -458,14 +441,14 @@ No campo `lifecycle_stage`, adicionar `dormant` à lista de valores válidos: `n
 
 **Como o contact_state é atualizado:** Toda mutação deve: (1) atualizar `contact_state`, (2) registrar em `contact_events`, (3) inserir em `segment_eval_queue` com `fields_changed`. Sempre os três juntos, sempre em `BEGIN/COMMIT`. Nunca atualizar `contact_state` diretamente sem passar por essas funções.
 
-### Campos array — estado dos producers (Sprint 9)
+### Campos array — estado dos producers
 
 | Campo | Producer | Status |
 |---|---|---|
 | `bought_product_ids` | `process_purchase_analytics` + `linkProducts.ts` (recalcula array completo após link) | ✅ Ativo |
 | `tag_ids` | Triggers DB em `crm.customer_tags` + `crm.lead_tags` (after insert/delete) | ✅ Ativo |
-| `import_ids` | Backfill aplicado — 31.389 parties | ✅ Populado — producer tempo real pendente (D8) |
-| `responded_form_ids` | Backfill aplicado — 12 parties | ✅ Populado — producer tempo real pendente (D7) |
+| `import_ids` | Backfill aplicado — producer tempo real pendente (D8) | ✅ Populado |
+| `responded_form_ids` | Backfill aplicado — producer tempo real pendente (D7) | ✅ Populado |
 | `journey_ids` | — | ❌ 0% populado — producer não existe (D9) |
 | `segment_ids` | `apply_segment_membership_diff` | ✅ Ativo |
 
@@ -489,7 +472,7 @@ No campo `lifecycle_stage`, adicionar `dormant` à lista de valores válidos: `n
 
 O handler `executeCreateOpportunityNode` (em `processJourneyNode.ts`) cria ou atualiza oportunidades via automação.
 
-**Dedup:** busca oportunidade `status='open'` no mesmo `pipeline_id` pelo contato. Chave preferencial e única: `party_id`. Fallback `contact_email` removido em Sprint 7 — migração party-first completa.
+**Dedup:** busca oportunidade `status='open'` no mesmo `pipeline_id` pelo contato. Chave preferencial e única: `party_id`. Fallback `contact_email` removido — migração party-first completa.
 
 **Se encontrou:** calcula diff de campos → UPDATE oportunidade → INSERT em `crm.opportunity_stage_history` se etapa mudou → INSERT em `crm.opportunity_activities` → retorna `opportunity_updated`.
 
@@ -498,14 +481,14 @@ O handler `executeCreateOpportunityNode` (em `processJourneyNode.ts`) cria ou at
 **Regras da timeline (`crm.opportunity_activities`):**
 - Append-only — nunca fazer UPDATE
 - Idempotência via UNIQUE INDEX parcial em `(enrollment_id, node_id)` — reprocessamento não duplica
-- Backfill usa `source='system'` com `source_meta=null` para não colidir com INSERTs de jornada (54 oportunidades backfilladas em Sprint 6)
+- Backfill usa `source='system'` com `source_meta=null` para não colidir com INSERTs de jornada
 - Activity é obrigatória: se o INSERT falhar, o node falha inteiro e o journeys-worker faz retry — nunca usar `try/catch` isolado no INSERT de activity
 
 `email_opened` / `email_clicked` — emitidos por trigger AFTER INSERT em `email.email_events` (resolve party via `recipient_id → campaign_recipients → crm.parties`)
 
 `segment_entered` / `segment_exited` — emitidos por `apply_segment_membership_diff` a cada mudança de membership
 
-`crm.opportunities.party_id` é NOT NULL enforçado desde Sprint 8 — oportunidade sem contato é violação do modelo party-first. Trigger `crm.sync_opportunity_summary` (AFTER INSERT/UPDATE(status,party_id)/DELETE) mantém `has_open_opportunity` e `open_opportunity_count` em `contact_state` sincronizados em tempo real.
+`crm.opportunities.party_id` é NOT NULL enforçado — oportunidade sem contato é violação do modelo party-first. Trigger `crm.sync_opportunity_summary` (AFTER INSERT/UPDATE(status,party_id)/DELETE) mantém `has_open_opportunity` e `open_opportunity_count` em `contact_state` sincronizados em tempo real.
 
 ---
 
@@ -562,47 +545,7 @@ Adicionar um provider novo é criar **1 arquivo de mapper**. Zero mudança no ba
 
 ---
 
-## 16. Roadmap de Sprints
-
-### Sprint 9 — pendência de segmentação
-
-- Conectar `trg_record_email_engagement` para atualizar `last_email_opened_at` / `last_email_clicked_at` em `contact_state` (trigger do Sprint 7 só escreve em `contact_events` — falta o UPDATE em `contact_state`)
-- UI: novos blocos de condição no segment builder (product picker, time window, CRM condition)
-
-### Sprint 10
-
-- [ ] `DROP TABLE analytics.segment_customers` (período de segurança cumprido)
-- [ ] D6 Fase 3 — `DROP COLUMN customer_id` (tabelas restantes) + 7 FKs + recriar 4 views
-- [ ] D5 — Migrar pipeline SendGrid para versão unificada (ver seção 20)
-- [ ] `refresh_tenant_distribution` + tela de monitoramento
-
-### Sprint 17 — Personalização e cache
-
-- [ ] Vercel KV para cache de edge (`contact_state` hot path)
-- [ ] Identity resolution em checkout e formulários
-- [ ] `visitor_sessions` conectado ao frontend
-
-### Sprint 18 — Dashboard Piloto Automático
-
-- [ ] API de oportunidades de receita
-- [ ] Cards de revenue em risco
-- [ ] Attribution dashboard
-- [ ] Product ladder visualization
-
-### Sprint 19+ — ML Real
-
-- [ ] Implementar schema `cluster_runs` / `cluster_definitions` / `cluster_members` / `cluster_segments`
-- [ ] Adicionar `source_run_id` indexável em `segment_parties`
-- [ ] `computeClusters.ts` — K-means k=5 lendo `contact_state`, chamando `apply_cluster_membership`
-- [ ] UI de renomear label de cluster (`label_overridden_at`)
-- [ ] Fase 2: features comportamentais (`avg_order_value`, `email_open_rate_30d`)
-- [ ] Fase 3: HDBSCAN/GMM via microserviço Python
-- [ ] Lookalike por embeddings
-- [ ] A/B testing com bandit algorithm
-
----
-
-## 17. Deploy no Railway — Configuração por Service
+## 16. Deploy no Railway — Configuração por Service
 
 Todos os services usam build context = raiz do repo. Cada service define seu Dockerfile via env var `RAILWAY_DOCKERFILE_PATH`.
 
@@ -610,7 +553,7 @@ Todos os services usam build context = raiz do repo. Cada service define seu Doc
 
 ---
 
-## 18. Observabilidade — O que monitorar
+## 17. Observabilidade — O que monitorar
 
 ### Filas e saúde do sistema
 
@@ -649,282 +592,9 @@ Ver `workers/journeys-event/src/monitoring.sql` para queries completas:
 
 ---
 
-## 19. Incidentes e Lições Aprendidas
+# PARTE B — SEGMENTAÇÃO & RULE ENGINE
 
-Esta seção registra conhecimento arquitetural extraído de incidentes reais. Não é um log operacional — é o que o sistema aprendeu e nunca deve esquecer.
-
----
-
-### Lição 1 — Dedup cross-source (Incidente Eduzz, Fev 2026)
-
-O índice de idempotência é `UNIQUE ON (tenant_id, source_name, external_transaction_id)`. `source_name` faz parte da chave **intencionalmente** — permite rastrear múltiplas fontes do mesmo dado (ex: webhook + import histórico).
-
-**Consequência obrigatória:** o enqueue de qualquer provider DEVE verificar todas as fontes antes de criar jobs, sem filtrar por `source_name`. Se o enqueue filtrar só a própria fonte, re-importações criam duplicatas que passam pela constraint sem serem detectadas.
-
-A proteção depende de todos os pipelines do mesmo provider usarem o mesmo `source_name` canônico. Documentado e auditado em Sprint 6 — zero duplicatas em 35.312 transações.
-
----
-
-### Lição 2 — Amount: sempre bruto, nunca líquido
-
-Mappers devem usar explicitamente o campo de valor bruto do provider. Nunca usar valor líquido (após taxas) como `amount`. Para providers com moeda estrangeira, converter para BRL usando cotação disponível no payload, com fallback para 1.
-
----
-
-### Lição 3 — Controle de idempotência do enqueue
-
-O controle de "já foi processado?" deve usar a **tabela de destino** (`commerce.transactions`), nunca um campo de status na tabela raw.
-
-**Errado:** `WHERE processing_status = 'pending'` em `doare.donations` — dessincroniza quando o worker não faz callback, cria dependência de estado na tabela raw.
-
-**Correto:** `NOT EXISTS (SELECT 1 FROM commerce.transactions WHERE ...)` — a fonte de verdade é o destino, idempotência garantida pela constraint UNIQUE.
-
-`doare.donations.processing_status` foi deprecated em Fev 2026. Coluna não existia no DB no momento da auditoria (Sprint 8) — type stale removido de `workers/ingestion/src/types.ts`.
-
----
-
-### Lição 4 — Edge Functions: responsabilidade única
-
-Edge Functions que crescem sem limite viram gargalo de manutenção e deploy. Solução aplicada no Sprint 6 (25/02): `integrations-worker` (5 providers) → 4 Edge Functions dedicadas.
-
-**Regra permanente:** um provider = uma Edge Function. Deploy de um provider não arrisca os outros.
-
----
-
-### Lição 5 — raw_source é opcional quando existe schema raw dedicado
-
-| Provider | Rastreabilidade raw |
-|---|---|
-| doare | `doare.donations` via `external_transaction_id = doare_id` |
-| eduzz | `eduzz.invoices` via `external_transaction_id = eduzz_invoice_id` |
-| Provider sem schema raw | `raw_source` obrigatório no payload do job |
-
----
-
-### Lição 6 — Validar o deploy, não só o código
-
-**Checklist obrigatório após qualquer mudança em Edge Function:**
-
-- [ ] `supabase functions deploy <nome>` executado
-- [ ] Versão confirmada no dashboard (deve ser > versão anterior)
-- [ ] Primeiro ciclo do cron/webhook validado nos logs
-- [ ] Resultado do job inclui o campo novo esperado
-
----
-
-### Lição 7 — Contrato de tipos frontend → banco deve ser explícito (Incidente event_entry, Fev 2026)
-
-O frontend salvava `trigger_type = 'event'` mas toda a infraestrutura push-based foi construída com `trigger_type = 'event_entry'`. A divergência ficou invisível porque não havia validação no INSERT de jornadas.
-
-**Consequência:** routing index, trigger GENERATED, `enqueue_journey_checks` — tudo estava correto mas nunca encontrava jornadas reais porque o valor no banco era diferente.
-
-**Resolução:** 3 arquivos TypeScript corrigidos + UPDATE nas 3 jornadas existentes + migration futura para adicionar CHECK constraint em `journeys.journeys(trigger_type)`.
-
-**Regra permanente:** qualquer valor de enum salvo no banco deve ter CHECK constraint correspondente. Tipos TypeScript e valores de banco devem ser auditados juntos em qualquer PR que crie novo `trigger_type`, `status`, ou campo categórico.
-
----
-
-### Lição 8 — Campos de controle de fluxo não pertencem ao settings_json (Incidente journeys-event-worker, Fev 2026)
-
-O worker tentou `SELECT allow_reentry FROM journeys.journeys` — coluna não existia, valor estava em `settings_json`. Isso causou 35 dead jobs.
-
-**Causa raiz dupla:** (1) schema real não foi verificado antes de escrever o SELECT; (2) campos de controle de fluxo foram enterrados em JSON sem type safety, sem NOT NULL, sem default garantido pelo banco.
-
-**Resolução:** `allow_reentry`, `force_reentry` e `enroll_existing` migrados para colunas `boolean NOT NULL DEFAULT false`. 9 arquivos atualizados. `settings_json` mantido apenas para configurações verdadeiramente opcionais e variáveis por tipo de jornada.
-
-**Regras permanentes:**
-- Antes de qualquer SELECT em tabela existente, confirmar schema real — nunca assumir que campos TypeScript têm colunas 1:1
-- Campos que controlam lógica de negócio (reentrada, elegibilidade, limites) devem ser colunas tipadas, nunca JSON
-- `settings_json` é para preferências de UI e metadados opcionais — nunca para flags de comportamento do worker
-
----
-
-### Lição 9 — Duas fontes de verdade para RFM (Sprint 6, 26/02)
-
-`v_segment_base` calculava RFM on-the-fly via `ntile(5)`, enquanto `refreshRfm` materializava em `customer_features`. UI e export divergiam.
-
-**Resolução:** `v_customer_rfm_base` e `v_customer_rfm_scores` dropadas, `v_segment_base` reescrita para ler de `contact_state`, `refreshRfm` sincroniza scores para `contact_state` após cada ciclo.
-
-**Regra permanente:** nenhuma view deve recalcular RFM em runtime — `contact_state` é o snapshot, workers são os únicos produtores.
-
----
-
-### Lição 10 — Migração party-first: cortar o modelo antigo, não adaptar (Sprint 7, 26/02)
-
-`crm.leads` existia como entidade com tabela própria. A tentativa de "consertar" o fluxo que passava por ela (`ensure_lead_for_party`, FK em opportunities, `segment_leads`) gerava patches em cima de modelo errado.
-
-**Resolução:** cortar os fluxos na raiz — sem adaptar, sem fallback temporário. Lead é role de um party (`crm.party_role_assignments`), não entidade separada.
-
-**Sequência executada:**
-1. FK `opportunities_lead_id_fkey` → removida
-2. `ContactSelector` → upsert direto em `crm.parties`, sem `createLead`
-3. `segment_leads` → dropada, substituída por `segment_parties` (`source='lead'`)
-4. 6 RPCs que referenciavam `segment_leads` → reescritas
-5. `crm.leads` → write protection enforced no banco → depois dropada
-6. 5 tabelas filhas (`lead_tags`, `lead_notes`, etc.) → `lead_id` nullable, queries migradas para `party_id`
-7. `ensure_lead_for_party` → removida de todos os callers ativos
-
-**Regra permanente:** quando um modelo de dados está errado, dropar é mais seguro que adaptar. Adaptar prolonga a coexistência de dois modelos e aumenta a superfície de bugs. CASCADE com auditoria prévia de dependências é o caminho.
-
----
-
-### Lição 11 — Migração de coluna em produção: dados primeiro, código depois, DROP por último (D6, Sprint 7, 26/02)
-
-A migração `customer_id → party_id` revelou que backfill de dados (100% `party_id` populado) e migração de código são etapas independentes e devem ser executadas separadamente. Tentar dropar colunas antes de migrar todo o código que as lê quebra produção.
-
-**Sequência correta:**
-1. Backfill dados — garantir cobertura 100% na coluna nova
-2. Migrar escritas — sistema para de popular coluna antiga
-3. Migrar leituras — functions, workers, frontend
-4. `DROP COLUMN` — só após período de segurança
-
-Efeito colateral positivo: ao parar de chamar `ensure_customer_for_party`, 11 parties que eram silenciosamente excluídas do RFM (sem row em `crm.customers`) passaram a ser incluídas.
-
-**Regra permanente:** nunca dropar coluna na mesma sessão em que migra o código. Período de segurança mínimo de 1 sprint entre Fase 2 (código) e Fase 3 (DROP).
-
----
-
-### Lição 12 — Trigger de role assignment deve manter invariante lead→customer (Sprint 7, 27/02)
-
-`assign_customer_role_on_paid_transaction` atribuía customer role mas não revogava o lead role. `upsert_party_person` fazia corretamente (step 4), mas o trigger não.
-
-**Efeito:** 1.750 parties com ambos os roles ativos. Dashboard mostrava 925 clientes em vez de 2.675 — diferença de 1.750 caindo na categoria "both" invisível para o card.
-
-**Causa:** dois caminhos de atribuição de role com comportamentos divergentes.
-
-**Resolução:** migration `fix_trigger_revoke_lead_on_customer_assignment` + backfill 1.751 lead roles revogados cross-tenant. `both=0` confirmado em todos os tenants.
-
-**Regra permanente:** qualquer função ou trigger que atribui um role superior deve revogar os roles inferiores da mesma hierarquia. Invariante: lead e customer são mutuamente exclusivos — customer sempre prevalece.
-
----
-
-### Lição 13 — RFM tem um único produtor (Sprint 7+)
-
-O sistema tinha 5 locais calculando RFM com regras divergentes: `get_customer_rfm()` recalculava NTILE on-the-fly sobre todos os clientes (sem regra dos 365 dias), `v_segment_base` + 4 RPCs replicavam o CASE de 365 dias independentemente. UI e export mostravam scores diferentes para o mesmo contato.
-
-**Regra dos 365 dias canônica:** ativos = `last_purchase_at >= NOW() - INTERVAL '365 days'`. NTILE calculado apenas entre ativos. Perdidos recebem `r_score=0`, `rfm_segment='Perdido'`.
-
-**Resolução:** `get_customer_rfm()` eliminada (lê direto de `contact_state`). `v_customer_rfm_base` e `v_customer_rfm_scores` dropadas. 4 RPCs migradas de `customer_features` → `contact_state`. 1.832 contatos com segmentos legacy ("Hibernating"/"Champions") corrigidos para "Perdido". Cron `rfm-rolling-refresh` adicionado para tenants sem atividade (spread de 1/24 por hora).
-
-**Regra permanente:** NTILE só existe em `refreshRfm.ts`. Todo consumidor lê `contact_state.rfm_segment` diretamente. Dois produtores de RFM = bug.
-
----
-
-### Lição 14 — Índices redundantes e dead tuples custam 18x em performance (Sprint 7+)
-
-`customer_features` tinha 12 índices para tabela de escrita intensiva — cada upsert atualizava 12 índices desnecessariamente. `contact_state` e `commerce.transactions` acumulavam milhares de dead tuples sem VACUUM adequado.
-
-**Otimizações:** VACUUM em `transactions` (5.977 dead tuples) e `contact_state` (6.535 dead tuples). Drop de 5 índices redundantes em `customer_features` e `legacy_party_map`. Novo índice composto em `legacy_party_map (tenant_id, legacy_type, legacy_id)`.
-
-**Resultados medidos:** `get_customer_ids_paginated` 208ms → 11ms (18x), disk reads -98%. `refreshRfm` fetch 229ms → 13ms (17.6x). `customer_features`: 12 → 7 índices.
-
-**Regra permanente:** auditar índices e dead tuples de tabelas quentes a cada sprint. Tabela com upserts constantes não deve ter mais índices do que queries distintas que a lêem.
-
----
-
-### Lição 15 — Clusters e Lookalikes: contrato output-table agnóstico ao algoritmo (Sprint 19+)
-
-Arquitetura planejada (não implementada). O produto precisa expor clusters como segmentos acionáveis em jornadas sem conhecer o algoritmo que os gerou.
-
-**Princípio central:** o algoritmo é plugável, o output é um contrato fixo.
-
-**Tabelas do contrato:**
-- `analytics.cluster_runs` — auditoria: qual algoritmo, quais features, qual versão, status
-- `analytics.cluster_definitions` — um registro por cluster: label (gerado pelo worker, editável pelo usuário), centróide, `label_overridden_at` (null = worker gerou, not null = usuário editou)
-- `analytics.cluster_members` — membros com score por `run_id` (semântica de score definida pelo run, nunca comparar entre runs)
-- `analytics.cluster_segments` — vínculo 1:1 `cluster_definition_id → segment_id` (unique constraint garante que um cluster nunca vira dois segmentos)
-
-**Guardrails não-negociáveis:**
-1. `segment_parties` deve ter coluna `source_run_id` indexável — necessário para DELETE seguro no replace (nunca filtrar por JSON)
-2. Ninguém fora do compute depende de `cluster_index` como identidade semântica — apenas `cluster_definition_id` e `segment_id` são estáveis
-3. `apply_cluster_membership` processa cluster por cluster (evita storm em tenants grandes)
-4. `features_version` é migração versionada (ex: `contact_state_v3`), não número mágico — permite rollback e comparação entre versões
-
-**Fluxo:**
-```
-contact_state (input)
-  → compute (K-means, HDBSCAN, etc.)
-  → cluster_members
-  → apply_cluster_membership(run_id)
-  → segment_parties
-  → segment_eval_queue
-  → jornadas
-```
-O publish dispara avaliação automática — sem confirmação manual.
-
-**Roadmap algoritmo:**
-- Fase 1: K-means k=5, features RFM 3D, semanal
-- Fase 2: +comportamento (`avg_order_value`, `email_open_rate_30d`, `distinct_products`)
-- Fase 3: HDBSCAN/GMM via microserviço Python
-- Fase 4: embeddings
-
----
-
-### Lição 16 — Membership e metadata de algoritmo são tabelas diferentes (Sprint 8, Mar 2026)
-
-`segment_customers` acumulava dois tipos de dado conceitualmente distintos: membership (quais parties pertencem a qual segmento) e metadata de algoritmo (score, tier, `explanation_json` para lookalikes).
-
-Tentar migrar `segment_customers` diretamente para `segment_parties` revelou o gap: `segment_parties` é tabela de membership pura, não tem colunas de score/tier.
-
-**Resolução correta:** separar por responsabilidade.
-- `segment_parties` = membership canônica para todas as fontes (cluster, lookalike, rule-based)
-- `customer_lookalike_scores` = metadata do algoritmo com `segment_id` (score, tier, explanation)
-
-O JOIN é feito on-demand por `get_lookalike_members()` quando o frontend precisa de ambos. `segment_customers` entrou em modo zero-write e será dropada no Sprint 10.
-
-**Regra permanente:** tabelas de membership não devem carregar metadata de algoritmo. Membership = pertence/não pertence. Score/tier = output do compute, vive na tabela do compute.
-
----
-
-### Lição 17 — Condições correlacionadas requerem tabelas de summary, não JSONB dinâmico
-
-O problema "primeira compra do produto X nos últimos 30 dias" não pode ser resolvido com AND de condições independentes contra `contact_state` — o filtro temporal e o filtro de produto precisam ser avaliados juntos contra o mesmo registro.
-
-Tentativa de solução via JSONB (`product_stats` em `contact_state`) descartada: GIN não resolve range queries em campos dinâmicos, evolução de schema é custosa, debug é difícil.
-
-**Solução correta:** tabela dedicada `contact_product_stats(tenant_id, party_id, product_id, first_purchase_at, ...)` com índices compostos reais. EXISTS na avaliação do segmento. O mesmo padrão se aplica a qualquer dimensão com alta cardinalidade (campanhas, afiliados, etc.).
-
-**Regra permanente:** campos de summary com cardinalidade alta (por produto, por campanha) vivem em tabelas dedicadas, nunca em JSONB. JSONB é para campos globais estáveis e de baixa dimensionalidade.
-
-### Lição 18 — Campo array vazio = segmento silenciosamente errado (Sprint 9)
-
-`bought_product_ids` tinha 32% dos contatos com produtos faltando. O evaluator usava subquery em `commerce.transactions` (lenta mas correta). Ao migrar para GIN, contagens colapsaram: `linkProducts.ts` atualizava `commerce.transactions` com `product_id` mas não propagava para `contact_state.bought_product_ids`. O campo ficava com 1 produto quando o contato tinha 4. O producer de `process_purchase_analytics` faz `array_append` incremental — funciona apenas para compras novas via webhook, não para retroativos.
-
-**Fix:** (1) `linkProducts.ts` recalcula array completo após UPDATE transactions, (2) backfill cross-tenant corrigiu 3.454 contatos, (3) validação divergência = 0 antes de reaplicar GIN.
-
-Rollback bem executado evitou semanas de contagens erradas em produção.
-
-**Regra permanente:** antes de migrar qualquer condition de subquery para GIN, rodar validação de divergência com EXPLAIN ANALYZE e comparação de contagens por segmento. Divergência > 0 = não migrar. O rollback é a decisão correta.
-
----
-
-## 20. Bugs e Dívidas Pendentes — Sprint 7+
-
-### Dívidas arquiteturais
-
-| # | Item | Status |
-|---|---|---|
-| D5 | Migrar pipeline SendGrid para versão unificada | Pendente Sprint 10 |
-| D7 | Producer `responded_form_ids` em tempo real (hoje só backfill) | Pendente |
-| D8 | Producer `import_ids` em tempo real (hoje só backfill) | Pendente |
-| D9 | `journey_ids` em `contact_state` — producer não existe | Pendente |
-| D10 | `has_tag` GIN Phase 2 — bloqueado por product tags transitivas não estarem em `tag_ids` | Pendente |
-
-### D5 — Migrar pipeline SendGrid para versão unificada
-
-**Pipeline atual** (`sendgrid-webhook`, ativo): escreve direto em `email.email_events` sem passar por `integrations.jobs`. Bugs conhecidos: 68 eventos `'blocked'` ignorados, soft bounce suprime no 1º bounce (51 emails suprimidos indevidamente), `spamreport` não registra em `unsubscribes`.
-
-**Handler v2** (`sendgrid.ts`, nunca ativado): tem soft bounce retry, threshold adaptativo, `ALLOWED_PREVIOUS`.
-
-**Quando resolver:**
-1. Criar pipeline unificado em `sendgrid-events/handlers/sendgrid.ts`
-2. Testar em staging com eventos reais
-3. Configurar webhook SendGrid para `/functions/v1/sendgrid-events`
-4. Desativar `sendgrid-webhook` após validação
-
----
-
-## 21. Rule Engine v2 — Segmentação Escalável
+## 18. Rule Engine v2 — Segmentação Escalável
 
 ### Arquitetura de condições — dois tiers
 
@@ -942,7 +612,6 @@ O evaluator opera em dois tiers para equilibrar performance e expressividade:
 - Chave: `(tenant_id, party_id, product_id)`
 - Campos: `first_purchase_at`, `last_purchase_at`, `purchase_count`, `total_spent`
 - Populada por `process_purchase_analytics` a cada compra paid
-- Backfill histórico executado: 21.299 registros, 15.489 contatos, desde 2021
 
 ### evaluation_mode em `analytics.segments`
 
@@ -964,17 +633,19 @@ O evaluator opera em dois tiers para equilibrar performance e expressividade:
 - `workers/analytics/src/segment-rules-evaluator.ts` — avaliação in-memory para crm e email_engagement
 - `workers/analytics/src/segment-sql-builder.ts` — SQL builder para product_stat via EXISTS + `inferEvaluationMode()`
 
-### Estado do evaluator (Sprint 9)
+### Estado do evaluator
 
 | Condition | Implementação | Performance |
 |---|---|---|
-| `bought_product` / `not_bought_product` | GIN `bought_product_ids && ARRAY[]` | ✅ 530x — ativo desde Sprint 9 |
+| `bought_product` / `not_bought_product` | GIN `bought_product_ids && ARRAY[]` | ✅ 530x — ativo |
 | `has_tag` / `not_has_tag` | 4 subqueries (diretas + product tags transitivas) | Bloqueado — product tags não estão em `tag_ids` |
 | `responded_form` / `not_responded_form` | Subquery `lead_form_submissions` | Phase 2 — após producer tempo real |
 | `from_import` / `not_from_import` | Subquery `lead_import_history` | Phase 2 — após producer tempo real |
 | Campos RFM / lifecycle / scores | Colunas diretas via `v_segment_base` | Já O(1) |
 
-### Soft-delete — segments e forms (Sprint 9)
+---
+
+## 19. Soft-delete — segments e forms
 
 - `analytics.segments`: coluna `deleted_at timestamptz` adicionada. Soft-delete via `UPDATE SET deleted_at = NOW(), is_active = false` — nunca DELETE físico
 - `forms.forms` e `smart_forms.forms`: `deleted_at timestamptz` adicionado
@@ -983,7 +654,83 @@ O evaluator opera em dois tiers para equilibrar performance e expressividade:
 - `refreshSegments` filtra `deleted_at IS NULL`
 - Dropdowns de automações no builder filtram deletados + aviso visual quando segmento/form foi deletado
 
-### Jobs stuck — prevenção (Sprint 9)
+---
+
+## 20. Jobs stuck — prevenção
 
 `analytics.cleanup_stale_segment_eval_jobs(interval)` — RPC criada. Libera jobs claimed há mais que o threshold (default 10min). Chamada a cada ~60s no `segment-eval-worker`. Configurável via `SEGMENT_EVAL_STALE_MINUTES`.
 
+---
+
+# PARTE C — REGRAS PERMANENTES
+
+## 21. Regras extraídas de incidentes
+
+Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o sistema aprendeu e nunca deve esquecer.
+
+| # | Regra | Origem |
+|---|-------|--------|
+| R1 | Enqueue deve verificar TODAS as fontes, sem filtrar por `source_name`. Um provider = um `source_name` canônico | Dedup cross-source |
+| R2 | Mappers usam valor bruto do provider, nunca líquido. Moeda estrangeira → BRL com cotação do payload | Amount |
+| R3 | Idempotência de enqueue usa tabela de destino (`commerce.transactions`), nunca campo de status na tabela raw | Enqueue |
+| R4 | Um provider = uma Edge Function. Deploy de um isolado do outro | Edge Functions |
+| R5 | `raw_source` é opcional quando provider tem schema raw dedicado. Obrigatório caso contrário | Rastreabilidade |
+| R6 | Após deploy de Edge Function: confirmar versão no dashboard + validar primeiro ciclo nos logs | Deploy |
+| R7 | Enum salvo no banco deve ter CHECK constraint. Tipos TS e valores DB auditados juntos em PRs | Contrato frontend→banco |
+| R8 | Campos de controle de fluxo (reentrada, elegibilidade) = colunas tipadas, nunca `settings_json` | JSON vs colunas |
+| R9 | Nenhuma view recalcula RFM em runtime. `contact_state` é o snapshot. NTILE só em `refreshRfm.ts` | RFM fonte única |
+| R10 | Modelo errado → dropar, não adaptar. Adaptar prolonga coexistência de dois modelos | Party-first |
+| R11 | Migração de coluna: (1) backfill dados (2) migrar escritas (3) migrar leituras (4) DROP após 1 sprint | DROP seguro |
+| R12 | Trigger que atribui role superior deve revogar roles inferiores. Lead e customer mutuamente exclusivos | Role hierarchy |
+| R13 | NTILE só em `refreshRfm.ts`. Dois produtores de RFM = bug. Regra 365d vive ali ONLY | RFM produtor único |
+| R14 | Tabelas quentes: auditar índices e dead tuples a cada sprint. Índices ≤ queries distintas | Performance |
+| R15 | Tabelas de membership não carregam metadata de algoritmo. Score/tier = tabela do compute | Membership vs metadata |
+| R16 | Condições correlacionadas (produto×tempo) → tabela de summary dedicada, nunca JSONB | Summary tables |
+| R17 | Campo array vazio = segmento silenciosamente errado. Validar divergência = 0 antes de migrar para GIN | Array producers |
+| R18 | Clusters: algoritmo plugável, output é contrato fixo. `segment_parties` com `source_run_id` indexável | Clusters/Lookalikes |
+
+---
+
+# PARTE D — ROADMAP & DÍVIDAS TÉCNICAS
+
+## 22. Dívidas Arquiteturais
+
+| # | Item | Status |
+|---|---|---|
+| D5 | Migrar pipeline SendGrid para versão unificada | Pendente Sprint 10 |
+| D7 | Producer `responded_form_ids` em tempo real (hoje só backfill) | Pendente |
+| D8 | Producer `import_ids` em tempo real (hoje só backfill) | Pendente |
+| D9 | `journey_ids` em `contact_state` — producer não existe | Pendente |
+| D10 | `has_tag` GIN Phase 2 — bloqueado por product tags transitivas não estarem em `tag_ids` | Pendente |
+| D11 | `refreshFeatures` cleanup de parties com customer role revogada — zerar `monetary`/`frequency` órfãos em `contact_state` | Pendente Sprint 10+ |
+
+---
+
+## 23. Sprint 10 — Pendente
+
+- [ ] `DROP TABLE analytics.segment_customers` (período de segurança cumprido)
+- [ ] D6 Fase 3 — `DROP COLUMN customer_id` (tabelas restantes) + 7 FKs + recriar 4 views
+- [ ] D5 — Migrar pipeline SendGrid para versão unificada
+- [ ] `refresh_tenant_distribution` + tela de monitoramento
+- [ ] Conectar `trg_record_email_engagement` para atualizar `last_email_opened_at` / `last_email_clicked_at` em `contact_state`
+- [ ] UI: novos blocos de condição no segment builder (product picker, time window, CRM condition)
+
+---
+
+## 24. Sprints Futuros
+
+**Sprint 17 — Personalização e cache**
+- Vercel KV para cache de edge (`contact_state` hot path)
+- Identity resolution em checkout e formulários
+- `visitor_sessions` conectado ao frontend
+
+**Sprint 18 — Dashboard Piloto Automático**
+- API de oportunidades de receita, cards de revenue em risco
+- Attribution dashboard, product ladder visualization
+
+**Sprint 19+ — ML Real**
+- Schema `cluster_runs` / `cluster_definitions` / `cluster_members` / `cluster_segments`
+- `source_run_id` indexável em `segment_parties`
+- `computeClusters.ts` — K-means k=5 lendo `contact_state`
+- UI de renomear label de cluster, features comportamentais
+- HDBSCAN/GMM via microserviço Python, lookalike por embeddings, A/B testing com bandit
