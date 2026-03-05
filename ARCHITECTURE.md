@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 6.0 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+)*
+*Versão 6.1 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+) ✅ Sympla integrado (Sprint 10)*
 
 ---
 
@@ -53,6 +53,7 @@ O que fazer com o que sabemos.
 - `apidozap` → webhook-driven | `apidozap:read_receipt`, `apidozap:process_message`
 - `nylas-sync` → webhook-driven | `nylas:sync_message` e sub-handlers
 - `eduzz-webhook` → webhook-driven | `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment`, `eduzz:enrich_invoice` (placeholder)
+- `sympla-sync` → cron-driven (sem webhooks nativos) | `sympla:sync_orders`, `sympla:sync_participants`
 - `sendgrid-webhook` → webhook-driven | pipeline ativo (escrita direta em `email.*`)
 - `webhooks-sendgrid` → receiver alternativo (inativo — pipeline v2 planejado, ver D5)
 - `integrations-worker` → órfão sem tráfego (desmembrado em Sprint 6)
@@ -420,6 +421,7 @@ workers/journeys-event/src/
 | `create-contact-events-partition` | `0 2 25 * *` | Cria partição mensal |
 | `cleanup-event-processing-jobs` | `0 3 * * *` | DELETE success com > 7 dias |
 | `rfm-rolling-refresh` | `0 * * * *` | Recalcula RFM de 1/24 dos tenants por hora via `MOD(HASHTEXT(tenant_id), 24)` — garante atualização em até 24h para tenants sem atividade |
+| `sympla-sync-daily` | `0 2 * * *` | Sync diário Sympla (02:00 UTC = 23:00 BRT) — orders + participants por janela de ciclo de vida |
 
 ---
 
@@ -531,6 +533,65 @@ Adicionar um provider novo é criar **1 arquivo de mapper**. Zero mudança no ba
 - ~~Modificar `commerce.process_transactions_batch`~~
 
 > `source_name` deve ser sempre o nome canônico do provider em lowercase — `'eduzz'`, `'doare'`, `'hotmart'`. Nunca usar variantes como `eduzz_import`, `eduzz_historical`, `eduzz_backfill`. Um provider = um `source_name` fixo para todos os pipelines (webhook, import histórico, reprocessamento). Variação de `source_name` no mesmo provider quebra o dedup cross-source.
+
+> **Provider pull-based — padrão Sympla:** Providers sem webhook nativo usam cron-driven sync via Edge Function. Credencial por tenant (`s_token`) armazenada em `integrations.accounts.config`. Hierarquia Tenant → Events → Orders → Participants. Sync de participants usa janela de ciclo de vida: futuro (enrich de contato), ativo (-1d a +3d, checkins em tempo real), encerrado recente (sync final, seta `checkin_synced = true`), arquivado (nunca re-fetch). Datas da API sem offset tratadas como `America/Sao_Paulo`, nunca UTC.
+
+---
+
+## 14.1 Provider Sympla — Detalhes de Implementação
+
+**Status:** ✅ Operacional (Sprint 10) — Fases 1–4 completas
+
+**Tipo:** Pull-based (sem webhooks nativos). Credencial `s_token` por tenant em `integrations.accounts.config`.
+
+**Hierarquia de dados:**
+
+```
+Tenant
+└── Events (GET /events)
+    └── Orders (GET /events/{id}/orders)          ← transações
+    └── Participants (GET /events/{id}/participants)  ← contatos + checkin
+```
+
+**Schema no banco:** `sympla.*`
+- `sympla.events` — cache de eventos com campos completos (host, category, address, `checkin_synced`)
+- `sympla.orders` — pedidos com invoice_info (CPF ~12%, address ~24%), UTM, user_agent
+- `sympla.participants` — participantes com phone extraído de `custom_form`, checkin, `checkin_event_emitted`
+- `sympla.sync_cursors` — cursor por evento para sync incremental
+
+**Cobertura de dados (tenant de referência):**
+
+| Campo | Cobertura | Origem |
+|---|---|---|
+| email | 100% | orders.buyer_email |
+| city/state | 23.5% | orders.invoice_info (só boleto/cartão com NF) |
+| CPF | 12.3% | orders.invoice_info (boleto 100%, PIX/cartão opcional) |
+| phone | 52.6% | participants.custom_form |
+| checkin | 31.5% | participants.checkin array |
+
+**Mapeamento de status:**
+
+| Status Sympla | Status normalizado |
+|---|---|
+| `A` | `paid` |
+| `P`, `NP` | `pending` |
+| `NA`, `C` | `cancelled` |
+| `R` | `refunded` |
+
+**Datas:** API retorna sem offset — tratar como `America/Sao_Paulo` — appender `-03:00` no parse, nunca `Z`.
+
+**Janela de sync de participants:**
+
+| Janela | Critério | Ação |
+|---|---|---|
+| Futuro | `start_date > hoje` | Fetch para enrich de contato |
+| Ativo | `-1d ≤ start_date ≤ +3d` | Fetch frequente — checkins em tempo real |
+| Encerrado recente | `+3d < start_date ≤ +7d` AND `checkin_synced = false` | Fetch final → `checkin_synced = true` |
+| Arquivado | `checkin_synced = true` | Nunca re-fetch |
+
+**Fases pendentes:**
+- Fase 5: checkin → `journeys.journey_events` (type `sympla_checkin`)
+- Fase 6: `contact_state.event_checkin_count` + `analytics.contact_checkin_stats`
 
 ---
 
@@ -689,6 +750,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R16 | Condições correlacionadas (produto×tempo) → tabela de summary dedicada, nunca JSONB | Summary tables |
 | R17 | Campo array vazio = segmento silenciosamente errado. Validar divergência = 0 antes de migrar para GIN | Array producers |
 | R18 | Clusters: algoritmo plugável, output é contrato fixo. `segment_parties` com `source_run_id` indexável | Clusters/Lookalikes |
+| R19 | Datas de providers brasileiros sem offset explícito = `America/Sao_Paulo` (UTC-3), nunca UTC. Appender `Z` causa erro de +3h em todos os timestamps. | Sympla timezone bug |
 
 ---
 
@@ -704,6 +766,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D9 | `journey_ids` em `contact_state` — producer não existe | Pendente |
 | D10 | `has_tag` GIN Phase 2 — bloqueado por product tags transitivas não estarem em `tag_ids` | Pendente |
 | D11 | `refreshFeatures` cleanup de parties com customer role revogada — zerar `monetary`/`frequency` órfãos em `contact_state` | Pendente Sprint 10+ |
+| D12 | Normalização de telefone (`phone_normalized` E.164) — `crm.party_person`, `sympla.participants`, todos os providers. Função utilitária compartilhada. Backfill + UI de indicador de cobertura. Campanhas WhatsApp filtram por `phone_normalized IS NOT NULL` | Pendente Sprint 11 |
 
 ---
 
@@ -715,10 +778,24 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 - [ ] `refresh_tenant_distribution` + tela de monitoramento
 - [ ] Conectar `trg_record_email_engagement` para atualizar `last_email_opened_at` / `last_email_clicked_at` em `contact_state`
 - [ ] UI: novos blocos de condição no segment builder (product picker, time window, CRM condition)
+- [ ] Sympla Fase 5: checkin → `journeys.journey_events` (type `sympla_checkin`)
+- [ ] Sympla Fase 6: `contact_state.event_checkin_count` + `analytics.contact_checkin_stats` (Tier 1.5)
 
 ---
 
 ## 24. Sprint 11 — Pendente
+
+### Sympla Integration v5
+
+**Tabela `sympla.participants`** criada com PK `(tenant_id, id)`, campos de ticket (`ticket_number`, `ticket_name`, `ticket_discount`), checkin (`checkin_at`, `checkin_synced`), e extração de `custom_form` (`phone`, `cpf`). Índices: order lookup, email lookup, checkin_pending (partial).
+
+**Edge Function `sympla-sync` v5** — mudanças em relação à v4:
+- **Timezone fix:** `parseSymplaDate` agora detecta offset no payload; datas sem offset recebem `-03:00` (BRT) em vez de `Z` (UTC). Fix retroativo: 775 `commerce.transactions` corrigidas (`paid_at + 3h`).
+- **Novas colunas:** events (17 cols: `reference_id`, `detail`, `host_*`, `category_*`, `address_*`, `checkin_synced`) e orders (5 cols: `presentation_id`, `address_*`, `user_agent`).
+- **Participants sync:** `syncParticipants()` com janela temporal — future (>-1d), active (-1d a +3d), recently-ended (+3d a +7d), archived (skip se `checkin_synced`). Extrai phone/CPF de `custom_form` via regex case-insensitive.
+- **Mapper:** `NormalizedTransaction.extra` inclui `city`, `state`, `presentation_id`.
+
+**pg_cron:** `sympla-sync-daily` às 02:00 UTC (23:00 BRT).
 
 ### Performance: Loading Timeout Recorrente (escola-do-fluxo)
 
