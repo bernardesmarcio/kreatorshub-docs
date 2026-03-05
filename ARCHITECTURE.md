@@ -290,10 +290,11 @@ RETURNS jsonb
 
 1. Para cada transação do batch, valida versão do contrato — versão desconhecida gera erro por item, batch continua
 2. Captura o status anterior da transação se ela já existir (para detectar transição real)
-3. Faz INSERT com `ON CONFLICT DO UPDATE` — transições unidirecionais: `paid` permanece `paid` exceto para `refunded`; qualquer outro status pode transicionar para `paid`
-4. `paid_at` é preenchido via `COALESCE` — nunca sobrescreve se já existia
-5. Se o status não mudou (`v_previous_status = v_status`) → skip, não roda analytics
-6. Analytics pipeline só roda na transição PARA `paid`: novo insert `paid`, ou mudança de `pending`/`cancelled` para `paid`
+3. **Role assignment condicional:** `paid` + `amount > 0` → `ARRAY['customer']`; caso contrário → `ARRAY['lead']`. Transações gratuitas (R$0) **nunca** atribuem role customer — contato permanece como lead.
+4. Faz INSERT com `ON CONFLICT DO UPDATE` — transições unidirecionais: `paid` permanece `paid` exceto para `refunded`; qualquer outro status pode transicionar para `paid`
+5. `paid_at` é preenchido via `COALESCE` — nunca sobrescreve se já existia
+6. Se o status não mudou (`v_previous_status = v_status`) → skip, não roda analytics
+7. Analytics pipeline só roda na transição PARA `paid`: novo insert `paid`, ou mudança de `pending`/`cancelled` para `paid`
 
 ---
 
