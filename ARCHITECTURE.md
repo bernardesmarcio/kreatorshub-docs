@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 6.1 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+) ✅ Sympla integrado (Sprint 10)*
+*Versão 6.4 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+) ✅ Sympla integrado (Sprint 10) ✅ Eduzz unificado em `integrations.accounts` (Sprint 14) ✅ Convenção de nomenclatura Edge Functions definida (Sprint 10)*
 
 ---
 
@@ -52,12 +52,25 @@ O que fazer com o que sabemos.
 - `doare-sync` → cron-driven | `doare:sync` + `enqueue_pending_donations`
 - `apidozap` → webhook-driven | `apidozap:read_receipt`, `apidozap:process_message`
 - `nylas-sync` → webhook-driven | `nylas:sync_message` e sub-handlers
-- `eduzz-webhook` → webhook-driven | `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment`, `eduzz:enrich_invoice` (placeholder)
+- `webhooks-eduzz` → receiver webhook-driven | salva raw + enfileira jobs (provider='eduzz-webhook') | **rename pendente → `eduzz-receiver-webhook`**
+- `eduzz-webhook` → processor job-driven | `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment`, `eduzz:ping` | **rename pendente → `eduzz-processor-worker`**
 - `sympla-sync` → cron-driven (sem webhooks nativos) | `sympla:sync_orders`, `sympla:sync_participants`
-- `sendgrid-webhook` → webhook-driven | pipeline ativo (escrita direta em `email.*`)
+- `sendgrid-webhook` → receiver webhook-driven | pipeline ativo (escrita direta em `email.*`) | **rename pendente → `sendgrid-receiver-webhook`**
 - `webhooks-sendgrid` → receiver alternativo (inativo — pipeline v2 planejado, ver D5)
 - `integrations-worker` → órfão sem tráfego (desmembrado em Sprint 6)
 - `[outros: oauth, utils]` → funções de suporte
+
+### Convenção de nomenclatura — Edge Functions
+
+| Padrão | Papel | Exemplo |
+|---|---|---|
+| `{provider}-receiver-webhook` | Recebe requisições HTTP externas do provider. URL pública registrada no painel do provider por tenant. Nunca processa — apenas salva raw e enfileira job. | `webhooks-eduzz` → rename para `eduzz-receiver-webhook` |
+| `{provider}-processor-worker` | Processa jobs da fila com `provider = '{provider}-processor-worker'`. Nunca exposto externamente. | `eduzz-webhook` → rename para `eduzz-processor-worker` |
+| `{provider}-oauth-callback` | Fluxo OAuth — troca code por token, salva credenciais, dispara import histórico. | `eduzz-oauth-callback` |
+| `{provider}-sync` | Sync cron-driven via pg_cron para providers sem webhook nativo. | `sympla-sync`, `doare-sync` |
+
+> **Regra:** o nome da função deve deixar claro o papel sem precisar abrir o código.
+> receiver = URL pública, processor = worker interno, sync = cron pull.
 
 **RAILWAY WORKERS** (processamento — Node.js, postgres.js, PgBouncer)
 
@@ -501,12 +514,11 @@ Adicionar um provider novo é criar **1 arquivo de mapper**. Zero mudança no ba
 
 **Edge Function:**
 
-- [ ] Criar Edge Function dedicada:
+- [ ] Criar Edge Functions seguindo convenção de nomenclatura (ver R22):
   ```
-  supabase/functions/<provider>/
-  ├── _core.ts          (copiar de qualquer Edge Function existente)
-  ├── handlers/<provider>.ts    (lógica do provider)
-  └── index.ts          (só registrar handlers do provider, claim com provider='<provider>')
+  supabase/functions/{provider}-receiver-webhook/   ← URL pública, recebe do provider
+  supabase/functions/{provider}-processor-worker/   ← worker interno, processa jobs
+  supabase/functions/{provider}-oauth-callback/     ← se provider usa OAuth
   ```
 - [ ] Criar `integrations.invoke_<provider>()` apontando para `/functions/v1/<provider>`
 - [ ] Adicionar ELSIF no `enqueue_webhook_job` (webhook) ou invoke no cron (pull)
@@ -752,6 +764,8 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R18 | Clusters: algoritmo plugável, output é contrato fixo. `segment_parties` com `source_run_id` indexável | Clusters/Lookalikes |
 | R19 | Datas de providers brasileiros sem offset explícito = `America/Sao_Paulo` (UTC-3), nunca UTC. Appender `Z` causa erro de +3h em todos os timestamps. | Sympla timezone bug |
 | R20 | Toda fila de trabalho com status terminal (`processed`, `success`, `completed`) precisa de TTL de purge definido na criação. Fila não é ledger — não acumula histórico. `segment_eval_queue` sem purge → 1.1M rows, 482MB, banco travado. | Queue bloat incident |
+| R21 | Primeiro provider não ganha schema próprio. Config de integração = `integrations.accounts` desde o dia 1. Schema dedicado só para dados raw do provider (`eduzz.invoices`, `eduzz.buyers`). `eduzz.integrations` legada causou workarounds `eduzzLegacy` no frontend e 7 RPCs duplicadas. | Eduzz legacy migration |
+| R22 | Edge Functions seguem convenção `{provider}-receiver-webhook` (URL pública) e `{provider}-processor-worker` (worker interno). Nomes ambíguos causam configuração de URL errada no provider e interrupção silenciosa de webhooks. | Rename eduzz Sprint 10 |
 
 ---
 
@@ -768,6 +782,8 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D10 | `has_tag` GIN Phase 2 — bloqueado por product tags transitivas não estarem em `tag_ids` | Pendente |
 | D11 | `refreshFeatures` cleanup de parties com customer role revogada — zerar `monetary`/`frequency` órfãos em `contact_state` | Pendente Sprint 10+ |
 | D12 | Normalização de telefone (`phone_normalized` E.164) — `crm.party_person`, `sympla.participants`, todos os providers. Função utilitária compartilhada. Backfill + UI de indicador de cobertura. Campanhas WhatsApp filtram por `phone_normalized IS NOT NULL` | Pendente Sprint 11 |
+| D13 | `DROP TABLE eduzz.integrations` — tabela legada. Toda leitura/escrita já migrada para `integrations.accounts` (Sprint 14). RPCs (`eduzz.*`, `public.eduzz_get_integration`, `public.get_integration_config`) já atualizadas. Tabela mantida como fallback; dropar após 30 dias sem incidente. | Pendente Sprint 15 |
+| D14 | Auditoria preventiva de TTL em todas as filas do sistema — após incidente de queue bloat em segment_eval_queue (1.1M rows, 482MB, banco travado). Verificar se todas as filas têm: (1) cron de purge para rows terminais, (2) índice parcial cobrindo status ativo, (3) NOT EXISTS filtrando apenas status ativos. Ver R20. | Pendente Sprint 11 |
 
 ---
 
@@ -823,10 +839,24 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 - [ ] Profiling das RPCs mais lentas (`get_dashboard_data`, `get_pareto_analysis`, `get_analytics_data`)
 - [ ] Considerar lazy loading / paginação na página de analytics
 - [ ] Avaliar se 10 queries simultâneas no mount é necessário ou pode ser sequencial/priorizado
+- [ ] D14 — Auditoria de TTL em todas as filas: inventariar todas as tabelas com coluna `status`, verificar acúmulo de rows terminais, criar crons de purge e índices parciais onde faltarem. Modelo de referência: correção aplicada em `segment_eval_queue` após incidente de queue bloat.
 
 ---
 
-## 25. Sprints Futuros
+## 25. Sprint 14 — Unificação `integrations.accounts`
+
+- [x] Migrar `eduzz.integrations` → `integrations.accounts` (colunas OAuth/sync/webhook genéricas)
+- [x] Copiar dados de 4 tenants via UPSERT (paridade 100%)
+- [x] Atualizar 7 RPCs (`eduzz.init_sync`, `eduzz.increment_sync_progress`, `eduzz.fail_sync`, `eduzz.reset_sync`, `public.eduzz_get_integration`, `public.eduzz_update_integration_stats`, `public.get_integration_config`)
+- [x] Edge Functions: `eduzz-oauth-callback` e `webhooks-eduzz` — removido fallback legado
+- [x] Worker `eduzz/supabase.ts`: `getEduzzIntegration`, `updateEduzzToken`, `invalidateEduzzToken` → `integrations.accounts`
+- [x] Frontend: `eduzzStorage.ts` CRUD migrado, `IntegrationHub.tsx` sem `eduzzLegacy`, `EduzzIntegrationTab.tsx` usa `status` em vez de `is_enabled`
+- [x] Tipo `EduzzIntegration` reflete `integrations.accounts` (com `config` JSONB, `status`, colunas OAuth)
+- [ ] D13: `DROP TABLE eduzz.integrations` — aguardar 30 dias sem incidente (Sprint 15)
+
+---
+
+## 26. Sprints Futuros
 
 **Sprint 17 — Personalização e cache**
 - Vercel KV para cache de edge (`contact_state` hot path)
