@@ -751,6 +751,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R17 | Campo array vazio = segmento silenciosamente errado. Validar divergência = 0 antes de migrar para GIN | Array producers |
 | R18 | Clusters: algoritmo plugável, output é contrato fixo. `segment_parties` com `source_run_id` indexável | Clusters/Lookalikes |
 | R19 | Datas de providers brasileiros sem offset explícito = `America/Sao_Paulo` (UTC-3), nunca UTC. Appender `Z` causa erro de +3h em todos os timestamps. | Sympla timezone bug |
+| R20 | Toda fila de trabalho com status terminal (`processed`, `success`, `completed`) precisa de TTL de purge definido na criação. Fila não é ledger — não acumula histórico. `segment_eval_queue` sem purge → 1.1M rows, 482MB, banco travado. | Queue bloat incident |
 
 ---
 
