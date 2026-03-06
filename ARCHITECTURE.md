@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 6.5 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+) ✅ Sympla integrado (Sprint 10) ✅ Eduzz unificado em `integrations.accounts` (Sprint 14) ✅ Edge Functions renomeadas + custom domain (Sprint 10) ✅ Integration Hub multi-provider (Sprint 10) ✅ claim_jobs com p_handlers no SQL (Sprint 10)*
+*Versão 6.6 — ✅ Eduzz OAuth app global ✅ webhook_verified_at ✅ TokenExpiredError ✅ core.kreatorshub.com.br slug ✅ import_sales_page Phase 2 ✅ Clusters/Lookalikes arquitetados (Sprint 19+)*
 
 ---
 
@@ -633,7 +633,37 @@ Tenant
 - `eduzz-processor-worker` — Worker interno, processa jobs da fila.
 - `eduzz-oauth-callback` — Fluxo OAuth, troca code por token, dispara import histórico.
 
-**Webhook URL:**
+**OAuth — app centralizado KreatorsHub:**
+- `client_id` e `client_secret` em env vars (`EDUZZ_CLIENT_ID`, `EDUZZ_CLIENT_SECRET`) — nunca por tenant
+- `access_token` de longa duração — API Eduzz não retorna `refresh_token` nem `expires_in`
+- Callback salva: `access_token`, `oauth_connected_at`, `oauth_user_id`
+- Import histórico disparado automaticamente no callback via `createHistoricalImportJobs()`
+
+**Webhook verification:**
+- Ping test: receiver responde 200 + grava `webhook_verified_at = now()`
+- Eventos reais: validação HMAC com Origin Key (`webhook_secret`)
+- UI faz polling a cada 5s enquanto `webhook_verified_at IS NULL` — badge muda para verde automaticamente
+
+**Token expirado — fluxo defensivo:**
+```
+Worker recebe 401
+  → tenta refresh (1x) → falha (sem refresh_token)
+  → invalidateEduzzToken(): access_token = null, oauth_connected_at = null
+  → throw TokenExpiredError
+  → blockJob('TOKEN_EXPIRED')
+  → UI detecta oauth_connected_at = null → banner "Conexão expirada — reconectar"
+```
+
+**Import histórico — Phase 2 (D12 implementado):**
+```
+eduzz:import_sales_page
+  Fase 1: fetch API → eduzz.buyers + eduzz.invoices (raw ledger)
+  Fase 2: paid invoices → NormalizedTransaction[]
+    → jobs commerce:process_batch (provider='ingestion', priority=8)
+    → ingestion-worker processa igual webhook
+```
+
+**Webhook URL (tenant-facing):**
 - Formato slug: `https://core.kreatorshub.com.br/functions/v1/eduzz-receiver-webhook/{tenant_slug}`
 - Formato legacy: `https://core.kreatorshub.com.br/functions/v1/eduzz-receiver-webhook?tenant_id={uuid}`
 
@@ -822,6 +852,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R24 | Webhook URLs usam domínio customizado (`core.kreatorshub.com.br`) com slug no path, nunca URL raw do Supabase. Slug é preferencial; `?tenant_id=uuid` é fallback. Receiver resolve slug → tenant_id via `core.tenants`. | Custom domain Sprint 10 |
 | R25 | Edge Function nunca é worker. Se precisa de poll loop, claim de jobs ou processar lógica pesada, é Railway worker. Sintomas de violação: Edge Function com `while(true)`, `claimJobs()`, múltiplas chamadas RPC em sequência, timeout > 10s, ou lógica que cresce com volume de dados. Qualquer um desses sinais = mover para Railway worker imediatamente. | Separação Edge vs Railway |
 | R26 | Webhook de provider deve criar jobs com `provider='ingestion'`. O ingestion-worker é o único consumidor de processamento downstream de webhooks. Edge Function dedicada por provider só existe para recepção e normalização O(1). | Webhook → ingestion pipeline |
+| R27 | OAuth providers usam app centralizado da plataforma, nunca app por tenant. Client credentials em env vars globais. Token por tenant salvo em `integrations.accounts.config`. Dependência de app OAuth por tenant = risco operacional: cliente revoga → todos os tenants perdem acesso. | Eduzz OAuth migration Sprint 10 |
 
 ---
 
@@ -840,6 +871,8 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D12 | Normalização de telefone (`phone_normalized` E.164) — `crm.party_person`, `sympla.participants`, todos os providers. Função utilitária compartilhada. Backfill + UI de indicador de cobertura. Campanhas WhatsApp filtram por `phone_normalized IS NOT NULL` | Pendente Sprint 11 |
 | D13 | `DROP TABLE eduzz.integrations` — tabela legada. Toda leitura/escrita já migrada para `integrations.accounts` (Sprint 14). RPCs (`eduzz.*`, `public.eduzz_get_integration`, `public.get_integration_config`) já atualizadas. Tabela mantida como fallback; dropar após 30 dias sem incidente. | Pendente Sprint 15 |
 | D14 | Auditoria preventiva de TTL em todas as filas do sistema — após incidente de queue bloat em segment_eval_queue (1.1M rows, 482MB, banco travado). Verificar se todas as filas têm: (1) cron de purge para rows terminais, (2) índice parcial cobrindo status ativo, (3) NOT EXISTS filtrando apenas status ativos. Ver R20. | Pendente Sprint 11 |
+| D15 | URL customizada `core.kreatorshub.com.br` — custom domain Supabase + slug no path do receiver. Backward compatible com `?tenant_id=uuid`. | ✅ Sprint 11 |
+| D16 | `import_sales_page` Phase 2 — raw → `NormalizedTransaction[]` → `commerce:process_batch`. Import histórico agora alimenta o mesmo pipeline do webhook. | ✅ Sprint 11 |
 
 ---
 
@@ -852,6 +885,10 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 - [x] Provider migration: 87 jobs e webhook_events migrados de `eduzz-webhook` → `eduzz-processor-worker`
 - [x] Integration Hub UI: `IntegrationHub.tsx` substitui `EduzzIntegrationTab` direto — grid multi-provider (Eduzz, Sympla, Hotmart em breve) com Sheet lateral por provider
 - [x] Sympla Integration UI: `SymplaIntegrationDialog.tsx` — setup com token, seleção de eventos, sync, stats
+- [x] Eduzz OAuth app global: `client_id`/`client_secret` em env vars, `access_token` por tenant em `integrations.accounts.config`
+- [x] Webhook verification: `webhook_verified_at` + ping test + UI polling automático
+- [x] TokenExpiredError: fluxo defensivo 401 → invalidate → blockJob → banner UI
+- [x] `import_sales_page` Phase 2: raw → NormalizedTransaction → commerce:process_batch (D16)
 
 **Pendente:**
 - [ ] `DROP TABLE analytics.segment_customers` (período de segurança cumprido)
