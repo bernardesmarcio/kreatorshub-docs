@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 6.4 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+) ✅ Sympla integrado (Sprint 10) ✅ Eduzz unificado em `integrations.accounts` (Sprint 14) ✅ Convenção de nomenclatura Edge Functions definida (Sprint 10)*
+*Versão 6.5 — ✅ RFM fonte única de verdade ✅ contact_state canonical ✅ Clusters/Lookalikes arquitetados (Sprint 19+) ✅ Sympla integrado (Sprint 10) ✅ Eduzz unificado em `integrations.accounts` (Sprint 14) ✅ Edge Functions renomeadas + custom domain (Sprint 10) ✅ Integration Hub multi-provider (Sprint 10) ✅ claim_jobs com p_handlers no SQL (Sprint 10)*
 
 ---
 
@@ -52,25 +52,39 @@ O que fazer com o que sabemos.
 - `doare-sync` → cron-driven | `doare:sync` + `enqueue_pending_donations`
 - `apidozap` → webhook-driven | `apidozap:read_receipt`, `apidozap:process_message`
 - `nylas-sync` → webhook-driven | `nylas:sync_message` e sub-handlers
-- `webhooks-eduzz` → receiver webhook-driven | salva raw + enfileira jobs (provider='eduzz-webhook') | **rename pendente → `eduzz-receiver-webhook`**
-- `eduzz-webhook` → processor job-driven | `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment`, `eduzz:ping` | **rename pendente → `eduzz-processor-worker`**
+- `eduzz-receiver-webhook` → receiver webhook-driven | salva raw em `integrations.webhook_events` + enfileira jobs (provider=`eduzz-processor-worker`) | URL pública: `core.kreatorshub.com.br/functions/v1/eduzz-receiver-webhook/{slug}` | aceita slug no path ou `?tenant_id=uuid` (legado)
+- `eduzz-processor-worker` → processor job-driven | `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment`, `eduzz:process_commission`, `eduzz:process_learning`, `eduzz:ping`
 - `sympla-sync` → cron-driven (sem webhooks nativos) | `sympla:sync_orders`, `sympla:sync_participants`
 - `sendgrid-webhook` → receiver webhook-driven | pipeline ativo (escrita direta em `email.*`) | **rename pendente → `sendgrid-receiver-webhook`**
 - `webhooks-sendgrid` → receiver alternativo (inativo — pipeline v2 planejado, ver D5)
 - `integrations-worker` → órfão sem tráfego (desmembrado em Sprint 6)
-- `[outros: oauth, utils]` → funções de suporte
+- `[outros: oauth, utils]` → funções de suporte (ex: `eduzz-oauth-callback`)
 
 ### Convenção de nomenclatura — Edge Functions
 
 | Padrão | Papel | Exemplo |
 |---|---|---|
-| `{provider}-receiver-webhook` | Recebe requisições HTTP externas do provider. URL pública registrada no painel do provider por tenant. Nunca processa — apenas salva raw e enfileira job. | `webhooks-eduzz` → rename para `eduzz-receiver-webhook` |
-| `{provider}-processor-worker` | Processa jobs da fila com `provider = '{provider}-processor-worker'`. Nunca exposto externamente. | `eduzz-webhook` → rename para `eduzz-processor-worker` |
+| `{provider}-receiver-webhook` | Recebe requisições HTTP externas do provider. URL pública registrada no painel do provider por tenant. Nunca processa — apenas salva raw e enfileira job. | `eduzz-receiver-webhook` ✅ |
+| `{provider}-processor-worker` | Processa jobs da fila com `provider = '{provider}-processor-worker'`. Nunca exposto externamente. | `eduzz-processor-worker` ✅ |
 | `{provider}-oauth-callback` | Fluxo OAuth — troca code por token, salva credenciais, dispara import histórico. | `eduzz-oauth-callback` |
 | `{provider}-sync` | Sync cron-driven via pg_cron para providers sem webhook nativo. | `sympla-sync`, `doare-sync` |
 
 > **Regra:** o nome da função deve deixar claro o papel sem precisar abrir o código.
 > receiver = URL pública, processor = worker interno, sync = cron pull.
+
+### Custom domain — Webhook URLs
+
+**Domínio:** `core.kreatorshub.com.br` (aponta para `pbfpwfkgjaqotbudihpy.supabase.co`)
+
+Todos os webhook URLs gerados pelo frontend usam o domínio customizado. Dois formatos aceitos:
+- **Slug (preferencial):** `https://core.kreatorshub.com.br/functions/v1/eduzz-receiver-webhook/{tenant_slug}`
+- **Legacy (fallback):** `https://core.kreatorshub.com.br/functions/v1/eduzz-receiver-webhook?tenant_id={uuid}`
+
+O receiver resolve o slug via `core.tenants.slug` → `tenant_id`. `getWebhookUrl()` em `eduzzStorage.ts` é async e faz lookup do slug.
+
+### claim_jobs — Filtro de handlers no SQL
+
+Workers passam `p_handlers text[]` direto na chamada RPC `claim_jobs`, evitando claim de jobs que serão descartados em application code. Parâmetro `p_handlers` já existia no RPC mas nenhum worker usava — corrigido em Sprint 10. Ver R23.
 
 **RAILWAY WORKERS** (processamento — Node.js, postgres.js, PgBouncer)
 
@@ -140,8 +154,9 @@ ingestion-worker → process_transactions_batch → commerce + analytics
 
 **Fluxo Eduzz especificamente:**
 ```
-Webhook Eduzz chega
-  → eduzz:process_invoice (Edge Function)
+Webhook Eduzz chega em core.kreatorshub.com.br/functions/v1/eduzz-receiver-webhook/{slug}
+  → eduzz-receiver-webhook: resolve slug → tenant_id, valida HMAC, salva raw, enfileira job
+  → eduzz-processor-worker: claim job → eduzz:process_invoice
   → [priority 1] monta NormalizedTransaction direto do payload
   → job commerce:process_batch
   → ingestion-worker → commerce.transactions
@@ -607,6 +622,43 @@ Tenant
 
 ---
 
+## 14.2 Provider Eduzz — Detalhes de Implementação
+
+**Status:** ✅ Operacional — Webhook-driven + OAuth + import histórico
+
+**Tipo:** Webhook-driven (real-time). Credenciais OAuth + webhook_secret em `integrations.accounts.config`.
+
+**Edge Functions:**
+- `eduzz-receiver-webhook` — URL pública, recebe webhooks da Eduzz. Valida HMAC (`x-eduzz-signature`), salva raw em `integrations.webhook_events`, enfileira job com `provider = 'eduzz-processor-worker'`.
+- `eduzz-processor-worker` — Worker interno, processa jobs da fila.
+- `eduzz-oauth-callback` — Fluxo OAuth, troca code por token, dispara import histórico.
+
+**Webhook URL:**
+- Formato slug: `https://core.kreatorshub.com.br/functions/v1/eduzz-receiver-webhook/{tenant_slug}`
+- Formato legacy: `https://core.kreatorshub.com.br/functions/v1/eduzz-receiver-webhook?tenant_id={uuid}`
+
+**Schema no banco:** `eduzz.*`
+- `eduzz.invoices` — invoices completas com dados de buyer, affiliates
+- `eduzz.buyers` — compradores com dados de contato
+- `eduzz.contracts` — contratos/assinaturas
+
+**Handlers:**
+
+| Event type | Handler |
+|---|---|
+| `myeduzz.invoice_*` (paid, opened, canceled, refunded, chargeback, etc.) | `eduzz:process_invoice` |
+| `myeduzz.contract_*` | `eduzz:process_contract` |
+| `sun.cart_abandonment` | `eduzz:process_cart_abandonment` |
+| `myeduzz.commission_processed` | `eduzz:process_commission` |
+| `nutror.*` (enrollment, lesson, module, certificate) | `eduzz:process_learning` |
+| `ping` | `eduzz:ping` |
+
+**Prioridades:** `invoice_paid` = 1, `refunded`/`chargeback` = 2, `cart_abandonment` = 3, default = 5.
+
+**Railway worker:** `eduzz-enrichment` — import histórico (`ENABLED_HANDLERS=eduzz:enrich_sales,eduzz:enrich_invoice`).
+
+---
+
 ## 15. Checklist para Novo Nó de Automação
 
 - [ ] Implementar handler em `workers/journeys/src/handlers/nodes/`
@@ -766,6 +818,10 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R20 | Toda fila de trabalho com status terminal (`processed`, `success`, `completed`) precisa de TTL de purge definido na criação. Fila não é ledger — não acumula histórico. `segment_eval_queue` sem purge → 1.1M rows, 482MB, banco travado. | Queue bloat incident |
 | R21 | Primeiro provider não ganha schema próprio. Config de integração = `integrations.accounts` desde o dia 1. Schema dedicado só para dados raw do provider (`eduzz.invoices`, `eduzz.buyers`). `eduzz.integrations` legada causou workarounds `eduzzLegacy` no frontend e 7 RPCs duplicadas. | Eduzz legacy migration |
 | R22 | Edge Functions seguem convenção `{provider}-receiver-webhook` (URL pública) e `{provider}-processor-worker` (worker interno). Nomes ambíguos causam configuração de URL errada no provider e interrupção silenciosa de webhooks. | Rename eduzz Sprint 10 |
+| R23 | Workers devem passar `p_handlers text[]` no RPC `claim_jobs` para filtrar no SQL, nunca em application code. Claim sem filtro trava jobs de outros handlers e gasta locks desnecessários. | claim_jobs Sprint 10 |
+| R24 | Webhook URLs usam domínio customizado (`core.kreatorshub.com.br`) com slug no path, nunca URL raw do Supabase. Slug é preferencial; `?tenant_id=uuid` é fallback. Receiver resolve slug → tenant_id via `core.tenants`. | Custom domain Sprint 10 |
+| R25 | Edge Function nunca é worker. Se precisa de poll loop, claim de jobs ou processar lógica pesada, é Railway worker. Sintomas de violação: Edge Function com `while(true)`, `claimJobs()`, múltiplas chamadas RPC em sequência, timeout > 10s, ou lógica que cresce com volume de dados. Qualquer um desses sinais = mover para Railway worker imediatamente. | Separação Edge vs Railway |
+| R26 | Webhook de provider deve criar jobs com `provider='ingestion'`. O ingestion-worker é o único consumidor de processamento downstream de webhooks. Edge Function dedicada por provider só existe para recepção e normalização O(1). | Webhook → ingestion pipeline |
 
 ---
 
@@ -787,8 +843,17 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 
 ---
 
-## 23. Sprint 10 — Pendente
+## 23. Sprint 10 — Parcialmente Concluído
 
+**Concluído:**
+- [x] Rename Edge Functions: `webhooks-eduzz` → `eduzz-receiver-webhook`, `eduzz-webhook` → `eduzz-processor-worker` (funções antigas deletadas do Supabase)
+- [x] Custom domain `core.kreatorshub.com.br` + webhook URLs com slug no path
+- [x] `claim_jobs` RPC: workers agora passam `p_handlers text[]` no SQL em vez de filtrar em app code
+- [x] Provider migration: 87 jobs e webhook_events migrados de `eduzz-webhook` → `eduzz-processor-worker`
+- [x] Integration Hub UI: `IntegrationHub.tsx` substitui `EduzzIntegrationTab` direto — grid multi-provider (Eduzz, Sympla, Hotmart em breve) com Sheet lateral por provider
+- [x] Sympla Integration UI: `SymplaIntegrationDialog.tsx` — setup com token, seleção de eventos, sync, stats
+
+**Pendente:**
 - [ ] `DROP TABLE analytics.segment_customers` (período de segurança cumprido)
 - [ ] D6 Fase 3 — `DROP COLUMN customer_id` (tabelas restantes) + 7 FKs + recriar 4 views
 - [ ] D5 — Migrar pipeline SendGrid para versão unificada
@@ -848,7 +913,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 - [x] Migrar `eduzz.integrations` → `integrations.accounts` (colunas OAuth/sync/webhook genéricas)
 - [x] Copiar dados de 4 tenants via UPSERT (paridade 100%)
 - [x] Atualizar 7 RPCs (`eduzz.init_sync`, `eduzz.increment_sync_progress`, `eduzz.fail_sync`, `eduzz.reset_sync`, `public.eduzz_get_integration`, `public.eduzz_update_integration_stats`, `public.get_integration_config`)
-- [x] Edge Functions: `eduzz-oauth-callback` e `webhooks-eduzz` — removido fallback legado
+- [x] Edge Functions: `eduzz-oauth-callback` e `eduzz-receiver-webhook` (ex-`webhooks-eduzz`) — removido fallback legado
 - [x] Worker `eduzz/supabase.ts`: `getEduzzIntegration`, `updateEduzzToken`, `invalidateEduzzToken` → `integrations.accounts`
 - [x] Frontend: `eduzzStorage.ts` CRUD migrado, `IntegrationHub.tsx` sem `eduzzLegacy`, `EduzzIntegrationTab.tsx` usa `status` em vez de `is_enabled`
 - [x] Tipo `EduzzIntegration` reflete `integrations.accounts` (com `config` JSONB, `status`, colunas OAuth)
