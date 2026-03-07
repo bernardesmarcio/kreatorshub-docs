@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 6.6 — ✅ 3 workers canônicos (ingestion/historical-sync/pull-sync) ✅ eduzz-processor-worker removido ✅ Eduzz OAuth app global ✅ webhook_verified_at ✅ historical-sync-worker (ex-eduzz-worker) ✅ sympla:historical_sync*
+*Versão 6.7 — Cleanup: sprints removidos, dívidas consolidadas (D5-D29), roadmap simplificado*
 
 ---
 
@@ -855,131 +855,48 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 
 ---
 
-# PARTE D — ROADMAP & DÍVIDAS TÉCNICAS
+# PARTE D — DÍVIDAS TÉCNICAS & ROADMAP
 
 ## 22. Dívidas Arquiteturais
 
-| # | Item | Status |
+| # | Item | Prioridade |
 |---|---|---|
-| D5 | Migrar pipeline SendGrid para versão unificada | Pendente Sprint 10 |
+| D5 | Migrar pipeline SendGrid para versão unificada | Pendente |
 | D7 | Producer `responded_form_ids` em tempo real (hoje só backfill) | Pendente |
 | D8 | Producer `import_ids` em tempo real (hoje só backfill) | Pendente |
 | D9 | `journey_ids` em `contact_state` — producer não existe | Pendente |
 | D10 | `has_tag` GIN Phase 2 — bloqueado por product tags transitivas não estarem em `tag_ids` | Pendente |
-| D11 | `refreshFeatures` cleanup de parties com customer role revogada — zerar `monetary`/`frequency` órfãos em `contact_state` | Pendente Sprint 10+ |
-| D12 | Normalização de telefone (`phone_normalized` E.164) — `crm.party_person`, `sympla.participants`, todos os providers. Função utilitária compartilhada. Backfill + UI de indicador de cobertura. Campanhas WhatsApp filtram por `phone_normalized IS NOT NULL` | Pendente Sprint 11 |
-| D13 | `DROP TABLE eduzz.integrations` — tabela legada. Toda leitura/escrita já migrada para `integrations.accounts` (Sprint 14). RPCs (`eduzz.*`, `public.eduzz_get_integration`, `public.get_integration_config`) já atualizadas. Tabela mantida como fallback; dropar após 30 dias sem incidente. | Pendente Sprint 15 |
-| D14 | Auditoria preventiva de TTL em todas as filas do sistema — após incidente de queue bloat em segment_eval_queue (1.1M rows, 482MB, banco travado). Verificar se todas as filas têm: (1) cron de purge para rows terminais, (2) índice parcial cobrindo status ativo, (3) NOT EXISTS filtrando apenas status ativos. Ver R20. | Pendente Sprint 11 |
-| D15 | URL customizada `core.kreatorshub.com.br` — custom domain Supabase + slug no path do receiver. Backward compatible com `?tenant_id=uuid`. | ✅ Sprint 11 |
-| D16 | `import_sales_page` Phase 2 — raw → `NormalizedTransaction[]` → `commerce:process_batch`. Import histórico agora alimenta o mesmo pipeline do webhook. | ✅ Sprint 11 |
-| D17 | Remover `eduzz-processor-worker` Edge Function — processamento migrado para `eduzz-receiver-webhook` (mapper inline) + `ingestion-worker`. Jobs agora usam `provider='ingestion'`. | ✅ Sprint 15 |
-| D18 | **Journey fanout não-atômico** — enrollment INSERT e `process_enrollment` job INSERT são statements separadas sem transação. Falha entre os dois cria enrollment `active` órfão que bloqueia re-entry e nunca progride. Comentário `sql.begin() não suportado` no código é **incorreto** — `postgres.js` suporta `sql.begin()` com PgBouncer transaction mode. **Fix:** (1) envolver ambos INSERTs em `sql.begin()` em `processEventJob.ts`, `processBackfillJob.ts` e `checkEventEntries.ts`; (2) criar sweeper pg_cron para enrollments órfãos (active há >5min sem processing_job correspondente); (3) remover comentários incorretos sobre sql.begin(). Ref: Principal Engineering Audit F1. | **P1** — Pendente |
-| D19 | **Observabilidade backend** — Sentry cobre apenas frontend React. Workers logam structured JSON mas sem aggregação, dashboards, alertas de queue lag, nem tracing distribuído. Se um worker parar silenciosamente, só descobre quando usuário reclama. **Fix:** (1) integrar Sentry nos Railway workers (Node.js SDK); (2) dashboard de filas: depth, drain rate, retry/dead rates, p95 latency por handler; (3) alertas: dead jobs > 0, queue depth crescendo, worker sem heartbeat >5min. Stack sugerida: Sentry para errors + Grafana/Supabase logs para métricas. Ref: Principal Engineering Audit F10. | **P2** — Pendente |
-| D20 | **Journeys batch claim** — `journeys.claim_next_job` retorna 1 job por vez. Overhead de 2 RPCs (claim + complete) por job limita throughput. O `analytics-worker` já tem batch claim com fairness por tenant e cycle time budget — mesmo padrão deve ser portado. **Fix:** (1) criar `journeys.claim_next_jobs(worker_id, batch_size)` retornando SETOF; (2) atualizar journeys-worker e email-campaign-worker para batch processing; (3) adicionar per-tenant cap e `maxCycleRuntimeMs` como analytics-worker já tem. Ref: Principal Engineering Audit F8. | **P3** — Pendente |
-| D21 | **Segment-eval tenant scan** — Worker faz `SELECT id FROM core.tenants` a cada ciclo e chama `claim_next_segment_jobs` por tenant = O(tenants) queries mesmo sem trabalho. Com sharding + SKIP LOCKED o impacto é baixo hoje, mas escala linearmente com tenants. **Fix:** criar `claim_next_segment_jobs_global(worker_id, batch_size, shard_index, total_shards)` que faz 1 query com shard filter no WHERE. Padrão idêntico ao `public.claim_next_jobs` do analytics-worker. Ref: Principal Engineering Audit F2. | **P4** — Pendente Sprint 12+ |
-| D22 | **claim_jobs tenant fairness** — `integrations.claim_jobs` ordena por `priority, created_at` sem cap por tenant. Mitigado hoje por workers provider-scoped e batch_size=5. Vira problema quando muitos tenants compartilham provider (ex: import histórico simultâneo de vários tenants Eduzz). **Fix futuro:** round-robin CTE com `ROW_NUMBER() OVER (PARTITION BY tenant_id)` limitando N jobs por tenant por claim. Ref: Principal Engineering Audit F3. | Defer — escala futura |
-| D23 | **Idempotency constraint no enqueue** — `enqueue_webhook_job` usa SELECT-then-INSERT (TOCTOU). Risco prático baixo porque upstream `receive_webhook` já tem `ON CONFLICT (idempotency_key)` e downstream handlers são idempotentes. **Hardening opcional:** partial unique index `CREATE UNIQUE INDEX idx_jobs_webhook_event_active ON integrations.jobs(webhook_event_id) WHERE webhook_event_id IS NOT NULL AND status NOT IN ('failed', 'cancelled')`. Ref: Principal Engineering Audit F5. | Defer — hardening |
+| D11 | `refreshFeatures` cleanup de parties com customer role revogada — zerar `monetary`/`frequency` órfãos em `contact_state` | Pendente |
+| D12 | Normalização de telefone (`phone_normalized` E.164) — `crm.party_person`, `sympla.participants`, todos os providers. Função utilitária compartilhada. Backfill + UI de indicador de cobertura. Campanhas WhatsApp filtram por `phone_normalized IS NOT NULL` | Pendente |
+| D13 | `DROP TABLE eduzz.integrations` — tabela legada. Toda leitura/escrita já migrada para `integrations.accounts`. RPCs atualizadas. Dropar após validação. | Pendente |
+| D14 | Auditoria preventiva de TTL em todas as filas do sistema — verificar se todas as filas têm: (1) cron de purge para rows terminais, (2) índice parcial cobrindo status ativo, (3) NOT EXISTS filtrando apenas status ativos. Ver R20. | Pendente |
+| D18 | **Journey fanout não-atômico** — enrollment INSERT e `process_enrollment` job INSERT são statements separadas sem transação. **Fix:** (1) envolver ambos INSERTs em `sql.begin()` em `processEventJob.ts`, `processBackfillJob.ts` e `checkEventEntries.ts`; (2) criar sweeper pg_cron para enrollments órfãos; (3) remover comentários incorretos sobre sql.begin(). Ref: Audit F1. | **P1** |
+| D19 | **Observabilidade backend** — Sentry cobre apenas frontend React. Workers sem aggregação, dashboards ou alertas. **Fix:** (1) Sentry nos Railway workers; (2) dashboard de filas (depth, drain rate, p95 latency); (3) alertas: dead jobs > 0, queue depth crescendo, worker sem heartbeat >5min. Ref: Audit F10. | **P2** |
+| D20 | **Journeys batch claim** — `journeys.claim_next_job` retorna 1 job por vez. **Fix:** (1) criar `journeys.claim_next_jobs(worker_id, batch_size)` retornando SETOF; (2) batch processing em journeys-worker e email-campaign-worker; (3) per-tenant cap e `maxCycleRuntimeMs`. Ref: Audit F8. | **P3** |
+| D21 | **Segment-eval tenant scan** — Worker faz O(tenants) queries por ciclo mesmo sem trabalho. **Fix:** criar `claim_next_segment_jobs_global(worker_id, batch_size, shard_index, total_shards)`. Ref: Audit F2. | **P4** |
+| D22 | **claim_jobs tenant fairness** — ordena por `priority, created_at` sem cap por tenant. **Fix futuro:** round-robin CTE com `ROW_NUMBER() OVER (PARTITION BY tenant_id)`. Ref: Audit F3. | Defer |
+| D23 | **Idempotency constraint no enqueue** — `enqueue_webhook_job` usa SELECT-then-INSERT (TOCTOU). Risco baixo. **Hardening:** partial unique index em `integrations.jobs(webhook_event_id)`. Ref: Audit F5. | Defer |
+| D24 | `DROP TABLE analytics.segment_customers` — período de segurança cumprido | Pendente |
+| D25 | `refresh_tenant_distribution` + tela de monitoramento | Pendente |
+| D26 | `trg_record_email_engagement` → atualizar `last_email_opened_at` / `last_email_clicked_at` em `contact_state` | Pendente |
+| D27 | UI: novos blocos de condição no segment builder (product picker, time window, CRM condition) | Pendente |
+| D28 | D6 Fase 3 — `DROP COLUMN customer_id` (tabelas restantes) + 7 FKs + recriar 4 views | Pendente |
+| D29 | Performance loading timeout — tenant escola-do-fluxo. Profiling de RPCs lentas (`get_dashboard_data`, `get_pareto_analysis`) + lazy loading analytics. Sentry JAVASCRIPT-REACT-22, 21, 1S | Investigar |
 
 ---
 
-## 23. Sprint 10 — Parcialmente Concluído
+## 23. Roadmap Futuro
 
-**Concluído:**
-- [x] Rename Edge Functions: `webhooks-eduzz` → `eduzz-receiver-webhook`, `eduzz-webhook` → `eduzz-processor-worker` (funções antigas deletadas do Supabase)
-- [x] Custom domain `core.kreatorshub.com.br` + webhook URLs com slug no path
-- [x] `claim_jobs` RPC: workers agora passam `p_handlers text[]` no SQL em vez de filtrar em app code
-- [x] Provider migration: 87 jobs e webhook_events migrados de `eduzz-webhook` → `eduzz-processor-worker`
-- [x] Integration Hub UI: `IntegrationHub.tsx` substitui `EduzzIntegrationTab` direto — grid multi-provider (Eduzz, Sympla, Hotmart em breve) com Sheet lateral por provider
-- [x] Sympla Integration UI: `SymplaIntegrationDialog.tsx` — setup com token, seleção de eventos, sync, stats
-- [x] Eduzz OAuth app global: `client_id`/`client_secret` em env vars, `access_token` por tenant em `integrations.accounts.config`
-- [x] Webhook verification: `webhook_verified_at` + ping test + UI polling automático
-- [x] TokenExpiredError: fluxo defensivo 401 → invalidate → blockJob → banner UI
-- [x] `import_sales_page` Phase 2: raw → NormalizedTransaction → commerce:process_batch (D16)
-- [x] `eduzz-processor-worker` removido — jobs migrados para provider=`ingestion`, mapper inline no receiver (D17)
-- [x] Rename `eduzz-enrichment` → `historical-sync-worker` (`RAILWAY_DOCKERFILE_PATH=historical-sync/Dockerfile`)
-- [x] `sympla:historical_sync` adicionado ao historical-sync-worker
-- [x] `pull-sync-worker` substitui pg_cron para Doare e Sympla (`integrations.sync_schedules`)
-
-**Pendente:**
-- [ ] `DROP TABLE analytics.segment_customers` (período de segurança cumprido)
-- [ ] D6 Fase 3 — `DROP COLUMN customer_id` (tabelas restantes) + 7 FKs + recriar 4 views
-- [ ] D5 — Migrar pipeline SendGrid para versão unificada
-- [ ] `refresh_tenant_distribution` + tela de monitoramento
-- [ ] Conectar `trg_record_email_engagement` para atualizar `last_email_opened_at` / `last_email_clicked_at` em `contact_state`
-- [ ] UI: novos blocos de condição no segment builder (product picker, time window, CRM condition)
-- [ ] Sympla Fase 5: checkin → `journeys.journey_events` (type `sympla_checkin`)
-- [ ] Sympla Fase 6: `contact_state.event_checkin_count` + `analytics.contact_checkin_stats` (Tier 1.5)
-
----
-
-## 24. Sprint 11 — Pendente
-
-### Sympla Integration v5
-
-**Tabela `sympla.participants`** criada com PK `(tenant_id, id)`, campos de ticket (`ticket_number`, `ticket_name`, `ticket_discount`), checkin (`checkin_at`, `checkin_synced`), e extração de `custom_form` (`phone`, `cpf`). Índices: order lookup, email lookup, checkin_pending (partial).
-
-**Edge Function `sympla-sync` v5** — mudanças em relação à v4:
-- **Timezone fix:** `parseSymplaDate` agora detecta offset no payload; datas sem offset recebem `-03:00` (BRT) em vez de `Z` (UTC). Fix retroativo: 775 `commerce.transactions` corrigidas (`paid_at + 3h`).
-- **Novas colunas:** events (17 cols: `reference_id`, `detail`, `host_*`, `category_*`, `address_*`, `checkin_synced`) e orders (5 cols: `presentation_id`, `address_*`, `user_agent`).
-- **Participants sync:** `syncParticipants()` com janela temporal — future (>-1d), active (-1d a +3d), recently-ended (+3d a +7d), archived (skip se `checkin_synced`). Extrai phone/CPF de `custom_form` via regex case-insensitive.
-- **Mapper:** `NormalizedTransaction.extra` inclui `city`, `state`, `presentation_id`.
-
-**pg_cron:** ~~`sympla-sync-daily`~~ — substituído pelo pull-sync-worker via `integrations.sync_schedules`.
-
-### Performance: Loading Timeout Recorrente (escola-do-fluxo)
-
-**Status:** Identificado, não resolvido
-**Tenant:** `escola-do-fluxo` (`48ef8a5c-283b-4943-8552-53e8f8e92c3a`)
-**User:** `68d43ac4-f65c-479a-a7b9-84889424965c`
-**Sentry Issues:** JAVASCRIPT-REACT-22, 21, 1S
-
-**Problema:** Watchdog `LOADING_TIMEOUT` recorrente — 10 queries ficam penduradas por >10s em múltiplas rotas (`/admin/analytics`, `/contatos`, `/admin/clients/*`). Logs do Supabase mostram status codes 520 (internal error) e 525 (SSL handshake failed) em RPCs como `get_user_features`, `get_tenant_account`, `get_dashboard_data`, `get_pareto_analysis`, `transactions`.
-
-**Ocorrências registradas no Sentry:**
-- 04/03: `/admin/analytics` — 10 fetching, 520/525 nos logs Supabase
-- 03/03: `/contatos` — 10 fetching
-- 12-27/02: `/admin/clients/*` — 17 páginas diferentes, 7 fetching (issue 1S, 21 ocorrências)
-
-**Hipóteses a investigar:**
-1. Queries pesadas para este tenant (volume de dados grande?)
-2. Conexão de rede instável do usuário (520/525 = falha SSL/conexão)
-3. RPCs lentas que excedem timeout do PostgREST (~30s default)
-4. Concorrência de queries — 10 RPCs simultâneas saturando pool de conexões
-
-**Ações necessárias:**
-- [ ] Verificar tamanho dos dados do tenant (transações, contatos, contact_state)
-- [ ] Profiling das RPCs mais lentas (`get_dashboard_data`, `get_pareto_analysis`, `get_analytics_data`)
-- [ ] Considerar lazy loading / paginação na página de analytics
-- [ ] Avaliar se 10 queries simultâneas no mount é necessário ou pode ser sequencial/priorizado
-- [ ] D14 — Auditoria de TTL em todas as filas: inventariar todas as tabelas com coluna `status`, verificar acúmulo de rows terminais, criar crons de purge e índices parciais onde faltarem. Modelo de referência: correção aplicada em `segment_eval_queue` após incidente de queue bloat.
-
----
-
-## 25. Sprint 14 — Unificação `integrations.accounts`
-
-- [x] Migrar `eduzz.integrations` → `integrations.accounts` (colunas OAuth/sync/webhook genéricas)
-- [x] Copiar dados de 4 tenants via UPSERT (paridade 100%)
-- [x] Atualizar 7 RPCs (`eduzz.init_sync`, `eduzz.increment_sync_progress`, `eduzz.fail_sync`, `eduzz.reset_sync`, `public.eduzz_get_integration`, `public.eduzz_update_integration_stats`, `public.get_integration_config`)
-- [x] Edge Functions: `eduzz-oauth-callback` e `eduzz-receiver-webhook` (ex-`webhooks-eduzz`) — removido fallback legado
-- [x] Worker `eduzz/supabase.ts`: `getEduzzIntegration`, `updateEduzzToken`, `invalidateEduzzToken` → `integrations.accounts`
-- [x] Frontend: `eduzzStorage.ts` CRUD migrado, `IntegrationHub.tsx` sem `eduzzLegacy`, `EduzzIntegrationTab.tsx` usa `status` em vez de `is_enabled`
-- [x] Tipo `EduzzIntegration` reflete `integrations.accounts` (com `config` JSONB, `status`, colunas OAuth)
-- [ ] D13: `DROP TABLE eduzz.integrations` — aguardar 30 dias sem incidente (Sprint 15)
-
----
-
-## 26. Sprints Futuros
-
-**Sprint 17 — Personalização e cache**
+**Personalização e cache**
 - Vercel KV para cache de edge (`contact_state` hot path)
 - Identity resolution em checkout e formulários
 - `visitor_sessions` conectado ao frontend
 
-**Sprint 18 — Dashboard Piloto Automático**
+**Dashboard Piloto Automático**
 - API de oportunidades de receita, cards de revenue em risco
 - Attribution dashboard, product ladder visualization
 
-**Sprint 19+ — ML Real**
+**ML Real**
 - Schema `cluster_runs` / `cluster_definitions` / `cluster_members` / `cluster_segments`
 - `source_run_id` indexável em `segment_parties`
 - `computeClusters.ts` — K-means k=5 lendo `contact_state`
