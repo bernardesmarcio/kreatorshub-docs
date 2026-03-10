@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 6.7 — Cleanup: sprints removidos, dívidas consolidadas (D5-D29), roadmap simplificado*
+*Versão 6.8 — Segmentation Engine v2 implementação, party_profile e traits, dívidas D30-D33*
 
 ---
 
@@ -469,6 +469,13 @@ No campo `lifecycle_stage`, adicionar `dormant` à lista de valores válidos: `n
 
 **Como o contact_state é atualizado:** Toda mutação deve: (1) atualizar `contact_state`, (2) registrar em `contact_events`, (3) inserir em `segment_eval_queue` com `fields_changed`. Sempre os três juntos, sempre em `BEGIN/COMMIT`. Nunca atualizar `contact_state` diretamente sem passar por essas funções.
 
+> **Fronteira permanente do contact_state:** Somente dados comportamentais
+> derivados pertencem a contact_state — RFM, lifecycle, scores, arrays de
+> membership, datas derivadas de comportamento. Campos de perfil (phone,
+> profession, birth_date) vivem em `crm.party_person` / `crm.party_profile`.
+> Campos customizados do tenant vivem em `crm.party_trait_*`. Materializar
+> campos de perfil ou traits em contact_state é violação arquitetural (ver R30).
+
 ### Campos array — estado dos producers
 
 | Campo | Producer | Status |
@@ -799,6 +806,113 @@ O evaluator opera em dois tiers para equilibrar performance e expressividade:
 
 ---
 
+## 18.1 Segmentation Engine v2 — Implementação
+
+**Status:** ✅ Operacional (Sprint 10)
+
+**Localização:** `workers/analytics/src/segmentation/`
+
+**Arquivos:**
+
+| Arquivo | Responsabilidade |
+|---|---|
+| `types.ts` | Interfaces: ConditionLeaf, ConditionGroup, SegmentAST, EvaluationContext, ExecutionMeta |
+| `normalizer.ts` | toNNF + canonicalize + astHash — elimina NOT via De Morgan |
+| `validator.ts` | Validação de AST contra registry — retorna erros tipados |
+| `semanticFieldRegistry.ts` | Campos hardcoded com resolver, cost_hint, missing_semantics |
+| `executionRegistry.ts` | Mapeamento campo → tabela/coluna de execução |
+| `resolvers.ts` | 5 resolvers: snapshot_scalar, snapshot_array_contains, profile_scalar, summary_exists, custom_trait_scalar |
+| `planner.ts` | compileSQL() + compileMemory() — recursivo por nó AND/OR |
+| `fieldCatalog.ts` | getSegmentFieldCatalog() — combina campos estáticos + field_definitions do tenant |
+| `traitProducer.ts` | BLOCK_TYPE_MAP, processSubmission, updatePartyIdentity |
+
+**Resolvers:**
+
+| Resolver | Fonte | Custo | Cobertura |
+|---|---|---|---|
+| `snapshot_scalar` | `analytics.contact_state` | instant | RFM, lifecycle, scores, timestamps |
+| `snapshot_array_contains` | `analytics.contact_state` (GIN) | instant | bought_product_ids, tag_ids, segment_ids |
+| `profile_scalar` | `crm.parties` / `crm.party_person` | fast | phone, profession, campos canônicos |
+| `summary_exists` | `analytics.contact_product_stats` | fast | product_first_purchase, product_purchase_count |
+| `custom_trait_scalar` | `crm.party_trait_*` | fast | qualquer campo de formulário do tenant |
+
+**Operadores suportados:**
+- Scalar: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`
+- Temporal: `before`, `after`, `within_last`, `between_dates`, `not_between_dates`
+- Array: `in`, `not_in`, `contains_any`, `not_contains_any`
+- Text: `starts_with`, `contains`
+- Existencial: `is_null`, `is_not_null`
+
+**Coexistência com legacy:** `refreshSegments.ts` usa `rules_json_v2` se `ast_version >= 1`, senão fallback para `build_segment_where_clause`. Métrica `v2_ratio` logada por ciclo. Meta: 100%.
+
+**Estado da migração:** 24/24 segmentos do tenant principal migrados para `rules_json_v2`. Colunas adicionadas em `analytics.segments`: `rules_json_v2`, `ast_version`, `ast_hash`, `migrated_at`, `migration_warnings`.
+
+---
+
+## 18.2 Perfil do Contato — party_profile e Traits
+
+**Arquitetura em três camadas:**
+
+```
+analytics.contact_state      → comportamento derivado (instant)
+                                RFM, lifecycle, scores, memberships
+crm.party_person             → identidade base (já existe)
+crm.party_profile            → snapshot de perfil (fast)
+                                colunas canônicas: phone, profession,
+                                birth_date, city, state, country,
+                                missing_semantics, source_system,
+                                source_field_id (mapeia block_id do formulário)
+crm.party_trait_text         ↗
+crm.party_trait_number       → projeção tipada para segmentação (fast)
+crm.party_trait_timestamp    → índice por (tenant_id, field_key, value_*)
+crm.party_trait_boolean      → cobertura completa de operadores por tipo
+crm.party_trait_multi_value  ↘
+```
+
+**Por que não JSONB puro para segmentação:** GIN cobre igualdade e containment mas não range queries, comparações numéricas e datas com precisão de planner. Traits tipadas cobrem todos os operadores com índice previsível.
+
+**Fluxo de formulário → traits:**
+
+```
+forms.form_versions status → 'published'
+  → trg_enqueue_field_sync
+  → handler forms:sync_field_definitions
+  → syncFormFieldDefinitions():
+      para cada bloco BLOCK_TYPE_MAP[type] = 'trait':
+        INSERT INTO crm.field_definitions
+          source_field_id = block.id
+          field_key = slugify(block.title)
+        ON CONFLICT (tenant_id, field_key) DO UPDATE
+
+forms.form_submissions status → projection
+  → handler forms:project_traits
+  → processSubmission() em sql.begin():
+      1. normalizeAnswer() por tipo de bloco
+      2. upsert em party_trait_* por field_type
+      3. merge party_profile.custom_fields
+      4. updatePartyIdentity() para blocos identity
+      5. INSERT segment_eval_queue fields_changed = [field_keys]
+```
+
+**BLOCK_TYPE_MAP — 22 tipos:**
+
+| Categoria | Tipos | Kind |
+|---|---|---|
+| Identidade | first_name, last_name, full_name, email, phone | identity → party_person |
+| Texto livre | short_text, long_text | trait → text |
+| Seleção única | single_choice, picture_choice, dropdown | trait → single_select |
+| Boolean | yes_no | trait → boolean |
+| Seleção múltipla | multiple_choice, checkbox | trait → multi_select |
+| Numérico | number, rating, nps, ranking | trait → number |
+| Data | date | trait → timestamp |
+| Compostos | contact_info, address | skip (futuro) |
+| Display | statement, website | skip |
+
+**Typeform — provider futuro:**
+Mesmo fluxo, origem diferente. Schema `typeform.*`, `field_definitions.source_system = 'typeform'`, `source_field_id` = ID do campo no Typeform. Webhook para ingestão contínua + Responses API para backfill histórico. Implementação: ver checklist de novo provider (seção 14).
+
+---
+
 ## 19. Soft-delete — segments e forms
 
 - `analytics.segments`: coluna `deleted_at timestamptz` adicionada. Soft-delete via `UPDATE SET deleted_at = NOW(), is_active = false` — nunca DELETE físico
@@ -853,6 +967,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R27 | OAuth providers usam app centralizado da plataforma, nunca app por tenant. Client credentials em env vars globais. Token por tenant salvo em `integrations.accounts.config`. Dependência de app OAuth por tenant = risco operacional: cliente revoga → todos os tenants perdem acesso. | Eduzz OAuth migration Sprint 10 |
 | R28 | Multi-step writes que criam estado dependente (enrollment + job, entity + event) devem estar em `sql.begin()`. `postgres.js` suporta transações com PgBouncer transaction mode e `prepare: false`. Comentário `sql.begin() não suportado` é incorreto e causou fanout não-atômico nas jornadas. | Principal Eng Audit D18 |
 | R29 | PostgreSQL NÃO propaga `relrowsecurity` para partições existentes. Policies na tabela pai SÃO herdadas, mas cada partição precisa de `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` explícito. Sem isso, acesso direto à partição via PostgREST bypassa RLS. Foram 49 partições habilitadas individualmente no Security Sprint 2. | Security Sprint 2 partition RLS |
+| R30 | `contact_state` contém exclusivamente comportamento derivado. Campos de perfil (phone, profession, qualquer atributo estático do contato) pertencem a `crm.party_profile`. Campos customizados do tenant pertencem a `crm.party_trait_*`. Materializar atributos de perfil ou traits em `contact_state` é violação arquitetural que destrói a fronteira entre snapshot comportamental e dados brutos de perfil. | Segmentation Engine v2 — Sprint 10 |
 
 ---
 
@@ -883,6 +998,10 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D27 | UI: novos blocos de condição no segment builder (product picker, time window, CRM condition) | Pendente |
 | D28 | D6 Fase 3 — `DROP COLUMN customer_id` (tabelas restantes) + 7 FKs + recriar 4 views | Pendente |
 | D29 | Performance loading timeout — tenant escola-do-fluxo. Profiling de RPCs lentas (`get_dashboard_data`, `get_pareto_analysis`) + lazy loading analytics. Sentry JAVASCRIPT-REACT-22, 21, 1S | Investigar |
+| D30 | Decompor blocos contact_info e address em traits individuais — hoje kind: 'skip', sem dados reais ainda | Pendente |
+| D31 | Integração Typeform — schema raw + Edge Function receiver + Responses API backfill + field_definitions com source_system='typeform' | Pendente |
+| D32 | `evaluation_mode` coluna em analytics.segments — inferir event_driven vs time_driven por segmento para otimizar re-scan periódico | Pendente |
+| D33 | UI: segment builder consumindo getSegmentFieldCatalog() dinâmico — expor campos de party_trait_* como condições disponíveis | Pendente |
 
 ---
 
