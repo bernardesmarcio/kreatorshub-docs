@@ -2,7 +2,7 @@
 
 ## Estado: Sprint 3 — Completo ✅
 ## Última atualização: 2026-03-10
-## Versão: 1.1
+## Versão: 1.2
 
 ---
 
@@ -958,32 +958,47 @@ Views agora executam com privilégios do **caller** (authenticated), respeitando
 | `journeys` | `journey_executions` | `input_json`, `output_json` | MEDIO — dados de execução |
 | `sympla` | `events`, `orders`, `participants` | `raw` | **ALTO** — dados brutos completos |
 
-### 13.5 Credenciais de Terceiros
+### 13.5 Credenciais de Terceiros — Inventário Atualizado (Sprint 4)
 
-**SEVERIDADE: CRITICA — 20 colunas com credenciais em texto**
+**Diagnóstico executado:** 2026-03-10 — Sprint 4 Fase 1
 
-| Schema | Tabela | Coluna | Tipo |
-|--------|--------|--------|------|
-| `commerce` | `asaas_config` | `api_key_encrypted` | API Key (criptografada) |
-| `core` | `eduzz_integrations` | `api_key` | API Key **texto plano** |
-| `core` | `eduzz_integrations` | `webhook_secret` | Webhook Secret **texto plano** |
-| `eduzz` | `integrations` | `api_key` | API Key **texto plano** |
-| `eduzz` | `integrations` | `webhook_secret` | Webhook Secret **texto plano** |
-| `eduzz` | `integrations` | `client_secret` | Client Secret **texto plano** |
-| `eduzz` | `integrations` | `access_token` | OAuth Token **texto plano** |
-| `eduzz` | `integrations` | `refresh_token` | OAuth Refresh **texto plano** |
-| `email` | `tenant_config` | `sendgrid_subuser_api_key` | API Key **texto plano** |
-| `email` | `tenant_config` | `webhook_secret` | Webhook Secret **texto plano** |
-| `integrations` | `accounts` | `access_token` | OAuth Token **texto plano** |
-| `integrations` | `accounts` | `refresh_token` | OAuth Refresh **texto plano** |
-| `integrations` | `accounts` | `client_secret` | Client Secret **texto plano** |
-| `whatsapp` | `instances` | `webhook_secret` | Webhook Secret **texto plano** |
+**Total: 20 colunas com credenciais em 7 tabelas**
 
-**Impacto:** Se um atacante conseguir ler estas tabelas (via falha de RLS ou SQL injection), obtém acesso direto a:
-- APIs da Eduzz de todos os tenants
-- APIs do SendGrid de todos os tenants
-- OAuth tokens de integrações (Nylas, Doaré, etc.)
-- Webhook secrets (permitindo forjar eventos)
+| Tabela | Colunas | Rows | Credenciais Populadas | Status |
+|--------|---------|------|-----------------------|--------|
+| `commerce.asaas_config` | `api_key_encrypted`, `webhook_token` | 1 | api_key: 1, webhook_token: 0 | ✅ api_key criptografado |
+| `core.eduzz_integrations` | `api_key`, `webhook_secret` | 1 | api_key: 0, webhook_secret: 1 | ❌ LEGADO — dropar |
+| `eduzz.integrations` | `api_key`, `access_token`, `refresh_token`, `client_secret`, `webhook_secret`, `token_expires_at` | 4 | api_key: 1, access_token: 4, webhook_secret: 4 | ❌ LEGADO — migrar |
+| `email.tenant_config` | `sendgrid_subuser_api_key`, `webhook_secret` | 4 | sendgrid_key: 4, webhook_secret: 0 | ❌ Texto plano |
+| `integrations.accounts` | `access_token`, `refresh_token`, `client_secret`, `secrets_ref`, `token_expires_at` | 8 | access_token: 4, refresh_token: 0, client_secret: 2 | ❌ Texto plano |
+| `whatsapp.instances` | `webhook_secret`, `vault_secret_name` | 1 | webhook_secret: 1 | ⚠️ Parcial |
+| `core.team_invitations` | `token` | — | — | ➖ Invite token (não credencial) |
+
+**Descoberta crítica:** `integrations.accounts.config` (JSONB) também contém secrets — duplicação:
+
+| Provider | Chaves no config JSONB |
+|----------|------------------------|
+| eduzz | `api_key`, `public_key`, `webhook_secret` |
+| sendgrid | `sendgrid_subuser_api_key`, `webhook_secret` |
+| sympla | `s_token` |
+
+**Funções que acessam credenciais:**
+
+| Função | Tabela | Campos |
+|--------|--------|--------|
+| `public.eduzz_get_integration` | `integrations.accounts` | tokens |
+| `public.get_tenant_by_sendgrid_message` | `email.tenant_config` | sendgrid config |
+| `public.get_tenant_email_config` | `email.tenant_config` | sendgrid config |
+
+**Tenants afetados:** 4 tenants (eduzz, sendgrid, integrations), 1 tenant (whatsapp)
+
+**Vault atual (4 secrets):**
+- `supabase_url` — infra
+- `service_role_key` — infra
+- `whatsapp_*` — 1 instância
+- `DOARE_API_URL` — Doaré
+
+**Impacto:** Se um atacante conseguir ler estas tabelas (via falha de RLS ou SQL injection), obtém acesso direto a APIs de todos os tenants.
 
 **Única exceção positiva:** `commerce.asaas_config.api_key_encrypted` — já usa criptografia.
 
@@ -991,11 +1006,11 @@ Views agora executam com privilégios do **caller** (authenticated), respeitando
 
 | Achado | Severidade | Ação |
 |--------|------------|------|
-| 13+ credenciais em texto plano nas tabelas | **CRITICA** | Migrar para Vault com urgência (Sprint 4) |
-| `eduzz.integrations` com 7 colunas de credencial | **CRITICA** | Maior concentração de secrets expostos |
+| 20 colunas com credenciais em texto (4-5 tenants, 7 tabelas) | **ALTA** | Sprint 4 — diagnóstico completo, migração incremental planejada |
+| `eduzz.integrations` com 6 colunas de credencial | **ALTA** | LEGADO — dropar após migração para `integrations.accounts` |
 | CPF/CNPJ em 8+ tabelas sem field-level encryption | **ALTA** | Avaliar encryption at field level |
 | ~160 colunas JSONB com PII potencialmente não mapeado | **ALTA** | Auditar `raw_payload`, `raw_source`, `config` |
-| `integrations.accounts.config` pode ter secrets em JSONB | **CRITICA** | Auditar conteúdo e migrar |
+| `integrations.accounts.config` JSONB contém secrets (eduzz, sendgrid, sympla) | **ALTA** | Incluir na migração de Sprint 4 |
 | 400 colunas PII em 19 schemas | **MEDIO** | Classificação formal de dados necessária |
 | `analytics.contact_events` com payload JSONB sem RLS | **CRITICA** | Combinar com gap do Diagnóstico 2 |
 
@@ -1125,7 +1140,7 @@ Views agora executam com privilégios do **caller** (authenticated), respeitando
 | `supabase_etl_admin` tem BYPASSRLS | **ALTA** | Verificar se é necessário |
 | `supabase_functions_admin` pode criar roles | **MEDIA** | Verificar se é necessário |
 | `cli_login_postgres` expirado | **BAIXA** | Remover role |
-| Apenas 4 secrets no Vault vs 13+ em texto plano | **CRITICA** | Migrar credenciais para Vault |
+| 20 colunas com credenciais em texto (4-5 tenants) | **ALTA** | Sprint 4 — migração incremental planejada |
 | `service_role_key` está no Vault | **INFO** | Positivo — usado por Edge Functions via pg_net |
 
 ---
@@ -1277,7 +1292,7 @@ Supabase Auth não está gerando registros de auditoria de login/logout/signup. 
 |-----|-----------|--------|
 | G-001 | ~~Tabelas multi-tenant sem RLS~~ | ~~Sprint 2~~ ✅ Sprint 2 |
 | G-002 | ~~SECURITY DEFINER sem search_path~~ | ~~Sprint 3~~ ✅ Sprint 1 |
-| G-003 | Credenciais de terceiros em texto | Sprint 4 |
+| G-003 | Credenciais de terceiros em texto (20 colunas, 4 tenants) | Sprint 4 — Fase 1 completa, decisões pendentes |
 
 ### 🟠 Alto
 
@@ -1479,7 +1494,81 @@ Supabase Auth não está gerando registros de auditoria de login/logout/signup. 
 - [ ] Testes funcionais (login, dashboard, segmentos, jornadas, CRM)
 - [x] Atualizar SECURITY.md com métricas finais
 
-### Sprint 4 — Auditoria Básica
+### Sprint 4 — Secrets Management
+
+**Objetivo:** Migrar credenciais de texto plano para Supabase Vault / campo criptografado. Complexidade: 🔴 ALTA — requer mudanças em workers e Edge Functions.
+
+**Contexto (Sprint 0):** 20 colunas com credenciais em 7 tabelas, apenas 4 secrets no Vault. Se DB comprometido, atacante acessa APIs Eduzz/SendGrid/Nylas/webhooks de todos os tenants (4-5 tenants afetados).
+
+**Estratégia recomendada: Híbrida**
+- **Secrets globais** (client_id, client_secret da plataforma) → Vault direto
+- **Secrets por tenant** (access_token, webhook_secret) → Campo criptografado com chave mestra no Vault
+
+**Tabelas afetadas:**
+
+| Tabela | Colunas | Criticidade |
+|--------|---------|-------------|
+| `eduzz.integrations` | api_key, access_token, refresh_token, client_secret, webhook_secret, public_key, token_expires_at | 🔴 CRÍTICA — NÃO MIGRAR (legada, planejar DROP) |
+| `core.eduzz_integrations` | api_key, webhook_secret, public_key | 🔴 CRÍTICA — legada (duplicada) |
+| `email.tenant_config` | sendgrid_subuser_api_key, webhook_secret | 🔴 CRÍTICA |
+| `integrations.accounts` | access_token, refresh_token, client_secret | 🟠 ALTA |
+| `whatsapp.instances` | webhook_secret | 🟡 MÉDIA |
+| `commerce.asaas_config` | webhook_token | 🟡 MÉDIA (api_key já criptografado) |
+
+**Fases:**
+
+| Fase | Descrição | Tempo est. |
+|------|-----------|-----------|
+| 1 | Diagnóstico: mapear quem usa cada credencial | 1-2h |
+| 2 | Infraestrutura: schema `secrets`, funções encrypt/decrypt, chave mestra no Vault | 2-4h |
+| 3a | Migração: `email.tenant_config` (menor risco, maior impacto) | 4-8h |
+| 3b | Migração: `integrations.accounts` (modelo correto) | 4-8h |
+| 3c | Limpeza: tabelas legadas `eduzz.integrations`, `core.eduzz_integrations` | 2-4h |
+| 4 | Validação: testar integrações, confirmar criptografia, dropar colunas antigas | 2-4h |
+
+**Infraestrutura: funções helper**
+- `secrets.encrypt(p_plaintext, p_key_name)` → bytea (SECURITY DEFINER, search_path = '')
+- `secrets.decrypt(p_ciphertext, p_key_name)` → text (SECURITY DEFINER, search_path = '')
+- Chave mestra: AES-256-CBC via pgcrypto, armazenada no Vault
+
+**Código afetado:**
+- `email-campaign-worker` — `tenantConfig.sendgrid_subuser_api_key` → `decryptSecret()`
+- `historical-sync-worker` — `integration.access_token` → `getDecryptedToken()`
+- Edge Functions — `integration.webhook_secret` → `decryptSecret()`
+
+**Riscos:**
+
+| Risco | Mitigação |
+|-------|-----------|
+| Quebrar integrações ativas | Migração incremental, manter colunas antigas em paralelo |
+| Perder credenciais | Backup antes de dropar colunas |
+| Performance decrypt | Cache em memória nos workers |
+
+**Recomendação:** Dado a complexidade, executar Sprint 4 em fases incrementais (4a: email, 4b: integrations, 4c: cleanup). Considerar priorizar Sprint 5 (Audit) se compliance for mais urgente.
+
+**Status:** ⏳ Fase 1 (diagnóstico) completa. Execução adiada — requer mudanças em workers/Edge Functions.
+
+- [x] Fase 1 — Diagnóstico de credenciais (20 colunas, 7 tabelas, 4 tenants)
+- [ ] Decisão arquitetural: estratégia de criptografia
+- [ ] Fase 2 — Infraestrutura (schema `secrets`, funções encrypt/decrypt, chave mestra no Vault)
+- [ ] Fase 3a — Migração `email.tenant_config` (sendgrid_subuser_api_key)
+- [ ] Fase 3b — Migração `integrations.accounts` (access_token, refresh_token, client_secret)
+- [ ] Fase 3c — Consolidar `integrations.accounts.config` JSONB (remover duplicação)
+- [ ] Fase 3d — DROP tabelas legadas (`eduzz.integrations`, `core.eduzz_integrations`)
+- [ ] Fase 4 — Validação e cleanup de colunas antigas
+
+**Decisões pendentes:**
+1. Estratégia: campo criptografado (pgcrypto + chave no Vault) vs Vault direto vs híbrido
+2. Ordem: `email.tenant_config` primeiro (4 tenants, menor risco) ou `integrations.accounts` (modelo correto)
+3. Consolidar JSONB config ou manter duplicação temporária
+4. Timeline para DROP de tabelas legadas
+
+**Dependências:**
+- Atualização de workers: `email-campaign-worker`, `historical-sync-worker`
+- Atualização de Edge Functions: `sendgrid-webhook`, `eduzz-receiver-webhook`
+- Testes de integração antes de dropar colunas antigas
+
+### Sprint 5 — Auditoria Básica
 - [ ] Implementar triggers em tabelas críticas (schema `audit` já criado)
 - [ ] Configurar retention
 - [ ] Dashboard básico de auditoria
@@ -1705,6 +1794,16 @@ Ações que geram audit log obrigatório:
 # PARTE G — HISTÓRICO
 
 ## 26. Changelog
+
+### 2026-03-10 — v1.2
+- **Sprint 4 Fase 1 — Diagnóstico de Credenciais COMPLETO** ✅
+- 20 colunas com credenciais identificadas em 7 tabelas
+- Escala real: apenas 4 tenants afetados (menor do que estimado no Sprint 0)
+- Descoberta: `integrations.accounts.config` JSONB também contém secrets (duplicação com colunas)
+- Tabelas legadas confirmadas para DROP: `core.eduzz_integrations`, `eduzz.integrations`
+- Vault atual: apenas 4 secrets (supabase_url, service_role_key, whatsapp_*, DOARE_API_URL)
+- Funções que acessam credenciais: `eduzz_get_integration`, `get_tenant_by_sendgrid_message`, `get_tenant_email_config`
+- Sprint 4 completo adiado — requer mudanças em workers + decisões arquiteturais
 
 ### 2026-03-10 — v1.1
 - **Sprint 3 — SECURITY DEFINER Audit COMPLETO** ✅
