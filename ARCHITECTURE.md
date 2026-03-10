@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 6.8 — Segmentation Engine v2 implementação, party_profile e traits, dívidas D30-D33*
+*Versão 6.9 — Pipeline de formulários (trait projection + backfill), lições R31-R32, dívidas D34-D35*
 
 ---
 
@@ -86,7 +86,7 @@ Workers passam `p_handlers text[]` direto na chamada RPC `claim_jobs`, evitando 
 **RAILWAY WORKERS** (processamento — Node.js, postgres.js, PgBouncer)
 
 - `ingestion-worker` → `commerce.transactions` + analytics pipeline (handler genérico, provider-agnóstico)
-- `analytics-worker` → inteligência e segmentação (segment-eval-loop, refreshRfm, computeClusters, computeLookalikes, refreshFeatures). `refreshRfm` escreve em `contact_state` (`customer_features` dropada em Sprint 8)
+- `analytics-worker` → inteligência e segmentação (segment-eval-loop, refreshRfm, computeClusters, computeLookalikes, refreshFeatures, **project_traits**, **sync_field_definitions**). `refreshRfm` escreve em `contact_state` (`customer_features` dropada em Sprint 8)
 - `journeys-worker` → execução de nós de automação (`WORKER_ONLY=true`)
 - `journey-scheduler` → enfileira checks periódicos (`IS_SCHEDULER=true`): `checkSegmentEntries`, `checkFormEntries`, `checkEventEntries` (apenas `trigger_type='purchase'`), `enqueueReadyWaits`
 - **`journeys-event-worker`** → fan-out push-based de eventos. Processa `event_processing_jobs` + `backfill_jobs`
@@ -105,6 +105,7 @@ Workers passam `p_handlers text[]` direto na chamada RPC `claim_jobs`, evitando 
 | Criar batch jobs na fila | Edge Function ou pg_cron | Gatilho, não processamento |
 | Processar dados → `commerce.*` | ingestion-worker (Railway) | postgres.js, transactions, BEGIN/COMMIT |
 | Inteligência / scores / RFM | analytics-worker (Railway) | Batch pesado, longa duração |
+| Projeção de traits (formulários) | analytics-worker (Railway) | `project_traits` + `sync_field_definitions` via `analytics.processing_jobs` |
 | Import histórico / enrich por provider | historical-sync-worker (Railway) | Batch pesado, longa duração, isolado do hot path |
 | Fan-out de eventos → enrollments | journeys-event-worker (Railway) | SLA < 5s, realtime, isolado |
 | Executar nós de automação | journeys-worker (Railway) | Estado de enrollment, grafos |
@@ -431,6 +432,7 @@ workers/journeys-event/src/
 | **Backfill** | **`journeys.backfill_jobs`** | **Ativação manual de jornada** | **journeys-event-worker** |
 | Email sending | `email.campaign_sends` | journeys-worker (`send_email` node) | email-campaign-worker |
 | Analytics jobs | `analytics.jobs` | analytics-worker scheduler | analytics-worker |
+| Analytics processing | `analytics.processing_jobs` | Edge Functions (form submit trigger), backfill scripts | analytics-worker (`project_traits`, `sync_field_definitions`, `link_products`) |
 | Job errors | `integrations.job_errors` | `process_transactions_batch` (erros por item) | observabilidade + reprocess |
 
 ---
@@ -968,6 +970,8 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R28 | Multi-step writes que criam estado dependente (enrollment + job, entity + event) devem estar em `sql.begin()`. `postgres.js` suporta transações com PgBouncer transaction mode e `prepare: false`. Comentário `sql.begin() não suportado` é incorreto e causou fanout não-atômico nas jornadas. | Principal Eng Audit D18 |
 | R29 | PostgreSQL NÃO propaga `relrowsecurity` para partições existentes. Policies na tabela pai SÃO herdadas, mas cada partição precisa de `ALTER TABLE ... ENABLE ROW LEVEL SECURITY` explícito. Sem isso, acesso direto à partição via PostgREST bypassa RLS. Foram 49 partições habilitadas individualmente no Security Sprint 2. | Security Sprint 2 partition RLS |
 | R30 | `contact_state` contém exclusivamente comportamento derivado. Campos de perfil (phone, profession, qualquer atributo estático do contato) pertencem a `crm.party_profile`. Campos customizados do tenant pertencem a `crm.party_trait_*`. Materializar atributos de perfil ou traits em `contact_state` é violação arquitetural que destrói a fronteira entre snapshot comportamental e dados brutos de perfil. | Segmentation Engine v2 — Sprint 10 |
+| R31 | CHECK constraints de enums (`triggered_by`, `status`, etc.) devem ser auditadas antes de adicionar novo valor no código. Constraint com lista incompleta causa insert silenciosamente rejeitado. Sempre: (1) verificar constraint existente, (2) migration adicionando novo valor, (3) deploy migration antes do código. | Form trait pipeline — `form_submission` vs `form_submitted` |
+| R32 | Unique index de coalescing (`UNIQUE (tenant_id, job_type) WHERE status = 'pending'`) é correto para jobs coalescentes (refresh_features, refresh_rfm) mas bloqueia jobs per-entity (project_traits, sync_field_definitions). Jobs per-entity precisam de `payload->>'submission_id'` no unique ou exclusão do job_type no index parcial. Misturar os dois padrões na mesma tabela requer WHERE clause que exclua os job_types per-entity. | Form trait backfill — unique constraint bloqueou enqueue em massa |
 
 ---
 
@@ -1002,6 +1006,8 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D31 | Integração Typeform — schema raw + Edge Function receiver + Responses API backfill + field_definitions com source_system='typeform' | Pendente |
 | D32 | `evaluation_mode` coluna em analytics.segments — inferir event_driven vs time_driven por segmento para otimizar re-scan periódico | Pendente |
 | D33 | UI: segment builder consumindo getSegmentFieldCatalog() dinâmico — expor campos de party_trait_* como condições disponíveis | Pendente |
+| D34 | Scoping do unique index `processing_jobs_tenant_job_type_pending_uidx` — excluir `project_traits` e `sync_field_definitions` da condição WHERE para permitir múltiplos jobs pendentes per-entity. Ver R32 | **P2** |
+| D35 | Completar backfill de traits de formulários — 16 de 30 submissions ainda sem traits projetados. Rodar `backfillFormTraits.ts` com DATABASE_URL de produção | **P1** |
 
 ---
 
@@ -1022,3 +1028,48 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 - `computeClusters.ts` — K-means k=5 lendo `contact_state`
 - UI de renomear label de cluster, features comportamentais
 - HDBSCAN/GMM via microserviço Python, lookalike por embeddings, A/B testing com bandit
+
+---
+
+## 24. Pipeline de Formulários → Traits
+
+### Fluxo end-to-end
+
+```
+form_submission (status='submitted', party_id NOT NULL)
+  → trigger/Edge Function enfileira job `project_traits` em analytics.processing_jobs
+  → analytics-worker consome job
+  → traitProducer.processSubmission()
+    1. Carrega field_definitions (form_block_id → trait metadata)
+    2. Busca form_answers do submission
+    3. Filtra por COMPATIBLE_ANSWER_TYPES (single_choice→single_select, etc.)
+    4. Upsert em crm.party_trait_text / party_trait_number / party_trait_date
+    5. Enfileira segment_eval_queue com triggered_by='form_submission'
+```
+
+### Tabelas envolvidas
+
+| Tabela | Schema | Papel |
+|---|---|---|
+| `forms.form_blocks` | forms | Definição de campos do formulário |
+| `forms.form_submissions` | forms | Submissões com `party_id` e `status` |
+| `forms.form_answers` | forms | Respostas individuais por bloco |
+| `analytics.field_definitions` | analytics | Mapeamento form_block → trait (trait_key, value_type, source_system) |
+| `crm.party_trait_text` | crm | Traits textuais do contato |
+| `crm.party_trait_number` | crm | Traits numéricos do contato |
+| `crm.party_trait_date` | crm | Traits de data do contato |
+
+### Código-fonte
+
+| Arquivo | Papel |
+|---|---|
+| `workers/analytics/src/segmentation/traitProducer.ts` | Core: `processSubmission`, `syncFormFieldDefinitions`, `resolveFieldDefinitions` |
+| `workers/analytics/src/handlers/formTraits.ts` | Handlers de job: `handleProjectTraits`, `handleSyncFieldDefinitions` |
+| `workers/analytics/src/segmentation/scripts/backfillFormTraits.ts` | Script de backfill (Phase 0: field_definitions, Phase 1: submissions) |
+
+### Regras
+
+- **field_definitions são pré-requisito**: Sem field_definitions, `processSubmission` retorna 0 traits. Sempre rodar `sync_field_definitions` antes de `project_traits`.
+- **COMPATIBLE_ANSWER_TYPES**: Mapeia tipos de resposta do formulário para tipos de campo. `single_choice` e `picture_choice` são compatíveis com `single_select`.
+- **Backfill usa processamento direto**: `backfillFormTraits.ts` chama `processSubmission()` diretamente, sem passar pela fila de jobs. Evita problemas com unique constraint de coalescing.
+- **DbConnection adapter**: Scripts que usam `postgres.js` nativo precisam do adapter `{ unsafe, begin }` para compatibilidade com traitProducer.
