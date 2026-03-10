@@ -2,7 +2,108 @@
 
 ## Estado: Sprint 5 — Completo ✅
 ## Última atualização: 2026-03-10
-## Versão: 1.3
+## Versão: 1.4
+
+---
+
+# ESTADO ATUAL E PRÓXIMOS PASSOS
+
+> **Última atualização:** 2026-03-10 | **Versão:** 1.4
+>
+> Esta seção é o ponto de entrada para continuidade entre sessões. Leia aqui primeiro.
+
+### Sprints Concluídos
+
+| Sprint | Escopo | Métricas-chave |
+|--------|--------|----------------|
+| Sprint 0 | Diagnóstico completo | 6 diagnósticos, inventário de 19 schemas |
+| Sprint 1 | Hardening fundacional | 469 grants revogados, 27 funções corrigidas, schema `app_auth` criado |
+| Sprint 2 | RLS sistemático | 66 tabelas protegidas, 267 políticas, 13 índices |
+| Sprint 3 | SECURITY DEFINER audit | 69 funções migradas DEFINER→INVOKER, 0 sem search_path |
+| Sprint 5 | Audit trail | 11 triggers, 7 funções, tabela `audit.trail` com RLS |
+
+### Sprint em Andamento
+
+**Sprint 4 — Secrets Management** (⏸️ pausado — requer mudanças em código)
+
+| Fase | Status | Descrição |
+|------|--------|-----------|
+| Fase 1 | ✅ | Diagnóstico: 20 colunas, 7 tabelas, 4 tenants |
+| Fase 2 | ⏸️ | Infraestrutura: schema `secrets`, funções encrypt/decrypt |
+| Fase 3a | ⏸️ | Migrar `email.tenant_config` |
+| Fase 3b | ⏸️ | Migrar `integrations.accounts` |
+| Fase 3c | ⏸️ | Consolidar JSONB config |
+| Fase 3d | ⏸️ | DROP tabelas legadas |
+| Fase 4 | ⏸️ | Validação |
+
+**Bloqueadores:**
+1. Requer mudanças em código (workers, Edge Functions)
+2. Decisão pendente: campo criptografado (pgcrypto) vs Vault direto vs híbrido
+
+**Dependências de código:**
+- `email-campaign-worker` — usar `secrets.decrypt_value()` para SendGrid API key
+- `historical-sync-worker` — migrar de `eduzz.integrations` para `integrations.accounts`
+- Edge Functions — `sendgrid-webhook`, `eduzz-receiver-webhook`
+
+### Decisões Pendentes
+
+| # | Decisão | Opções | Impacto |
+|---|---------|--------|---------|
+| D-SEC-1 | Estratégia de criptografia | A) Vault direto, B) Campo criptografado, C) Híbrido | Sprint 4 |
+| D-SEC-2 | Ordem de migração | `email.tenant_config` primeiro vs `integrations.accounts` | Sprint 4 |
+| D-SEC-3 | Timeline para DROP tabelas legadas | `eduzz.integrations`, `core.eduzz_integrations` | Sprint 4 |
+
+### Inventário de Credenciais (Sprint 4 Fase 1)
+
+| Tabela | Colunas sensíveis | Rows | Status |
+|--------|-------------------|------|--------|
+| `commerce.asaas_config` | api_key_encrypted, webhook_token | 1 | ✅ api_key ok |
+| `core.eduzz_integrations` | api_key, webhook_secret | 1 | ❌ LEGADO — planejar DROP |
+| `eduzz.integrations` | 6 colunas | 4 | ❌ LEGADO — planejar DROP |
+| `email.tenant_config` | sendgrid_subuser_api_key, webhook_secret | 4 | ❌ Texto plano |
+| `integrations.accounts` | access_token, refresh_token, client_secret | 8 | ❌ Texto plano |
+| `whatsapp.instances` | webhook_secret | 1 | ⚠️ Parcial |
+
+**Descoberta:** `integrations.accounts.config` (JSONB) também contém secrets duplicados.
+
+### Gaps Resolvidos
+
+| Gap | Descrição | Sprint |
+|-----|-----------|--------|
+| G-001 | Tabelas multi-tenant sem RLS | ✅ Sprint 2 |
+| G-002 | DEFINER sem search_path | ✅ Sprint 1 + 3 |
+| G-005 | Audit trail não existe | ✅ Sprint 5 |
+| G-006 | Sem testes cross-tenant | ✅ Sprint 2 |
+| G-007 | Views sem security_invoker | ✅ Sprint 1 |
+
+### Gaps Pendentes
+
+| Gap | Descrição | Sprint Planejado |
+|-----|-----------|------------------|
+| G-003 | Credenciais em texto plano (20 colunas) | Sprint 4 (pausado) |
+| G-004 | MFA não enforced | Sprint 8 |
+| G-008 | Sem SIEM integration | Sprint 12 |
+| G-009 | Sem incident runbook | Sprint 16 |
+
+### Roadmap Futuro
+
+| Sprint | Escopo | Complexidade | Pré-requisito |
+|--------|--------|--------------|---------------|
+| Sprint 4 completo | Migrar credenciais para Vault/encrypted | 🟠 SQL + código | Decisões D-SEC-1/2/3 |
+| Sprint 6 | Schema `api` único exposto | 🟠 Médio | — |
+| Sprint 7 | Hardening final Fase 1 | 🟡 Baixo | — |
+| Sprint 8-9 | SSO/SAML, MFA enforcement | 🔴 Enterprise | — |
+| Sprint 10-11 | Field encryption, Vault centralizado | 🔴 Enterprise | Sprint 4 |
+| Sprint 12-13 | Audit exportável, SIEM | 🟠 Médio | Sprint 5 |
+| Sprint 14-17 | Rate limiting, compliance program | 🟠 Médio | — |
+| Sprint 18+ | Pentest, SOC 2 Type II | 🔴 Externo | Todos anteriores |
+
+### Para Continuar
+
+1. Ler `docs/SECURITY.md` no repo (versão canônica)
+2. Esta seção tem o estado atual — começar aqui
+3. Sprint 4 é o próximo — decidir estratégia de criptografia primeiro (D-SEC-1)
+4. Migrations de sprints anteriores estão em `supabase/migrations/`
 
 ---
 
@@ -1293,15 +1394,15 @@ Supabase Auth não está gerando registros de auditoria de login/logout/signup. 
 
 ### 15.9 Resumo de Risco — Diagnóstico 6
 
-| Achado | Severidade | Ação |
-|--------|------------|------|
-| Schema `audit` não existe | **CRITICA** | Criar schema + tabelas (Sprint 5) |
-| Zero triggers de auditoria em tabelas sensíveis | **CRITICA** | Implementar triggers em 24 tabelas prioritárias |
-| `pgaudit.log = none` — efetivamente desabilitado | **ALTA** | Configurar `pgaudit.log = 'write, ddl'` |
-| `auth.audit_log_entries` vazia | **ALTA** | Investigar configuração do Supabase Auth |
-| `core.permission_audit_log` é o único log de audit real | **MEDIA** | Expandir padrão para outros schemas |
-| 13 tabelas de eventos existem mas sem padrão formal | **MEDIA** | Formalizar como parte do audit trail |
-| `pgaudit.log_parameter = off` | **MEDIA** | Habilitar para capturar valores |
+| Achado | Severidade | Ação | Status |
+|--------|------------|------|--------|
+| ~~Schema `audit` não existe~~ | ~~CRITICA~~ | ~~Criar schema + tabelas~~ | ✅ Sprint 5 |
+| ~~Zero triggers de auditoria~~ | ~~CRITICA~~ | ~~Implementar triggers~~ | ✅ Sprint 5 (11 triggers) |
+| `pgaudit.log = none` — efetivamente desabilitado | **ALTA** | Configurar `pgaudit.log = 'write, ddl'` | ⏸️ Avaliar necessidade |
+| `auth.audit_log_entries` vazia | **ALTA** | Investigar configuração do Supabase Auth | ⏸️ Pendente |
+| ~~`core.permission_audit_log` único log~~ | ~~MEDIA~~ | ~~Expandir padrão~~ | ✅ Sprint 5 (padrão expandido) |
+| 13 tabelas de eventos sem padrão formal | **MEDIA** | Formalizar como parte do audit trail | ⏸️ Baixa prioridade |
+| `pgaudit.log_parameter = off` | **MEDIA** | Habilitar para capturar valores | ⏸️ Avaliar |
 
 ---
 
@@ -1872,6 +1973,14 @@ Ações que geram audit log obrigatório:
 # PARTE G — HISTÓRICO
 
 ## 26. Changelog
+
+### 2026-03-10 — v1.4
+- Adicionada seção "Estado Atual e Próximos Passos" no topo para continuidade entre sessões
+- Resumo executivo: sprints completos, pendentes, bloqueadores
+- Inventário de credenciais consolidado com status por tabela
+- Decisões pendentes documentadas (D-SEC-1/2/3)
+- Roadmap futuro até Sprint 18+
+- Seção 15.9 atualizada com status dos achados resolvidos pelo Sprint 5
 
 ### 2026-03-10 — v1.3
 - **Sprint 5 — Audit Schema COMPLETO** ✅
