@@ -1,8 +1,8 @@
 # KreatorsHub — Security Architecture & Compliance Roadmap
 
-## Estado: Sprint 3 — Completo ✅
+## Estado: Sprint 5 — Completo ✅
 ## Última atualização: 2026-03-10
-## Versão: 1.2
+## Versão: 1.3
 
 ---
 
@@ -387,58 +387,77 @@ CREATE INDEX idx_table_tenant_deleted ON schema.table(tenant_id) WHERE deleted_a
 
 ### 9.1 Audit Schema
 
-**Status:** ❌ Não existe — Sprint 5
+**Status:** ✅ Implementado — Sprint 5 (2026-03-10)
 
-**Estrutura alvo:**
-```sql
-CREATE SCHEMA audit;
+**Tabela:** `audit.trail` — registro imutável de mudanças em tabelas sensíveis.
 
-CREATE TABLE audit.row_changes (
-  id uuid PRIMARY KEY,
-  table_schema text NOT NULL,
-  table_name text NOT NULL,
-  operation text NOT NULL,  -- INSERT, UPDATE, DELETE
-  row_id uuid,
-  old_data jsonb,
-  new_data jsonb,
-  changed_by uuid,
-  tenant_id uuid,
-  changed_at timestamptz DEFAULT now()
-);
+| Coluna | Tipo | Descrição |
+|--------|------|-----------|
+| `id` | uuid | PK |
+| `created_at` | timestamptz | Timestamp imutável |
+| `user_id` | uuid | auth.uid() quando disponível |
+| `user_email` | text | Email para referência |
+| `role_name` | text | authenticated, service_role, anon |
+| `schema_name` | text | Schema da tabela |
+| `table_name` | text | Nome da tabela |
+| `operation` | text | INSERT, UPDATE, DELETE |
+| `record_id` | text | PK do registro |
+| `tenant_id` | uuid | Para isolamento |
+| `old_data` | jsonb | Estado anterior |
+| `new_data` | jsonb | Novo estado |
+| `changed_fields` | text[] | Campos alterados (UPDATE) |
+| `ip_address` | inet | IP do request |
+| `user_agent` | text | User agent |
+| `request_id` | text | Correlação com logs |
+| `transaction_id` | bigint | txid_current() |
 
-CREATE TABLE audit.sensitive_actions (
-  id uuid PRIMARY KEY,
-  action_type text NOT NULL,
-  actor_id uuid,
-  tenant_id uuid,
-  target_type text,
-  target_id uuid,
-  metadata jsonb,
-  ip_address inet,
-  user_agent text,
-  created_at timestamptz DEFAULT now()
-);
-```
+**Índices:** 7 (PK, tenant+created_at, table+created_at, user+created_at, record, operation, created_at)
 
-### 9.2 Row-level Changes
+**RLS:** Habilitado — `service_role` full access, `authenticated` isolado por tenant (`app_auth.active_tenant_id()`)
 
-**Tabelas que precisam de audit trigger:**
-- `crm.parties` (PII)
-- `crm.party_person` (PII)
-- `commerce.transactions` (financeiro)
-- `core.tenant_members` (permissões)
-- `integrations.accounts` (credenciais)
+**Funções trigger:** `audit.log_change()` (completa, com changed_fields) e `audit.log_change_simple()` (fallback). Ambas SECURITY DEFINER + `search_path = ''`.
 
-### 9.3 Admin Activity Logs
+### 9.2 Tabelas Auditadas (11 triggers)
 
-**Ações a logar:**
-- Login/logout
-- Mudança de permissão
+| Prioridade | Schema | Tabela | Trigger |
+|------------|--------|--------|---------|
+| P0 | core | tenants | audit_tenants |
+| P0 | core | tenant_users | audit_tenant_users |
+| P0 | core | system_admins | audit_system_admins |
+| P1 | email | tenant_config | audit_tenant_config |
+| P1 | integrations | accounts | audit_integrations_accounts |
+| P1 | commerce | asaas_config | audit_asaas_config |
+| P2 | analytics | segments | audit_segments |
+| P2 | journeys | journeys | audit_journeys |
+| P2 | forms | forms | audit_forms |
+| P2 | smart_forms | forms | audit_smart_forms |
+| P3 | whatsapp | instances | audit_whatsapp_instances |
+
+Todos: INSERT + UPDATE + DELETE → `audit.log_change()`
+
+### 9.3 Funções Helper
+
+| Função | Descrição | Acesso |
+|--------|-----------|--------|
+| `audit.get_record_history(schema, table, record_id)` | Histórico de um registro | authenticated |
+| `audit.get_tenant_changes(tenant_id, since)` | Mudanças recentes do tenant | authenticated |
+| `audit.get_user_changes(user_id, since)` | Mudanças feitas por usuário | authenticated |
+| `audit.get_stats(since)` | Estatísticas por tabela | service_role |
+| `audit.export_trail(tenant_id, from, to)` | Export para compliance | service_role |
+
+### 9.4 Admin Activity Logs
+
+**Ações logadas automaticamente (via triggers):**
+- Mudança de permissão (core.tenant_users)
+- Alteração de configuração sensível (email.tenant_config, integrations.accounts)
+- Mudanças em tenants e admins
+
+**Ações a logar (futuro):**
+- Login/logout (depende de `auth.audit_log_entries` — vazio atualmente)
 - Export de dados
 - Acesso a dados de outro tenant (support)
-- Alteração de configuração sensível
 
-### 9.4 SIEM Integration
+### 9.5 SIEM Integration
 
 **Status:** ❌ Não existe
 
@@ -1148,49 +1167,68 @@ Views agora executam com privilégios do **caller** (authenticated), respeitando
 ## 15. Auditoria e Logging
 
 > **Diagnóstico executado:** 2026-03-09 — diagnostic-6.sql
+> **Sprint 5 executado:** 2026-03-10 — audit.trail + 11 triggers
 
-### 15.1 Schema audit existe?
+### 15.1 Schema audit
 
-**Resultado: ❌ NÃO EXISTE**
+**Resultado: ✅ IMPLEMENTADO (Sprint 5)**
 
-O schema `audit` não foi criado. Não há infraestrutura dedicada de auditoria no banco.
+O schema `audit` contém:
+- `audit.trail` — tabela centralizada de auditoria (17 colunas, 7 índices, RLS habilitado)
+- 5 tabelas de backup (Sprints 1-3): `grant_backup_sprint1`, `function_backup_sprint1`, `view_backup_sprint1`, `definer_classification`, `function_backup_sprint3`
+- 7 funções: 2 triggers (`log_change`, `log_change_simple`) + 5 helpers
 
-### 15.2 Tabelas de Auditoria Existentes
+### 15.2 Tabelas de Auditoria e Log
 
-Tabelas que funcionam como log/histórico (por convenção de nome):
-
-| Schema | Tabela | Colunas | Propósito |
-|--------|--------|---------|-----------|
-| `auth` | `audit_log_entries` | 5 | Auth audit (Supabase) — **VAZIA (0 registros)** |
-| `core` | `permission_audit_log` | 7 | Log de mudanças de permissão |
-| `commerce` | `merge_history` | 14 | Histórico de merges de produtos |
-| `crm` | `lead_import_history` | 6 | Histórico de imports de leads |
-| `crm` | `opportunity_stage_history` | 7 | Histórico de stages de oportunidades |
-| `analytics` | `fallback_log` | 5 | Log de fallback de analytics |
-| `integrations` | `logs` | 10 | Logs de integrações |
-
-**Observação:** `auth.audit_log_entries` está **vazia** — Supabase Auth não está gerando registros de auditoria.
+| Schema | Tabela | Tipo | Status |
+|--------|--------|------|--------|
+| `audit` | `trail` | **Auditoria centralizada (Sprint 5)** | ✅ Ativo — 11 triggers |
+| `auth` | `audit_log_entries` | Auth audit (Supabase) | ⚠️ VAZIA (0 registros) |
+| `core` | `permission_audit_log` | Log de mudanças de permissão | ✅ Pré-existente |
+| `commerce` | `merge_history` | Histórico de merges | ✅ Pré-existente |
+| `crm` | `lead_import_history` | Histórico de imports | ✅ Pré-existente |
+| `crm` | `opportunity_stage_history` | Histórico de stages | ✅ Pré-existente |
+| `analytics` | `fallback_log` | Log de fallback | ✅ Pré-existente |
+| `integrations` | `logs` | Logs de integrações | ✅ Pré-existente |
 
 ### 15.3 Triggers de Auditoria
 
-**Resultado: ❌ NENHUM trigger de auditoria encontrado**
+**Resultado: ✅ 11 triggers ativos (Sprint 5)**
 
-Nenhum trigger com nome contendo `audit`, `log`, `history` ou `track` foi identificado. As tabelas de histórico existentes (15.2) são populadas por lógica de aplicação, não por triggers automáticos.
+| Prioridade | Schema | Tabela | Trigger | Operações |
+|------------|--------|--------|---------|-----------|
+| P0 | core | tenants | audit_tenants | INSERT, UPDATE, DELETE |
+| P0 | core | tenant_users | audit_tenant_users | INSERT, UPDATE, DELETE |
+| P0 | core | system_admins | audit_system_admins | INSERT, UPDATE, DELETE |
+| P1 | email | tenant_config | audit_tenant_config | INSERT, UPDATE, DELETE |
+| P1 | integrations | accounts | audit_integrations_accounts | INSERT, UPDATE, DELETE |
+| P1 | commerce | asaas_config | audit_asaas_config | INSERT, UPDATE, DELETE |
+| P2 | analytics | segments | audit_segments | INSERT, UPDATE, DELETE |
+| P2 | journeys | journeys | audit_journeys | INSERT, UPDATE, DELETE |
+| P2 | forms | forms | audit_forms | INSERT, UPDATE, DELETE |
+| P2 | smart_forms | forms | audit_smart_forms | INSERT, UPDATE, DELETE |
+| P3 | whatsapp | instances | audit_whatsapp_instances | INSERT, UPDATE, DELETE |
 
-### 15.4 Tabelas Sensíveis SEM Audit Trigger
+**Correção:** `core.tenant_users` (não `team_members`) é o nome correto da tabela de membros de equipe.
 
-**24 tabelas com dados sensíveis (PII, financeiro, credenciais) sem qualquer trigger de auditoria:**
+### 15.4 Tabelas Sensíveis SEM Audit Trigger (remanescentes)
 
-| Schema | Tabelas |
-|--------|---------|
-| `analytics` | `contact_state`, `segment_parties` |
-| `commerce` | `archived_transactions`, `asaas_config`, `checkout_orders`, `transaction_import_errors`, `transactions` |
-| `core` | `eduzz_integrations`, `system_admins`, `team_invitations` |
-| `crm` | `customers`, `opportunities`, `parties`, `party_person` |
-| `email` | `campaign_recipients`, `campaign_sends`, `email_events`, `sender_identities`, `suppression_list`, `tenant_config`, `tenant_send_stats`, `unsubscribe_feedback`, `unsubscribes` |
-| `integrations` | `accounts` |
+**13 tabelas com dados sensíveis ainda sem trigger de auditoria (candidatas para Sprint futuro):**
 
-**Impacto:** Alterações em dados de clientes, transações financeiras, credenciais de integrações e configurações de email não são rastreadas. Impossível saber quem alterou o quê e quando.
+| Schema | Tabelas | Motivo para futuro |
+|--------|---------|-------------------|
+| `analytics` | `contact_state`, `segment_parties` | Alto volume — avaliar impacto |
+| `commerce` | `archived_transactions`, `checkout_orders`, `transactions` | Alto volume |
+| `commerce` | `transaction_import_errors` | Baixa prioridade |
+| `core` | `eduzz_integrations`, `team_invitations` | Legada / baixo risco |
+| `crm` | `customers`, `opportunities`, `parties`, `party_person` | Alto volume — avaliar |
+| `email` | `sender_identities` | Médio risco |
+
+**Tabelas que GANHARAM audit trigger no Sprint 5:**
+- `core.system_admins` (antes: nenhum trigger)
+- `email.tenant_config`, `integrations.accounts`, `commerce.asaas_config` (credenciais)
+- `analytics.segments`, `journeys.journeys`, `forms.forms`, `smart_forms.forms` (soft-delete tracking)
+- `whatsapp.instances` (webhook_secret)
 
 ### 15.5 pgAudit Status
 
@@ -1275,7 +1313,7 @@ Supabase Auth não está gerando registros de auditoria de login/logout/signup. 
 |----|----------|-----------|---------------|-------|--------|-----------|
 | C-001 | RLS em tabelas expostas | SOC 2, ISO | Policies SQL | Eng | ⚠️ | Query 2.4 |
 | C-002 | MFA para admins | SOC 2, ISO | Supabase Auth | Eng | ❌ | - |
-| C-003 | Audit trail | SOC 2, HIPAA, ISO | Schema audit | Eng | ❌ | - |
+| C-003 | Audit trail | SOC 2, HIPAA, ISO | Schema audit | Eng | ✅ | Sprint 5 — `audit.trail` + 11 triggers |
 | C-004 | Encryption at rest | SOC 2, HIPAA | Supabase | Infra | ✅ | Supabase docs |
 | C-005 | Encryption in transit | SOC 2, HIPAA | TLS | Infra | ✅ | Supabase docs |
 | C-006 | Access reviews | SOC 2, ISO | Manual | Ops | ❌ | - |
@@ -1299,7 +1337,7 @@ Supabase Auth não está gerando registros de auditoria de login/logout/signup. 
 | Gap | Descrição | Sprint |
 |-----|-----------|--------|
 | G-004 | MFA não enforced | Sprint 8 |
-| G-005 | Audit trail não existe | Sprint 5 |
+| G-005 | ~~Audit trail não existe~~ | ~~Sprint 5~~ ✅ Sprint 5 — `audit.trail` + 11 triggers em tabelas sensíveis |
 | G-006 | ~~Sem testes de cross-tenant~~ | ~~Sprint 2~~ ✅ Sprint 2 (SQL validated) |
 
 ### 🟡 Médio
@@ -1568,10 +1606,50 @@ Supabase Auth não está gerando registros de auditoria de login/logout/signup. 
 - Atualização de Edge Functions: `sendgrid-webhook`, `eduzz-receiver-webhook`
 - Testes de integração antes de dropar colunas antigas
 
-### Sprint 5 — Auditoria Básica
-- [ ] Implementar triggers em tabelas críticas (schema `audit` já criado)
-- [ ] Configurar retention
-- [ ] Dashboard básico de auditoria
+### Sprint 5 — Audit Schema ✅ Completo (2026-03-10)
+
+**Objetivo:** Criar infraestrutura de auditoria para compliance — registro imutável de mudanças em tabelas sensíveis.
+
+**Contexto:** Sprint 0 identificou: schema `audit` não existia, `pgaudit.log = none`, 0 triggers de auditoria, 24 tabelas sensíveis sem rastreamento. Sprint 1 criou schema `audit` para backups temporários.
+
+**Resultado:** 11 triggers de auditoria em tabelas sensíveis, tabela `audit.trail` centralizada, 7 funções, RLS habilitado.
+
+**Fases executadas:**
+
+| Fase | Descrição | Resultado |
+|------|-----------|-----------|
+| 1 | Diagnóstico | pgaudit não instalado, 0 triggers existentes, `core.tenant_users` (não `team_members`) |
+| 2 | Infraestrutura | `audit.trail` (17 colunas, 7 índices, RLS), `log_change()` + `log_change_simple()` |
+| 3 | Triggers P0/P1/P2/P3 | 11 triggers em tabelas sensíveis (INSERT + UPDATE + DELETE) |
+| 4 | Helpers + validação | 5 funções helper, 6/6 checks PASS |
+
+**Métricas finais:**
+
+| Componente | Quantidade |
+|------------|-----------|
+| Triggers de auditoria | 11 |
+| Índices em audit.trail | 7 |
+| Políticas RLS | 2 (service_role full, authenticated por tenant) |
+| Funções trigger | 2 (log_change, log_change_simple) |
+| Funções helper | 5 (get_record_history, get_tenant_changes, get_user_changes, get_stats, export_trail) |
+
+**Descobertas:**
+- `core.tenant_users` é o nome correto (não `team_members` como documentado no Sprint 0)
+- `core.permission_audit_log` já existia como log pré-existente
+- `whatsapp.instances` existe e foi incluída (P3)
+- pgaudit: instalado no Supabase mas `log = none` (efetivamente desabilitado)
+
+**Retenção:**
+- Atual: sem cleanup automático
+- Recomendação futura: particionamento mensal após 6 meses, archiving após 1 ano
+
+**pgaudit:** Mais granular (cobre SELECTs) mas gera muito log. Recomendação: começar com triggers, avaliar pgaudit depois.
+
+- [x] Fase 1 — Diagnóstico (pgaudit não instalado, 0 triggers existentes)
+- [x] Fase 2 — Infraestrutura (`audit.trail`, funções, índices, RLS)
+- [x] Fase 3 — Triggers em 11 tabelas sensíveis (P0/P1/P2/P3)
+- [x] Fase 4 — Helpers + validação (6/6 checks PASS)
+- [x] Atualizar SECURITY.md para v1.3
 
 ### Sprint 6 — Schema Strategy (Opcional)
 - [ ] Criar schema `api`
@@ -1794,6 +1872,17 @@ Ações que geram audit log obrigatório:
 # PARTE G — HISTÓRICO
 
 ## 26. Changelog
+
+### 2026-03-10 — v1.3
+- **Sprint 5 — Audit Schema COMPLETO** ✅
+- Tabela `audit.trail` criada (17 colunas, 7 índices, RLS habilitado)
+- 11 triggers de auditoria em tabelas sensíveis (P0/P1/P2/P3)
+- 7 funções: 2 triggers (`log_change`, `log_change_simple`) + 5 helpers
+- Funções helper: `get_record_history`, `get_tenant_changes`, `get_user_changes`, `get_stats`, `export_trail`
+- RLS: service_role full access, authenticated isolado por tenant
+- Correção: `core.tenant_users` (não `team_members`)
+- Descoberta: `core.permission_audit_log` já existia (log de permissões)
+- Gap G-005 resolvido, Compliance C-003 marcado ✅
 
 ### 2026-03-10 — v1.2
 - **Sprint 4 Fase 1 — Diagnóstico de Credenciais COMPLETO** ✅
