@@ -972,6 +972,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R30 | `contact_state` contém exclusivamente comportamento derivado. Campos de perfil (phone, profession, qualquer atributo estático do contato) pertencem a `crm.party_profile`. Campos customizados do tenant pertencem a `crm.party_trait_*`. Materializar atributos de perfil ou traits em `contact_state` é violação arquitetural que destrói a fronteira entre snapshot comportamental e dados brutos de perfil. | Segmentation Engine v2 — Sprint 10 |
 | R31 | CHECK constraints de enums (`triggered_by`, `status`, etc.) devem ser auditadas antes de adicionar novo valor no código. Constraint com lista incompleta causa insert silenciosamente rejeitado. Sempre: (1) verificar constraint existente, (2) migration adicionando novo valor, (3) deploy migration antes do código. | Form trait pipeline — `form_submission` vs `form_submitted` |
 | R32 | Unique index de coalescing (`UNIQUE (tenant_id, job_type) WHERE status = 'pending'`) é correto para jobs coalescentes (refresh_features, refresh_rfm) mas bloqueia jobs per-entity (project_traits, sync_field_definitions). Jobs per-entity precisam de `payload->>'submission_id'` no unique ou exclusão do job_type no index parcial. Misturar os dois padrões na mesma tabela requer WHERE clause que exclua os job_types per-entity. | Form trait backfill — unique constraint bloqueou enqueue em massa |
+| R33 | Job enfileirado na tabela/worker errado bloqueia silenciosamente. `project_traits` foi enfileirado em `integrations.jobs` mas integrations-worker só consome providers (eduzz, sympla, apidozap). Jobs ficaram pending sem erro. Antes de enfileirar: (1) confirmar qual worker consome a tabela, (2) verificar se job_type está na allowlist (`ENABLED_JOB_TYPES`/`KNOWN_JOB_TYPES`). Trait projection = `analytics.processing_jobs` → analytics-worker. | Form trait pipeline — jobs pending indefinidamente |
 
 ---
 
@@ -1037,39 +1038,60 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 
 ```
 form_submission (status='submitted', party_id NOT NULL)
-  → trigger/Edge Function enfileira job `project_traits` em analytics.processing_jobs
+  → trigger enfileira job `project_traits` em analytics.processing_jobs
   → analytics-worker consome job
   → traitProducer.processSubmission()
     1. Carrega field_definitions (form_block_id → trait metadata)
     2. Busca form_answers do submission
     3. Filtra por COMPATIBLE_ANSWER_TYPES (single_choice→single_select, etc.)
-    4. Upsert em crm.party_trait_text / party_trait_number / party_trait_date
-    5. Enfileira segment_eval_queue com triggered_by='form_submission'
+    4. Upsert em crm.party_trait_text / party_trait_number / party_trait_timestamp / party_trait_boolean / party_trait_multi_value
+    5. Merge party_profile.custom_fields
+    6. updatePartyIdentity (blocos de identidade)
+    7. Enfileira segment_eval_queue com triggered_by='form_submission'
 ```
 
-### Tabelas envolvidas
+### Arquitetura de dados — 3 camadas
 
-| Tabela | Schema | Papel |
-|---|---|---|
-| `forms.form_blocks` | forms | Definição de campos do formulário |
-| `forms.form_submissions` | forms | Submissões com `party_id` e `status` |
-| `forms.form_answers` | forms | Respostas individuais por bloco |
-| `analytics.field_definitions` | analytics | Mapeamento form_block → trait (trait_key, value_type, source_system) |
-| `crm.party_trait_text` | crm | Traits textuais do contato |
-| `crm.party_trait_number` | crm | Traits numéricos do contato |
-| `crm.party_trait_date` | crm | Traits de data do contato |
+**`crm.party_person` / `crm.party_profile`**
+Campos de identidade (email, phone, nome) — atualizados via `updatePartyIdentity()`.
 
-### Código-fonte
+**`crm.field_definitions`**
+Contrato semântico dos campos do tenant. `(tenant_id, field_key, field_type, operator_family, source_system='forms', source_field_id=block_id)`. Populado por `sync_field_definitions` a cada versão publicada.
+
+**`crm.party_trait_text/number/timestamp/boolean/multi_value`**
+Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`. Trait só é gravado se existir `field_definition` mapeada para o block. Idempotente: `ON CONFLICT (tenant_id, party_id, field_key) DO UPDATE`.
+
+### Mapeamento block_type → destino
+
+| block_type | Destino |
+|---|---|
+| `email`, `phone`, `first_name`, `last_name`, `full_name` | `crm.party_person` (identidade) |
+| `short_text`, `long_text`, `single_choice`, `picture_choice`, `dropdown` | `crm.party_trait_text` |
+| `yes_no` | `crm.party_trait_boolean` |
+| `multiple_choice`, `checkbox` | `crm.party_trait_multi_value` |
+| `number`, `rating`, `nps`, `ranking` | `crm.party_trait_number` |
+| `date` | `crm.party_trait_timestamp` |
+| `contact_info`, `address` | skip — D30 (decomposição futura) |
+| `statement`, `website` | skip |
+
+### Regras permanentes
+
+- **R30:** traits NUNCA são materializados em `contact_state` — violação arquitetural
+- **`project_traits` e `sync_field_definitions` NÃO são jobs coalesced** — múltiplos pending simultâneos por tenant são esperados e corretos
+- A unique index de deduplicação em `analytics.processing_jobs` cobre APENAS jobs coalesced (`refresh_features`, `refresh_rfm`, etc.) — `project_traits` e `sync_field_definitions` estão fora dessa lista intencionalmente
+- `tenant_id` vem sempre do job, nunca do payload
+- `field_definitions` são pré-requisito: sem elas, `processSubmission` retorna 0 traits. Sempre rodar `sync_field_definitions` antes de `project_traits`
+- `COMPATIBLE_ANSWER_TYPES`: mapeia tipos de resposta do formulário para tipos de campo. `single_choice` e `picture_choice` são compatíveis com `single_select`
+- Backfill usa processamento direto: `backfillFormTraits.ts` chama `processSubmission()` diretamente, sem passar pela fila de jobs. Evita problemas com unique constraint de coalescing
+- `DbConnection` adapter: scripts que usam `postgres.js` nativo precisam do adapter `{ unsafe, begin }` para compatibilidade com traitProducer
+
+### Arquivos principais
 
 | Arquivo | Papel |
 |---|---|
-| `workers/analytics/src/segmentation/traitProducer.ts` | Core: `processSubmission`, `syncFormFieldDefinitions`, `resolveFieldDefinitions` |
+| `workers/analytics/src/segmentation/traitProducer.ts` | Core: `processSubmission`, `syncFormFieldDefinitions`, `resolveFieldDefinitions`, `normalizeAnswer`, `updatePartyIdentity` |
 | `workers/analytics/src/handlers/formTraits.ts` | Handlers de job: `handleProjectTraits`, `handleSyncFieldDefinitions` |
 | `workers/analytics/src/segmentation/scripts/backfillFormTraits.ts` | Script de backfill (Phase 0: field_definitions, Phase 1: submissions) |
-
-### Regras
-
-- **field_definitions são pré-requisito**: Sem field_definitions, `processSubmission` retorna 0 traits. Sempre rodar `sync_field_definitions` antes de `project_traits`.
-- **COMPATIBLE_ANSWER_TYPES**: Mapeia tipos de resposta do formulário para tipos de campo. `single_choice` e `picture_choice` são compatíveis com `single_select`.
-- **Backfill usa processamento direto**: `backfillFormTraits.ts` chama `processSubmission()` diretamente, sem passar pela fila de jobs. Evita problemas com unique constraint de coalescing.
-- **DbConnection adapter**: Scripts que usam `postgres.js` nativo precisam do adapter `{ unsafe, begin }` para compatibilidade com traitProducer.
+| `supabase/migrations/*_create_party_profile_traits.sql` | Schema das tabelas de traits e field_definitions |
+| `supabase/migrations/*_fix_trg_enqueue_trait_projection.sql` | Trigger de enqueue para `project_traits` |
+| `supabase/migrations/*_fix_processing_jobs_coalesced_index_scope.sql` | Scoping do unique index para excluir jobs per-entity |
