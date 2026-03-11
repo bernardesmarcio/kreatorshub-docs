@@ -1006,7 +1006,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D30 | Decompor blocos contact_info e address em traits individuais — hoje kind: 'skip', sem dados reais ainda | Pendente |
 | D31 | Integração Typeform — schema raw + Edge Function receiver + Responses API backfill + field_definitions com source_system='typeform' | Pendente |
 | D32 | `evaluation_mode` coluna em analytics.segments — inferir event_driven vs time_driven por segmento para otimizar re-scan periódico | Pendente |
-| D33 | UI: segment builder consumindo getSegmentFieldCatalog() dinâmico — expor campos de party_trait_* como condições disponíveis | Pendente |
+| D33 | UI: segment builder migrado para AST v2 (`rules_json_v2`) — save/load dual-write, conversão bidirecional, catálogo de campos dinâmico. Ver [`docs/D33-segment-builder-v2.md`](D33-segment-builder-v2.md) | Pendente |
 | D34 | Scoping do unique index `processing_jobs_tenant_job_type_pending_uidx` — excluir `project_traits` e `sync_field_definitions` da condição WHERE para permitir múltiplos jobs pendentes per-entity. Ver R32 | **P2** |
 | D35 | Completar backfill de traits de formulários — 16 de 30 submissions ainda sem traits projetados. Rodar `backfillFormTraits.ts` com DATABASE_URL de produção | **P1** |
 
