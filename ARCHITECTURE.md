@@ -1011,6 +1011,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D33 | UI: segment builder migrado para AST v2 (`rules_json_v2`) — save/load dual-write, conversão bidirecional, catálogo de campos dinâmico. Ver [`docs/D33-segment-builder-v2.md`](D33-segment-builder-v2.md) | Pendente |
 | D34 | Scoping do unique index `processing_jobs_tenant_job_type_pending_uidx` — excluir `project_traits` e `sync_field_definitions` da condição WHERE para permitir múltiplos jobs pendentes per-entity. Ver R32 | **P2** |
 | D35 | Completar backfill de traits de formulários — 16 de 30 submissions ainda sem traits projetados. Rodar `backfillFormTraits.ts` com DATABASE_URL de produção | **P1** |
+| D36 | **RLS não reconhece system_admin** — policies de RLS usam `tenant_id IN (SELECT tenant_id FROM core.tenant_users WHERE user_id = auth.uid())`, mas system admins podem não ter registro em `tenant_users` para todos os tenants. O RPC `get_user_tenant_memberships` faz LEFT JOIN e retorna todos os tenants, mas o RLS bloqueia queries. **Fix:** criar helper `core.user_visible_tenant_ids(uid)` que retorna todos os tenants para system admins (via `core.system_admins`) e apenas memberships para users normais. Substituir subquery de RLS por chamada a essa função. Workaround atual: inserir system admins em `tenant_users` de cada tenant manualmente. | **P2** |
 
 ---
 
