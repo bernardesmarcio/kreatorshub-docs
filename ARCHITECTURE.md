@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.0 — Typeform canonical integration (promote_forms, multi-provider worker), lições R34-R35*
+*Versão 7.1 — R36: campos 1:N via EXISTS subquery (opportunity_exists resolver), drop contact_state denormalization*
 
 ---
 
@@ -975,6 +975,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R33 | Job enfileirado na tabela/worker errado bloqueia silenciosamente. `project_traits` foi enfileirado em `integrations.jobs` mas integrations-worker só consome providers (eduzz, sympla, apidozap). Jobs ficaram pending sem erro. Antes de enfileirar: (1) confirmar qual worker consome a tabela, (2) verificar se job_type está na allowlist (`ENABLED_JOB_TYPES`/`KNOWN_JOB_TYPES`). Trait projection = `analytics.processing_jobs` → analytics-worker. | Form trait pipeline — jobs pending indefinidamente |
 | R34 | **Todo novo provider obrigatoriamente passa pelo sistema canônico de integração.** Ao conectar qualquer novo provider (Typeform, HubSpot, Google Calendar, etc.), o caminho é sempre: `integrations.accounts` → `integrations.capabilities` → `integrations.jobs` → `pull-sync-worker` ou `historical-sync-worker`. É **proibido**: (1) criar tabelas `{provider}.import_runs` ou equivalentes para controlar execução, (2) criar workers isolados por provider fora do sistema canônico, (3) fazer chamadas de API de sync diretamente de Edge Functions, (4) implementar scheduling fora de `integrations.jobs`. Padrão de nomeação: `{provider}:{ação}` (ex: `typeform:sync_responses`, `typeform:promote_forms`). **Como identificar violação:** se você está prestes a criar uma tabela de controle de execução ou um worker dedicado a um provider, pare — você está criando uma pipeline paralela. | Typeform implementado com pipeline própria (`typeform.import_runs`, zero capabilities, zero jobs) em Março/2026. Corrigido no mesmo sprint. |
 | R35 | **Import de provider externo exige filtro de organização antes de gravar no raw.** Todo sync que busca dados de uma API externa deve filtrar pelo `provider_account_id` da conta vinculada ao tenant antes de inserir no raw. Nunca importar "tudo que a conta vê" sem validar que o dado pertence ao escopo daquele tenant. Checklist obrigatório antes de gravar qualquer registro no raw: (1) `tenant_id` está correto e explícito? (2) `integration_account_id` está preenchido? (3) O dado pertence à organização/conta vinculada ao tenant (não apenas acessível pelo token)? | Typeform importou forms de todas as organizações acessíveis pelo personal token sem filtrar por organização, gerando 271 registros órfãos com contaminação entre tenants. Corrigido com limpeza em Março/2026. |
+| R36 | **Campos 1:N nunca são denormalizados em `contact_state`.** `contact_state` é estritamente escalar (um valor por contato). Entidades com cardinalidade 1:N (oportunidades, tickets, forms futuras) são avaliadas via `EXISTS` subquery direta na tabela relacional com índices corretos. O worker planner (`opportunity_exists` resolver) e o SQL function (`eval_condition_v2`) devem gerar SQL equivalente para esses campos. Denormalizar 1:N em `contact_state` (ex: `has_open_opportunity boolean`) cria divergência semântica entre preview (SQL function faz subquery real) e refresh (worker lê snapshot stale), além de exigir pipeline de sync impossível de manter consistente. | `has_open_opportunity` e `open_opportunity_count` foram dropados de `contact_state` em Março/2026 após auditoria confirmar zero segmentos referenciando. Substituídos por 10 campos `opportunity_exists` no worker planner. |
 
 ---
 
@@ -1080,6 +1081,7 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ### Regras permanentes
 
 - **R30:** traits NUNCA são materializados em `contact_state` — violação arquitetural
+- **R36:** campos 1:N (oportunidades, tickets) NUNCA são denormalizados em `contact_state` — usar EXISTS subquery via `opportunity_exists` resolver
 - **`project_traits` e `sync_field_definitions` NÃO são jobs coalesced** — múltiplos pending simultâneos por tenant são esperados e corretos
 - A unique index de deduplicação em `analytics.processing_jobs` cobre APENAS jobs coalesced (`refresh_features`, `refresh_rfm`, etc.) — `project_traits` e `sync_field_definitions` estão fora dessa lista intencionalmente
 - `tenant_id` vem sempre do job, nunca do payload
