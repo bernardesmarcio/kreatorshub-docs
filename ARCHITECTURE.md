@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.1 — R36: campos 1:N via EXISTS subquery (opportunity_exists resolver), drop contact_state denormalization*
+*Versão 7.2 — R37: blocos paralelos no segment builder, async segment refresh queue*
 
 ---
 
@@ -848,6 +848,117 @@ O evaluator opera em dois tiers para equilibrar performance e expressividade:
 **Coexistência com legacy:** `refreshSegments.ts` usa `rules_json_v2` se `ast_version >= 1`, senão fallback para `build_segment_where_clause`. Métrica `v2_ratio` logada por ciclo. Meta: 100%.
 
 **Estado da migração:** 24/24 segmentos do tenant principal migrados para `rules_json_v2`. Colunas adicionadas em `analytics.segments`: `rules_json_v2`, `ast_version`, `ast_hash`, `migrated_at`, `migration_warnings`.
+
+---
+
+## 18.15 Segment Builder — Blocos Paralelos
+
+**Status:** ✅ Operacional (Sprint 11)
+
+### Modelo mental
+
+O builder de segmentação usa **blocos paralelos** no primeiro nível. Cada bloco é uma lista de condições conectadas por AND (implícito). Os blocos se conectam entre si com E ou OU (operador **entre** blocos, não dentro).
+
+```
+┌─────────────────────────────────────┐
+│ Bloco 1                             │
+│   • Comprou produto A   (AND)       │
+│   • Comprou produto B   (AND)       │
+│   • Comprou produto C   (AND)       │
+└─────────────────────────────────────┘
+                 ─── OU ───
+┌─────────────────────────────────────┐
+│ Bloco 2                             │
+│   • Comprou produto D               │
+└─────────────────────────────────────┘
+                 ─── E ───
+┌─────────────────────────────────────┐
+│ Bloco 3                             │
+│   • Cidade = São Paulo              │
+└─────────────────────────────────────┘
+```
+
+**Lógica:** `(A E B E C) OU (D)` → dessa lista, filtra `cidade = SP`
+
+### Como funciona internamente
+
+**UI:** Cada bloco é um `UIBlock { group: RuleGroupType, joinOp: 'AND' | 'OR' }`. O `joinOp` define como ele se conecta ao bloco anterior (primeiro bloco é ignorado).
+
+**Recompose (UI → Backend AST):** Blocos consecutivos com mesmo `joinOp` são agrupados. Exemplo:
+- `[B1, OU:B2, E:B3]` → `AND( OR(B1, B2), B3 )`
+- `[B1, E:B2, E:B3]` → `AND(B1, B2, B3)`
+- `[B1, OU:B2, OU:B3]` → `OR(B1, B2, B3)`
+
+**Decompose (Backend AST → UI):** Recursivo — achata grupos aninhados de volta para blocos planos com joinOps corretos. `AND(OR(B1,B2), B3)` → `[B1, OU:B2, E:B3]`.
+
+**Controle de ciclo:** `internalChangeRef` evita que mudanças internas (emitChange) trigem re-decompose via useEffect. Só mudanças externas (template, load do DB) re-decompõem.
+
+### Regras permanentes
+
+1. Condições dentro de um bloco são **sempre AND** — sem toggle interno
+2. O operador E/OU é **entre blocos**, não dentro
+3. Botões "Adicionar bloco E" / "Adicionar bloco OU" definem o `joinOp` do novo bloco — blocos existentes não mudam
+4. `RuleGroup.tsx` usa `maxDepth={0}` dentro de blocos — sem sub-grupos aninhados na UI
+
+### Arquivos
+
+| Arquivo | Papel |
+|---|---|
+| `src/components/segmentation/SegmentBuilder.tsx` | Wrapper: decompose/recompose, state de UIBlocks, preview |
+| `src/components/segmentation/RuleGroup.tsx` | Renderiza um bloco (condições + add/remove). `maxDepth` controla nesting |
+| `src/components/segmentation/RuleRow.tsx` | Uma condição individual (campo, operador, valor) |
+| `src/types/segmentation.ts` | Tipos: `RuleGroup`, `RuleCondition`, `FieldDefinition` |
+| `src/types/segmentation-v2.ts` | Tipos AST v2: `ConditionNode`, `GroupNode`, `RulesJsonV2` + helpers de conversão |
+
+---
+
+## 18.16 Segment Refresh Queue — Cache Assíncrono
+
+**Status:** ✅ Operacional (Sprint 11)
+
+### Problema resolvido
+
+O trigger síncrono `refresh_segment_parties()` bloqueava 400-800ms por save de segmento. Com 100+ tenants e segmentos grandes (22k membros), isso causava timeouts.
+
+### Arquitetura
+
+```
+User salva segmento
+    │
+    ▼
+Trigger BEFORE (< 10ms)
+    ├── SET refresh_pending = true
+    └── INSERT INTO segment_refresh_queue
+
+Journeys worker (polling 5s)
+    │
+    ▼
+process_segment_refresh_queue()
+    ├── FOR UPDATE SKIP LOCKED
+    ├── refresh_segment_parties() (400-800ms em background)
+    ├── DELETE da fila
+    └── SET refresh_pending = false
+```
+
+### Componentes
+
+| Componente | Papel |
+|---|---|
+| `analytics.segment_refresh_queue` | Tabela fila (PK = segment_id, natural dedup) |
+| `analytics.segments.refresh_pending` | Flag booleana para feedback na UI |
+| `trg_queue_segment_refresh` | Trigger BEFORE no `analytics.segments` — enfileira em INSERT, mudança de regras, ou cache vazio |
+| `analytics.process_segment_refresh_queue()` | RPC batch processor (SKIP LOCKED, limit configurable) |
+| `analytics.queue_stale_segments()` | Enfileira segmentos não atualizados há 60+ min |
+| `analytics.queue_segment_for_refresh()` | Helper para enfileirar manualmente |
+| `workers/journeys/src/index.ts` | Scheduler polls `process_segment_refresh_queue` a cada 5s |
+| `workers/journeys/src/handlers/checkSegmentEntries.ts` | Safety net: se cache vazio, enfileira e retorna (próximo tick encontra membros) |
+
+### Regras permanentes
+
+1. Trigger NUNCA chama `refresh_segment_parties()` diretamente — sempre enfileira
+2. Worker usa `FOR UPDATE SKIP LOCKED` — sem contenção entre instâncias
+3. Após 3 tentativas com erro, item é removido da fila (`refresh_pending` resetado)
+4. Segmentos cluster/lookalike são ignorados (têm seus próprios pipelines)
 
 ---
 
