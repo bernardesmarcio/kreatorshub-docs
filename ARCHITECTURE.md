@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.10 — D5 ✅ pipeline SendGrid migrado para O(1), D26 ✅, D32 ✅, queue audit D41, D28 inventário factual*
+*Versão 7.11 — Sessão 20/03: workers migrados para worker.*, TTL integrations, D5 SendGrid pipeline completo*
 
 ---
 
@@ -94,6 +94,8 @@ Workers passam `p_handlers text[]` direto na chamada RPC `claim_jobs`, evitando 
 - `email-campaign-worker` → envio de emails (`prepareEmailBatch`, `sendEmailBatch`, `retrySoftBounce`)
 - `analytics-backfill-worker` → jobs de backfill e product linking isolados do pipeline crítico (`ENABLED_JOB_TYPES=link_products`)
 - `email-sync-worker` → sincronização de inbox Nylas (`deepSync`, `syncMessage`, `grantReauth`)
+
+**Schema de acesso dos workers (v7.11):** Todos os workers usam `worker.*` para job management (claim, complete, fail, block). Funções de domínio usam o schema nativo: `historical-sync` → `eduzz.*` e `integrations.*`; `email-sync` → `inbox.*`. **Zero stubs `public.*` de worker** — todos removidos.
 
 ### Regra de ouro de onde cada coisa fica
 
@@ -1099,12 +1101,12 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 
 | # | Item | Prioridade |
 |---|---|---|
-| D5 | ~~Migrar pipeline SendGrid para versão unificada~~ | ✅ Resolvido (v7.10) — `webhooks-sendgrid` O(1) + `integrations-worker` handlers |
+| D5 | ~~Migrar pipeline SendGrid para versão unificada~~ | ✅ Resolvido (v7.11) — `webhooks-sendgrid` O(1) + `integrations-worker` v81 handlers + URL migrada para `core.kreatorshub.com.br` em 5 subusers + `domain-delegation` atualizada |
 | D7 | Producer `responded_form_ids` em tempo real (hoje só backfill) | Pendente |
 | D8 | Producer `import_ids` em tempo real (hoje só backfill) | Pendente |
 | D9 | `journey_ids` em `contact_state` — producer não existe | Pendente |
 | D10 | `has_tag` GIN Phase 2 — bloqueado por product tags transitivas não estarem em `tag_ids` | Pendente |
-| D11 | `refreshFeatures` cleanup de parties com customer role revogada — zerar `monetary`/`frequency` órfãos em `contact_state` | Pendente |
+| D11 | ~~`refreshFeatures` cleanup de parties com customer role revogada~~ | ✅ Sem ação necessária (v7.11) — `refreshFeatures` recalcula do zero a cada execução, zero órfãos encontrados em auditoria |
 | D12 | Normalização de telefone (`phone_normalized` E.164) — `crm.party_person`, `sympla.participants`, todos os providers. Função utilitária compartilhada. Backfill + UI de indicador de cobertura. Campanhas WhatsApp filtram por `phone_normalized IS NOT NULL` | Pendente |
 | D13 | `DROP TABLE eduzz.integrations` — tabela legada. Toda leitura/escrita já migrada para `integrations.accounts`. RPCs atualizadas. Dropar após validação. | Pendente |
 | D14 | Auditoria preventiva de TTL em todas as filas do sistema — verificar se todas as filas têm: (1) cron de purge para rows terminais, (2) índice parcial cobrindo status ativo, (3) NOT EXISTS filtrando apenas status ativos. Ver R20. | Pendente |
@@ -1131,8 +1133,10 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D38 | **Alerta de anomalia pós-envio.** pg_cron job diário que detecta campanhas com `recipient_source = 'segment'` onde `recipient_count_at_send > segment_parties_snapshot * 1.5` OU `recipient_count_at_send > 80%` da base do tenant. INSERT em tabela de alertas. Depende das colunas de rastreabilidade adicionadas no Sprint 12 (Guard 1). | **P2** |
 | D39 | **Backend validation RPC para envio de campanha.** RPC `email.validate_campaign_send(p_tenant_id, p_recipient_count, p_segment_ids, p_recipient_source)` que valida server-side: (1) se source='segment', recipient_count <= SUM(segment_parties) * 1.1; (2) se source='all', recipient_count <= total_contacts do tenant; (3) retorna ok/reject com reason. Defense-in-depth — proteção redundante independente do frontend. | **P2** |
 | D40 | **party_id null em enrollments de formulário.** Jornada "Caminho de Madalena" teve 3 enrollments com `party_id` null, causando nó `create_opportunity` stuck (`next_execution_at = null`). Causa provável: `form_submission` criada antes do party ser vinculado, ou `checkFormEntries` não copiando `party_id`. **Investigar:** (1) verificar se `checkFormEntries` garante `party_id NOT NULL` antes de criar enrollment; (2) verificar se `form_submissions` com `party_id` null deveriam ser filtradas; (3) adicionar guard no enrollment: se `party_id IS NULL`, não criar enrollment e logar warning. | **P1** |
-| D41 | **Queue audit — filas sem TTL/purge.** Diagnóstico (2026-03-20): 3 filas sem purge cron: (1) `journeys.processing_jobs` — 76K rows / 55MB, sem cron; (2) `integrations.jobs` — 10K rows / 23MB, sem cron; (3) `integrations.webhook_events` — 1.9K rows / 10MB, sem cron. Adicionalmente, `analytics.segment_eval_queue` tem purge ativo (cada hora, TTL 24h) mas steady-state é 384K rows / 244MB porque taxa de inserção (~16K/h) acumula 24h de dados. Fix: reduzir TTL para 4h (projeção ~64MB) e criar pg_cron para as 3 filas sem purge. Ref: R20 (toda fila precisa de TTL na criação). | **P2** |
+| D41 | **Queue audit — filas sem TTL/purge.** ~~integrations.jobs~~ ✅ purge ativo (v7.11); ~~integrations.webhook_events~~ ✅ purge ativo (v7.11). Pendente: (1) `journeys.processing_jobs` — 76K rows / 55MB, sem cron. `analytics.segment_eval_queue` TTL 24h→4h pendente. Ref: R20. | **P3** — parcialmente resolvido |
 | D42 | **DROP tabelas Eduzz legadas** — `eduzz.integrations` e `core.eduzz_integrations`. Ambas substituídas por `integrations.accounts`. Bloqueado por Sprint Security — credenciais em texto plano precisam ser migradas antes do DROP. | Bloqueado |
+| B-17 | Testes de integração dos workers no tenant SaudeNow (`fe793fcd-7564-4d7c-b628-12a25e6d6656`) — criar jobs sintéticos para historical-sync, email-sync, ingestion e validar fluxo completo claim→running→success→analytics | Pendente |
+| B-18 | Mapper Eduzz — campos não mapeados em `commerce.transactions` (`installments`, `fee_value`, `net_gain`) — avaliar se devem ir para coluna dedicada ou campo extra do NormalizedTransaction | Pendente |
 
 ---
 
@@ -1224,6 +1228,39 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.11] — 2026-03-20
+
+### Workers Railway — migração public.* → worker.* concluída
+- `ingestion-worker`: já usava `worker.*` (confirmado, sem alteração)
+- `historical-sync`: migrado — `public.claim_jobs/complete_job/fail_job/get_jobs_count_grouped/bulk_enqueue_jobs` → `worker.*` e `integrations.*`
+- `email-sync`: migrado — `public.claim_jobs/complete_job/fail_job` → `worker.*`
+- Funções de domínio eduzz: `public.eduzz_increment_sync_progress` → `eduzz.increment_sync_progress` (atualizada com lógica robusta), `eduzz.claim_invoices_for_enrichment` criada (SKIP LOCKED)
+- Funções de domínio inbox: `public.upsert_message/batch_link_messages_to_crm/claim_active_accounts` → `inbox.*`
+- `public.*` stubs de job management: **zero** — 6 stubs dropados + 4 stubs de domínio dropados
+- `worker.*`: 10 funções canônicas (block_job, claim_jobs, claim_next_jobs, complete_job, enqueue_job, enqueue_webhook_job, fail_job, get_jobs_count_grouped, log_event, receive_webhook)
+
+### TTL/Purge — integrations (R20 cumprida)
+- `integrations.purge_old_jobs()` criada (retention: success=7d, terminal=30d; deleta `job_errors` dependentes)
+- `integrations.purge_old_webhook_events()` criada (retention: processed=7d, failed=30d; NOT EXISTS guard para FK)
+- pg_cron `purge-integrations-jobs` ativo (30 3 * * *)
+- pg_cron `purge-integrations-webhook-events` ativo (45 3 * * *)
+- Purge inicial: 10.722 jobs + 1.609 webhook_events removidos (11.480→758 jobs, 1.941→332 events)
+
+### D5 — SendGrid pipeline unificado ✅
+- `sendgrid-webhook` (inline, legado): URL migrada, não recebe mais tráfego
+- `webhooks-sendgrid` Edge Fn ativa: O(1) — recebe → salva raw → enfileira job → 200 (verificação ECDSA P-256)
+- `integrations-worker` v81: `registerSendgridHandlers` ativado
+- Pipeline: SendGrid → `webhooks-sendgrid` → `integrations.jobs` (provider='sendgrid') → `integrations-worker` → `email.*`
+- Handlers: `sendgrid:delivery_event` (bounce retry + supressão adaptativa), `sendgrid:engagement_event` (open/click tracking), `sendgrid:suppression_event` (unsubscribe + spam report)
+- URL webhook migrada para `https://core.kreatorshub.com.br/functions/v1/webhooks-sendgrid` em 5 subusers via action `migrate_webhooks`
+- `domain-delegation`: URL hardcoded atualizada + auth fix (JWT decode fallback para service_role)
+
+### Itens auditados e fechados
+- D11 (refreshFeatures roles revogados): ✅ zero órfãos em contact_state — refreshFeatures recalcula do zero
+- D41 (queue audit): ✅ parcial — integrations.jobs e webhook_events com purge; journeys.processing_jobs pendente
+- B-04 (webhooks eduzz orphaned 23–25/02): ✅ sem reprocessamento — transações já existiam via historical sync
+- B-05 (segment_parties não populado): ✅ trigger `trg_queue_segment_refresh` já existia e funcionava
 
 ## [v7.9] — 2026-03-20
 ### Auditoria Fase 2 — D-series consolidação
