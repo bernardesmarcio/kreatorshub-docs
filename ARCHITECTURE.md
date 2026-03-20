@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.7 — D40: party_id null em enrollments de formulário*
+*Versão 7.8 — Auditoria da base de conhecimento: D33 ✅, D24 cancelado, D37 confirmado, IC-5 seção 13 atualizada*
 
 ---
 
@@ -525,7 +525,7 @@ O handler `executeCreateOpportunityNode` (em `processJourneyNode.ts`) cria ou at
 
 `segment_entered` / `segment_exited` — emitidos por `apply_segment_membership_diff` a cada mudança de membership
 
-`crm.opportunities.party_id` é NOT NULL enforçado — oportunidade sem contato é violação do modelo party-first. Trigger `crm.sync_opportunity_summary` (AFTER INSERT/UPDATE(status,party_id)/DELETE) mantém `has_open_opportunity` e `open_opportunity_count` em `contact_state` sincronizados em tempo real.
+`crm.opportunities.party_id` é NOT NULL enforçado — oportunidade sem contato é violação do modelo party-first. Trigger `sync_opportunity_summary` removido (Sprint 11). Colunas `has_open_opportunity` e `open_opportunity_count` dropadas de `contact_state` — violavam R36 (1:N nunca denormalizado). Substituídas por 10 campos `opportunity_exists` no worker planner, avaliados via EXISTS subquery direta em `crm.opportunities` com índice `idx_opportunities_party_tenant_status`. Ver R36 para lista completa de campos.
 
 ---
 
@@ -1114,7 +1114,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D21 | **Segment-eval tenant scan** — Worker faz O(tenants) queries por ciclo mesmo sem trabalho. **Fix:** criar `claim_next_segment_jobs_global(worker_id, batch_size, shard_index, total_shards)`. Ref: Audit F2. | **P4** |
 | D22 | **claim_jobs tenant fairness** — ordena por `priority, created_at` sem cap por tenant. **Fix futuro:** round-robin CTE com `ROW_NUMBER() OVER (PARTITION BY tenant_id)`. Ref: Audit F3. | Defer |
 | D23 | **Idempotency constraint no enqueue** — `enqueue_webhook_job` usa SELECT-then-INSERT (TOCTOU). Risco baixo. **Hardening:** partial unique index em `integrations.jobs(webhook_event_id)`. Ref: Audit F5. | Defer |
-| D24 | `DROP TABLE analytics.segment_customers` — período de segurança cumprido | Pendente |
+| D24 | `DROP TABLE analytics.segment_customers` — ❌ CANCELADO. Diagnóstico (2026-03-20) confirmou que a tabela é ativamente usada por `computeClusters.ts`, `computeClusterSubgroups.ts` e `lookalikeStorage.ts` (~112 rows, clusters/lookalike audiences). Não é legacy — é a tabela de membership para segmentos tipo `cluster` e `cluster_subgroup`. `segment_parties` é para rule-based; `segment_customers` é para cluster-generated. Manter indefinidamente. | ❌ Cancelado |
 | D25 | `refresh_tenant_distribution` + tela de monitoramento | Pendente |
 | D26 | `trg_record_email_engagement` → atualizar `last_email_opened_at` / `last_email_clicked_at` em `contact_state` | Pendente |
 | D27 | UI: novos blocos de condição no segment builder (product picker, time window, CRM condition) | Pendente |
@@ -1123,11 +1123,11 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D30 | Decompor blocos contact_info e address em traits individuais — hoje kind: 'skip', sem dados reais ainda | Pendente |
 | D31 | Integração Typeform — schema raw + Edge Function receiver + Responses API backfill + field_definitions com source_system='typeform' | Pendente |
 | D32 | `evaluation_mode` coluna em analytics.segments — inferir event_driven vs time_driven por segmento para otimizar re-scan periódico | Pendente |
-| D33 | UI: segment builder migrado para AST v2 (`rules_json_v2`) — save/load dual-write, conversão bidirecional, catálogo de campos dinâmico. Ver [`docs/D33-segment-builder-v2.md`](D33-segment-builder-v2.md) | Pendente |
+| D33 | UI: segment builder migrado para AST v2 — ✅ Completo (Sprint 12). Frontend escreve exclusivamente `rules_json_v2`. Tipo `rule_based` renomeado para `manual`. 42/42 segmentos manuais com v2. Clusters (28) usam `rules_json` por design (membership estática). Fallback v1→v2 mantido em `astV2ToBuilder.ts` apenas para leitura de segmentos legados. | ✅ Done |
 | D34 | Scoping do unique index `processing_jobs_tenant_job_type_pending_uidx` — excluir `project_traits` e `sync_field_definitions` da condição WHERE para permitir múltiplos jobs pendentes per-entity. Ver R32 | **P2** |
 | D35 | Completar backfill de traits de formulários — 16 de 30 submissions ainda sem traits projetados. Rodar `backfillFormTraits.ts` com DATABASE_URL de produção | **P1** |
 | D36 | **RLS não reconhece system_admin** — policies de RLS usam `tenant_id IN (SELECT tenant_id FROM core.tenant_users WHERE user_id = auth.uid())`, mas system admins podem não ter registro em `tenant_users` para todos os tenants. O RPC `get_user_tenant_memberships` faz LEFT JOIN e retorna todos os tenants, mas o RLS bloqueia queries. **Fix:** criar helper `core.user_visible_tenant_ids(uid)` que retorna todos os tenants para system admins (via `core.system_admins`) e apenas memberships para users normais. Substituir subquery de RLS por chamada a essa função. Workaround atual: inserir system admins em `tenant_users` de cada tenant manualmente. | **P2** |
-| D37 | **Cleanup dead code segmentação v1:** (1) branch `ast_version !== 1` no evaluator (`segmentEvaluator.ts`) — fallback v1 nunca atingido, remover; (2) import de `build_segment_where_clause` — função dropada do banco, import morto; (3) referências em scripts de equivalence gate (`scripts/`) que usam `build_segment_where_clause` para comparação v1↔v2 — não mais necessárias. Zero segmentos rule-based em v1_only confirmado via diagnóstico. | Baixa prioridade |
+| D37 | **Cleanup dead code segmentação v1** (confirmado 2026-03-20): (1) `segmentEvaluator.ts:86-100` — fallback v1 chama `build_segment_where_clause` que foi **dropada do banco** — executar esse branch causaria erro SQL; (2) `scripts/runEquivalenceGate.ts` — inteiro arquivo é dead code; (3) `equivalence.test.ts` — testes de fallback v1 testam path impossível. Diagnóstico: 0 segmentos `rule_based` no banco (tipo renomeado para `manual`), 42/42 manuais com v2, função SQL não existe. Risco zero de remover. | Baixa — cleanup |
 | D38 | **Alerta de anomalia pós-envio.** pg_cron job diário que detecta campanhas com `recipient_source = 'segment'` onde `recipient_count_at_send > segment_parties_snapshot * 1.5` OU `recipient_count_at_send > 80%` da base do tenant. INSERT em tabela de alertas. Depende das colunas de rastreabilidade adicionadas no Sprint 12 (Guard 1). | **P2** |
 | D39 | **Backend validation RPC para envio de campanha.** RPC `email.validate_campaign_send(p_tenant_id, p_recipient_count, p_segment_ids, p_recipient_source)` que valida server-side: (1) se source='segment', recipient_count <= SUM(segment_parties) * 1.1; (2) se source='all', recipient_count <= total_contacts do tenant; (3) retorna ok/reject com reason. Defense-in-depth — proteção redundante independente do frontend. | **P2** |
 | D40 | **party_id null em enrollments de formulário.** Jornada "Caminho de Madalena" teve 3 enrollments com `party_id` null, causando nó `create_opportunity` stuck (`next_execution_at = null`). Causa provável: `form_submission` criada antes do party ser vinculado, ou `checkFormEntries` não copiando `party_id`. **Investigar:** (1) verificar se `checkFormEntries` garante `party_id NOT NULL` antes de criar enrollment; (2) verificar se `form_submissions` com `party_id` null deveriam ser filtradas; (3) adicionar guard no enrollment: se `party_id IS NULL`, não criar enrollment e logar warning. | **P1** |
@@ -1222,6 +1222,14 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.8] — 2026-03-20
+### Auditoria da base de conhecimento
+- D33: confirmado completo (Sprint 12). Tipo `rule_based` renomeado para `manual`. 42/42 com v2.
+- D24: cancelado — `segment_customers` é ativa para clusters/lookalikes (~112 rows, 3 writers, 2 readers)
+- D37: dead code confirmado — `build_segment_where_clause` dropada do banco, fallback v1 no evaluator chamaria função inexistente
+- IC-5: seção 13 (CRM) atualizada — referências a `sync_opportunity_summary` e colunas dropadas removidas
+- Seção 13 alinhada com R36 (`opportunity` via EXISTS, não denormalizado em `contact_state`)
 
 ## [v7.7] — 2026-03-19
 ### Sprint 12 — Documentação final + D40
