@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.4 — R36 expandido: opportunity_exists BULK_ONLY + changelog*
+*Versão 7.5 — Campaign Safety Guards: rastreabilidade, blast radius cap, R38 completo*
 
 ---
 
@@ -1088,7 +1088,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R35 | **Import de provider externo exige filtro de organização antes de gravar no raw.** Todo sync que busca dados de uma API externa deve filtrar pelo `provider_account_id` da conta vinculada ao tenant antes de inserir no raw. Nunca importar "tudo que a conta vê" sem validar que o dado pertence ao escopo daquele tenant. Checklist obrigatório antes de gravar qualquer registro no raw: (1) `tenant_id` está correto e explícito? (2) `integration_account_id` está preenchido? (3) O dado pertence à organização/conta vinculada ao tenant (não apenas acessível pelo token)? | Typeform importou forms de todas as organizações acessíveis pelo personal token sem filtrar por organização, gerando 271 registros órfãos com contaminação entre tenants. Corrigido com limpeza em Março/2026. |
 | R36 | **Campos 1:N nunca são denormalizados em `contact_state`.** `contact_state` é estritamente escalar (um valor por contato). Entidades com cardinalidade 1:N (oportunidades, tickets, forms futuras) são avaliadas via `EXISTS` subquery direta na tabela relacional com índices corretos. O worker planner (`opportunity_exists` resolver) e o SQL function (`eval_condition_v2`) devem gerar SQL equivalente para esses campos. Denormalizar 1:N em `contact_state` (ex: `has_open_opportunity boolean`) cria divergência semântica entre preview (SQL function faz subquery real) e refresh (worker lê snapshot stale), além de exigir pipeline de sync impossível de manter consistente. **Modo de execução: BULK_ONLY** — mudanças em oportunidades (criar, mover estágio, fechar) NÃO disparam reavaliação incremental do segmento; atualiza apenas no próximo ciclo de `evaluate_segment`. Se no futuro for necessário reatividade em tempo real, o pipeline de CRM deve enfileirar `evaluate_segment` jobs ao mudar status de oportunidades. **Campos implementados:** `has_opportunity`, `opportunity_status`, `opportunity_pipeline`, `opportunity_stage`, `opportunity_assigned_to`, `opportunity_lost_reason`, `opportunity_created_days`, `opportunity_closed_days`, `opportunity_won_days`, `opportunity_lost_days`. | `has_open_opportunity` e `open_opportunity_count` foram dropados de `contact_state` em Março/2026 após auditoria confirmar zero segmentos referenciando. Substituídos por 10 campos `opportunity_exists` no worker planner. Índice `idx_opportunities_party_tenant_status` criado para suportar as subqueries. |
 | R37 | **Impact Analysis obrigatória antes de mudança em contrato compartilhado.** Antes de alterar formato, renomear ou deprecar qualquer conceito listado em `DEPENDENCY_MAP.md`: (1) listar todos os readers e writers; (2) confirmar que TODOS os readers suportam o novo formato; (3) dual-write por pelo menos 1 sprint antes de dropar formato antigo; (4) campo vazio usado para filtrar = fail-closed (zero resultados, nunca "todos"). | Incidente Sprint 12 — campanha blast radius: migração `rules_json` → `rules_json_v2` quebrou email-campaign-worker que ainda lia v1 vazio, disparando para base inteira do tenant. |
-| R38 | **Fail-closed para membership vazia.** Se `segment_parties` retorna 0 rows para um `segment_id` que tem regras definidas (`rules_json_v2 IS NOT NULL`), a operação dependente (envio, export, enrollment) DEVE recusar, nunca prosseguir sem filtro. Zero members + regras definidas = refresh pendente, não "enviar para todos". Implementado em `CampaignSend.tsx` (`getSegmentRecipientsFailClosed`) e `generate-export/index.ts`. | Incidente Sprint 12 — mesma origem de R37. |
+| R38 | **Fail-closed para membership vazia.** Se `segment_parties` retorna 0 rows para um `segment_id` que tem regras definidas (`rules_json_v2 IS NOT NULL`), a operação dependente (envio, export, enrollment) DEVE recusar, nunca prosseguir sem filtro. Zero members + regras definidas = refresh pendente, não "enviar para todos". **Implementações:** (1) `CampaignSend.tsx` — `getSegmentRecipientsFailClosed()` tenta refresh e rejeita se ainda 0; (2) `generate-export/index.ts` — enfileira refresh e aborta export; (3) `checkSegmentEntries.ts` (worker handler) — guard com verificação de `rules_json_v2` + enqueue refresh; (4) `check-journey-entries/index.ts` (Edge Function legada) — guard equivalente como safety net. | Incidente Sprint 12 — mesma origem de R37. |
 
 ---
 
@@ -1126,7 +1126,9 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D34 | Scoping do unique index `processing_jobs_tenant_job_type_pending_uidx` — excluir `project_traits` e `sync_field_definitions` da condição WHERE para permitir múltiplos jobs pendentes per-entity. Ver R32 | **P2** |
 | D35 | Completar backfill de traits de formulários — 16 de 30 submissions ainda sem traits projetados. Rodar `backfillFormTraits.ts` com DATABASE_URL de produção | **P1** |
 | D36 | **RLS não reconhece system_admin** — policies de RLS usam `tenant_id IN (SELECT tenant_id FROM core.tenant_users WHERE user_id = auth.uid())`, mas system admins podem não ter registro em `tenant_users` para todos os tenants. O RPC `get_user_tenant_memberships` faz LEFT JOIN e retorna todos os tenants, mas o RLS bloqueia queries. **Fix:** criar helper `core.user_visible_tenant_ids(uid)` que retorna todos os tenants para system admins (via `core.system_admins`) e apenas memberships para users normais. Substituir subquery de RLS por chamada a essa função. Workaround atual: inserir system admins em `tenant_users` de cada tenant manualmente. | **P2** |
-| D37 | **Cleanup dead code segmentação v1:** remover fallback v1 em `segmentEvaluator.ts` que referencia `build_segment_where_clause` (função dropada do banco). Zero segmentos rule-based em v1_only — fallback nunca será atingido. Remover imports, branches e funções mortas. Remover também `build_segment_where_clause` legada dos scripts de equivalence gate. | Baixa prioridade |
+| D37 | **Cleanup dead code segmentação v1:** (1) branch `ast_version !== 1` no evaluator (`segmentEvaluator.ts`) — fallback v1 nunca atingido, remover; (2) import de `build_segment_where_clause` — função dropada do banco, import morto; (3) referências em scripts de equivalence gate (`scripts/`) que usam `build_segment_where_clause` para comparação v1↔v2 — não mais necessárias. Zero segmentos rule-based em v1_only confirmado via diagnóstico. | Baixa prioridade |
+| D38 | **Alerta de anomalia pós-envio.** pg_cron job diário que detecta campanhas com `recipient_source = 'segment'` onde `recipient_count_at_send > segment_parties_snapshot * 1.5` OU `recipient_count_at_send > 80%` da base do tenant. INSERT em tabela de alertas. Depende das colunas de rastreabilidade adicionadas no Sprint 12 (Guard 1). | **P2** |
+| D39 | **Backend validation RPC para envio de campanha.** RPC `email.validate_campaign_send(p_tenant_id, p_recipient_count, p_segment_ids, p_recipient_source)` que valida server-side: (1) se source='segment', recipient_count <= SUM(segment_parties) * 1.1; (2) se source='all', recipient_count <= total_contacts do tenant; (3) retorna ok/reject com reason. Defense-in-depth — proteção redundante independente do frontend. | **P2** |
 
 ---
 
@@ -1218,6 +1220,14 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.5] — 2026-03-19
+### Campaign Safety Guards
+- Guard 1: colunas de rastreabilidade em `campaign_sends` (`recipient_source`, `segment_ids`, `segment_parties_snapshot`, `recipient_count_at_send`)
+- Guard 2: blast radius cap (ratio > 1.1 = abort), confirmação "Todos" com digitação obrigatória, hard cap 50K
+- R38: implementação completa em 4 pontos (CampaignSend, generate-export, checkSegmentEntries worker, check-journey-entries Edge Function)
+- D38: alerta pós-envio (P2 — pendente)
+- D39: backend validation RPC (P2 — pendente)
 
 ## [v7.4] — 2026-03-19
 ### Segmentation Engine — Oportunidades
