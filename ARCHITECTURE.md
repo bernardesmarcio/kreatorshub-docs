@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.9 — Auditoria Fase 2: D26 ✅, D32 ✅, queue audit D41, D28 inventário factual*
+*Versão 7.10 — D5 ✅ pipeline SendGrid migrado para O(1), D26 ✅, D32 ✅, queue audit D41, D28 inventário factual*
 
 ---
 
@@ -54,8 +54,8 @@ O que fazer com o que sabemos.
 - `nylas-sync` → webhook-driven | `nylas:sync_message` e sub-handlers
 - `eduzz-receiver-webhook` → receiver webhook-driven | salva raw em `integrations.webhook_events` + mapeia → NormalizedTransaction + enfileira jobs (provider=`ingestion`) | URL pública: `core.kreatorshub.com.br/functions/v1/eduzz-receiver-webhook/{slug}` | aceita slug no path ou `?tenant_id=uuid` (legado)
 - `sympla-sync` → cron-driven (sem webhooks nativos) | `sympla:sync_orders`, `sympla:sync_participants`
-- `sendgrid-webhook` → receiver webhook-driven | pipeline ativo (escrita direta em `email.*`) | **rename pendente → `sendgrid-receiver-webhook`**
-- `webhooks-sendgrid` → receiver alternativo (inativo — pipeline v2 planejado, ver D5)
+- `webhooks-sendgrid` → receiver webhook-driven O(1) | salva raw em `integrations.webhook_events` + enfileira jobs (`sendgrid:delivery_event`, `sendgrid:engagement_event`, `sendgrid:suppression_event`) | URL: `core.kreatorshub.com.br/functions/v1/webhooks-sendgrid` | verificação ECDSA P-256
+- `sendgrid-webhook` → **LEGADO** (desativado — URL migrada para `webhooks-sendgrid`)
 - `[outros: oauth, utils]` → funções de suporte (ex: `eduzz-oauth-callback`)
 
 ### Convenção de nomenclatura — Edge Functions
@@ -1099,7 +1099,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 
 | # | Item | Prioridade |
 |---|---|---|
-| D5 | Migrar pipeline SendGrid para versão unificada | Pendente |
+| D5 | ~~Migrar pipeline SendGrid para versão unificada~~ | ✅ Resolvido (v7.10) — `webhooks-sendgrid` O(1) + `integrations-worker` handlers |
 | D7 | Producer `responded_form_ids` em tempo real (hoje só backfill) | Pendente |
 | D8 | Producer `import_ids` em tempo real (hoje só backfill) | Pendente |
 | D9 | `journey_ids` em `contact_state` — producer não existe | Pendente |
