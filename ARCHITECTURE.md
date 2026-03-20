@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.8 — Auditoria da base de conhecimento: D33 ✅, D24 cancelado, D37 confirmado, IC-5 seção 13 atualizada*
+*Versão 7.9 — Auditoria Fase 2: D26 ✅, D32 ✅, queue audit D41, D28 inventário factual*
 
 ---
 
@@ -1116,13 +1116,13 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D23 | **Idempotency constraint no enqueue** — `enqueue_webhook_job` usa SELECT-then-INSERT (TOCTOU). Risco baixo. **Hardening:** partial unique index em `integrations.jobs(webhook_event_id)`. Ref: Audit F5. | Defer |
 | D24 | `DROP TABLE analytics.segment_customers` — ❌ CANCELADO. Diagnóstico (2026-03-20) confirmou que a tabela é ativamente usada por `computeClusters.ts`, `computeClusterSubgroups.ts` e `lookalikeStorage.ts` (~112 rows, clusters/lookalike audiences). Não é legacy — é a tabela de membership para segmentos tipo `cluster` e `cluster_subgroup`. `segment_parties` é para rule-based; `segment_customers` é para cluster-generated. Manter indefinidamente. | ❌ Cancelado |
 | D25 | `refresh_tenant_distribution` + tela de monitoramento | Pendente |
-| D26 | `trg_record_email_engagement` → atualizar `last_email_opened_at` / `last_email_clicked_at` em `contact_state` | Pendente |
+| D26 | `trg_record_email_engagement` — ✅ Completo. Trigger `trg_record_email_engagement` ativo em `email.email_events`. Colunas `last_email_opened_at`, `last_email_clicked_at`, `email_open_rate_30d`, `email_click_rate_30d` presentes em `contact_state`. | ✅ Done |
 | D27 | UI: novos blocos de condição no segment builder (product picker, time window, CRM condition) | Pendente |
-| D28 | D6 Fase 3 — `DROP COLUMN customer_id` (tabelas restantes) + 7 FKs + recriar 4 views | Pendente |
+| D28 | D6 Fase 3 — `DROP COLUMN customer_id`. Diagnóstico (2026-03-20): 17 tabelas/views ainda com `customer_id` — analytics (7): `customer_cluster_assignments`, `customer_cluster_subgroup_assignments`, `customer_lookalike_scores`, `lifecycle_events`, `segment_customers`, `v_segment_base`, `v_segment_leads_base`; commerce (2): `transactions`, `archived_transactions`; core (1): `eduzz_webhook_events`; crm (4): `customer_badges`, `customer_tags`, `opportunities`, `vw_parties_unified`; eduzz (2): `buyers`, `webhook_events`; journeys (1): `journey_enrollments`. Trabalho substancial — requer migração por fases com validação entre cada DROP. | Pendente |
 | D29 | Performance loading timeout — tenant escola-do-fluxo. Profiling de RPCs lentas (`get_dashboard_data`, `get_pareto_analysis`) + lazy loading analytics. Sentry JAVASCRIPT-REACT-22, 21, 1S | Investigar |
 | D30 | Decompor blocos contact_info e address em traits individuais — hoje kind: 'skip', sem dados reais ainda | Pendente |
 | D31 | Integração Typeform — schema raw + Edge Function receiver + Responses API backfill + field_definitions com source_system='typeform' | Pendente |
-| D32 | `evaluation_mode` coluna em analytics.segments — inferir event_driven vs time_driven por segmento para otimizar re-scan periódico | Pendente |
+| D32 | `evaluation_mode` em segments — ✅ Completo. Coluna existe e é populada automaticamente. Worker: `segment-sql-builder.ts:109-146` infere mode por condições temporais. Frontend: `segmentService.ts:104-120` `inferEvaluationMode()` no create/update. Estado atual: 70/70 segmentos = `event_driven` (nenhum usa condições temporais `within_last`). | ✅ Done |
 | D33 | UI: segment builder migrado para AST v2 — ✅ Completo (Sprint 12). Frontend escreve exclusivamente `rules_json_v2`. Tipo `rule_based` renomeado para `manual`. 42/42 segmentos manuais com v2. Clusters (28) usam `rules_json` por design (membership estática). Fallback v1→v2 mantido em `astV2ToBuilder.ts` apenas para leitura de segmentos legados. | ✅ Done |
 | D34 | Scoping do unique index `processing_jobs_tenant_job_type_pending_uidx` — excluir `project_traits` e `sync_field_definitions` da condição WHERE para permitir múltiplos jobs pendentes per-entity. Ver R32 | **P2** |
 | D35 | Completar backfill de traits de formulários — 16 de 30 submissions ainda sem traits projetados. Rodar `backfillFormTraits.ts` com DATABASE_URL de produção | **P1** |
@@ -1131,6 +1131,8 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D38 | **Alerta de anomalia pós-envio.** pg_cron job diário que detecta campanhas com `recipient_source = 'segment'` onde `recipient_count_at_send > segment_parties_snapshot * 1.5` OU `recipient_count_at_send > 80%` da base do tenant. INSERT em tabela de alertas. Depende das colunas de rastreabilidade adicionadas no Sprint 12 (Guard 1). | **P2** |
 | D39 | **Backend validation RPC para envio de campanha.** RPC `email.validate_campaign_send(p_tenant_id, p_recipient_count, p_segment_ids, p_recipient_source)` que valida server-side: (1) se source='segment', recipient_count <= SUM(segment_parties) * 1.1; (2) se source='all', recipient_count <= total_contacts do tenant; (3) retorna ok/reject com reason. Defense-in-depth — proteção redundante independente do frontend. | **P2** |
 | D40 | **party_id null em enrollments de formulário.** Jornada "Caminho de Madalena" teve 3 enrollments com `party_id` null, causando nó `create_opportunity` stuck (`next_execution_at = null`). Causa provável: `form_submission` criada antes do party ser vinculado, ou `checkFormEntries` não copiando `party_id`. **Investigar:** (1) verificar se `checkFormEntries` garante `party_id NOT NULL` antes de criar enrollment; (2) verificar se `form_submissions` com `party_id` null deveriam ser filtradas; (3) adicionar guard no enrollment: se `party_id IS NULL`, não criar enrollment e logar warning. | **P1** |
+| D41 | **Queue audit — filas sem TTL/purge.** Diagnóstico (2026-03-20): 3 filas sem purge cron: (1) `journeys.processing_jobs` — 76K rows / 55MB, sem cron; (2) `integrations.jobs` — 10K rows / 23MB, sem cron; (3) `integrations.webhook_events` — 1.9K rows / 10MB, sem cron. Adicionalmente, `analytics.segment_eval_queue` tem purge ativo (cada hora, TTL 24h) mas steady-state é 384K rows / 244MB porque taxa de inserção (~16K/h) acumula 24h de dados. Fix: reduzir TTL para 4h (projeção ~64MB) e criar pg_cron para as 3 filas sem purge. Ref: R20 (toda fila precisa de TTL na criação). | **P2** |
+| D42 | **DROP tabelas Eduzz legadas** — `eduzz.integrations` e `core.eduzz_integrations`. Ambas substituídas por `integrations.accounts`. Bloqueado por Sprint Security — credenciais em texto plano precisam ser migradas antes do DROP. | Bloqueado |
 
 ---
 
@@ -1222,6 +1224,15 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.9] — 2026-03-20
+### Auditoria Fase 2 — D-series consolidação
+- D26: confirmado completo — trigger `trg_record_email_engagement` + 4 colunas em `contact_state`
+- D32: confirmado completo — `evaluation_mode` populado automaticamente, 70/70 = `event_driven`
+- D28: atualizado com inventário factual — 17 tabelas/views com `customer_id` em 6 schemas
+- D41: queue audit — 3 filas sem purge (`journeys` 76K, `integrations` 10K+1.9K), `segment_eval_queue` TTL 24h→4h
+- D42: DROP tabelas Eduzz legadas (bloqueado por Sprint Security)
+- Eduzz webhooks confirmados ativos (último evento: 2026-03-20 20:12)
 
 ## [v7.8] — 2026-03-20
 ### Auditoria da base de conhecimento
