@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.5 — Campaign Safety Guards: rastreabilidade, blast radius cap, R38 completo*
+*Versão 7.6 — R39: Journey node skip must fail, Docker cache lesson*
 
 ---
 
@@ -1089,6 +1089,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R36 | **Campos 1:N nunca são denormalizados em `contact_state`.** `contact_state` é estritamente escalar (um valor por contato). Entidades com cardinalidade 1:N (oportunidades, tickets, forms futuras) são avaliadas via `EXISTS` subquery direta na tabela relacional com índices corretos. O worker planner (`opportunity_exists` resolver) e o SQL function (`eval_condition_v2`) devem gerar SQL equivalente para esses campos. Denormalizar 1:N em `contact_state` (ex: `has_open_opportunity boolean`) cria divergência semântica entre preview (SQL function faz subquery real) e refresh (worker lê snapshot stale), além de exigir pipeline de sync impossível de manter consistente. **Modo de execução: BULK_ONLY** — mudanças em oportunidades (criar, mover estágio, fechar) NÃO disparam reavaliação incremental do segmento; atualiza apenas no próximo ciclo de `evaluate_segment`. Se no futuro for necessário reatividade em tempo real, o pipeline de CRM deve enfileirar `evaluate_segment` jobs ao mudar status de oportunidades. **Campos implementados:** `has_opportunity`, `opportunity_status`, `opportunity_pipeline`, `opportunity_stage`, `opportunity_assigned_to`, `opportunity_lost_reason`, `opportunity_created_days`, `opportunity_closed_days`, `opportunity_won_days`, `opportunity_lost_days`. | `has_open_opportunity` e `open_opportunity_count` foram dropados de `contact_state` em Março/2026 após auditoria confirmar zero segmentos referenciando. Substituídos por 10 campos `opportunity_exists` no worker planner. Índice `idx_opportunities_party_tenant_status` criado para suportar as subqueries. |
 | R37 | **Impact Analysis obrigatória antes de mudança em contrato compartilhado.** Antes de alterar formato, renomear ou deprecar qualquer conceito listado em `DEPENDENCY_MAP.md`: (1) listar todos os readers e writers; (2) confirmar que TODOS os readers suportam o novo formato; (3) dual-write por pelo menos 1 sprint antes de dropar formato antigo; (4) campo vazio usado para filtrar = fail-closed (zero resultados, nunca "todos"). | Incidente Sprint 12 — campanha blast radius: migração `rules_json` → `rules_json_v2` quebrou email-campaign-worker que ainda lia v1 vazio, disparando para base inteira do tenant. |
 | R38 | **Fail-closed para membership vazia.** Se `segment_parties` retorna 0 rows para um `segment_id` que tem regras definidas (`rules_json_v2 IS NOT NULL`), a operação dependente (envio, export, enrollment) DEVE recusar, nunca prosseguir sem filtro. Zero members + regras definidas = refresh pendente, não "enviar para todos". **Implementações:** (1) `CampaignSend.tsx` — `getSegmentRecipientsFailClosed()` tenta refresh e rejeita se ainda 0; (2) `generate-export/index.ts` — enfileira refresh e aborta export; (3) `checkSegmentEntries.ts` (worker handler) — guard com verificação de `rules_json_v2` + enqueue refresh; (4) `check-journey-entries/index.ts` (Edge Function legada) — guard equivalente como safety net. | Incidente Sprint 12 — mesma origem de R37. |
+| R39 | **Skip em nó de automação DEVE retornar `success: false` + `waitUntil`.** Quando um nó `send_email` detecta que a campanha não está pronta (status não-enviável), o handler deve retornar `{ success: false, waitUntil }` para que o enrollment fique em espera e reprocesse. Retornar `success: true` com skip faz o enrollment avançar para o próximo nó sem enviar o email, perdendo o envio silenciosamente. Status `automation` é um status válido para envio em contexto de journey — não deve ser rejeitado. **Lição adicional: Docker layer cache.** Workers containerizados (Railway, ECS, etc.) podem reutilizar layer de build anterior mesmo após push de novo código. Sempre incluir `BUILD_VERSION` constante no entrypoint do worker para: (1) invalidar cache do `COPY src` layer a cada mudança, (2) confirmar nos logs qual versão está rodando. | Incidente Sprint 13 — commit `c3f172e` corrigiu send_email mas Railway serviu código antigo por cache Docker. Worker logava `campaign_not_ready/automation` com `success: true` (código antigo) em vez de enviar o email. 19 enrollments ficaram stuck. |
 
 ---
 
@@ -1220,6 +1221,13 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.6] — 2026-03-20
+### Journey Node Skip + Docker Cache Fix
+- R39: send_email node skip deve retornar `success: false` + `waitUntil`, não `success: true`
+- Status `automation` é válido para envio em contexto de journey
+- BUILD_VERSION marker adicionado ao journey worker para deploy verification
+- Lição: Docker layer cache pode servir código antigo — sempre ter marker de versão no entrypoint
 
 ## [v7.5] — 2026-03-19
 ### Campaign Safety Guards
