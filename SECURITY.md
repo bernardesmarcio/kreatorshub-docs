@@ -1,14 +1,14 @@
 # KreatorsHub — Security Architecture & Compliance Roadmap
 
-## Estado: Sprint 5 — Completo ✅
-## Última atualização: 2026-03-10
-## Versão: 1.4
+## Estado: Sprint 5 — Completo ✅ | Auditoria factual: 2026-03-20
+## Última atualização: 2026-03-20
+## Versão: 1.5
 
 ---
 
 # ESTADO ATUAL E PRÓXIMOS PASSOS
 
-> **Última atualização:** 2026-03-10 | **Versão:** 1.4
+> **Última atualização:** 2026-03-20 | **Versão:** 1.5
 >
 > Esta seção é o ponto de entrada para continuidade entre sessões. Leia aqui primeiro.
 
@@ -84,13 +84,26 @@
 | G-004 | MFA não enforced | Sprint 8 |
 | G-008 | Sem SIEM integration | Sprint 12 |
 | G-009 | Sem incident runbook | Sprint 16 |
+| G-012 | `authenticated` com TRUNCATE em schemas de produção (commerce, community, content, core, journeys). TRUNCATE bypassa RLS. Resquício de `GRANT ALL` pré-Sprint 1. | Sprint 6 (P1) |
+| G-013 | 10 funções SECURITY DEFINER sem `search_path` — todas de segmentação (analytics e api): `get_segments_with_live_count`, `process_segment_refresh_queue`, `queue_segment_for_refresh`, `queue_stale_segments`, `trg_queue_segment_refresh`, `trg_refresh_segment_parties_on_change`, `detect_segment_entity_type`, `get_segment_preview`, `refresh_all_segments`. Criadas pós-Sprint 3. | Sprint 6 (P3) |
+
+### Snapshot de Segurança (2026-03-20)
+
+| Métrica | Valor | Tendência |
+|---------|-------|-----------|
+| Tabelas com RLS | 227 | ✅ Estável |
+| Tabelas multi-tenant sem RLS | 2 (fila + cache) | ✅ Aceitas |
+| SECURITY DEFINER functions | 364 | ⚠️ 10 sem search_path (G-013) |
+| Audit triggers (tabelas × operações) | 33 (11 tabelas) | ⚠️ Faltam: checkout_offers, checkout_orders, opportunities, eduzz.integrations |
+| Workers com credencial compartilhada | 8/8 | ❌ Todos mesma DATABASE_URL |
+| Credenciais em texto plano | ~20 colunas / 7 tabelas | ❌ Sprint 4 pausado |
 
 ### Roadmap Futuro
 
 | Sprint | Escopo | Complexidade | Pré-requisito |
 |--------|--------|--------------|---------------|
 | Sprint 4 completo | Migrar credenciais para Vault/encrypted | 🟠 SQL + código | Decisões D-SEC-1/2/3 |
-| Sprint 6 | Schema `api` único exposto | 🟠 Médio | — |
+| Sprint 6 | Revogar grants excessivos (G-012) + Schema `api` audit + DEFINER search_path fix (G-013) | 🟡 Baixo-Médio | — |
 | Sprint 7 | Hardening final Fase 1 | 🟡 Baixo | — |
 | Sprint 8-9 | SSO/SAML, MFA enforcement | 🔴 Enterprise | — |
 | Sprint 10-11 | Field encryption, Vault centralizado | 🔴 Enterprise | Sprint 4 |
@@ -320,7 +333,13 @@ app_auth.perm_version() → integer         -- cache busting
 
 ### 6.1 Isolamento Multi-tenant (RLS)
 
-**Status:** ✅ Completo — Sprint 2 (2026-03-10). 0 tabelas multi-tenant sem RLS.
+**Status:** ✅ Auditado 2026-03-20 — 227 tabelas com RLS, 2 exceções aceitas.
+
+**Exceções aceitas:**
+- `analytics.segment_refresh_queue` — fila interna, sem dados sensíveis
+- `typeform.themes_cache` — cache de temas, read-only
+
+Ambas não são expostas via PostgREST.
 
 **Padrão de policy (Sprint 2):**
 ```sql
@@ -409,13 +428,17 @@ CREATE POLICY "service_role_all" ON schema.table
 
 ### 7.1 Schemas Expostos vs Internos
 
-**Status:** ⚠️ A auditar — Sprint 0
+**Status:** ⚠️ Auditado 2026-03-20 — grants excessivos detectados
+
+**Estado factual (2026-03-20):**
+- `anon`: SELECT em `analytics` (3), `content` (3), `crm` (7), `forms` (5 SELECT + 2 INSERT)
+- `authenticated`: CRUD amplo em 18 schemas — commerce, community, content, core, crm, doare, eduzz, email, forms, imports, inbox, integrations, journeys, smart_forms, whatsapp
+- ⚠️ **RISCO G-012:** `authenticated` tem TRUNCATE, REFERENCES, TRIGGER em schemas de produção (commerce, community, content, core, journeys). TRUNCATE bypassa RLS. Resquício de `GRANT ALL` pré-hardening.
 
 **Alvo:**
 - `api` → único schema exposto (views SECURITY INVOKER)
-- Todos os outros → schemas privados
-
-**Estado atual:** Ver seção 10 (Inventário)
+- Revogar TRUNCATE, REFERENCES, TRIGGER de `authenticated` em todos os schemas (G-012)
+- Restringir grants ao mínimo necessário por schema
 
 ### 7.2 SECURITY DEFINER vs INVOKER
 
@@ -452,16 +475,22 @@ CREATE INDEX idx_table_tenant_deleted ON schema.table(tenant_id) WHERE deleted_a
 
 ### 8.1 Credenciais por Worker
 
-**Status:** ⚠️ A auditar — Sprint 0
+**Status:** ⚠️ Auditado 2026-03-20 — credencial compartilhada
 
-| Worker | Credencial atual | Credencial alvo |
-|--------|------------------|-----------------|
-| ingestion-worker | ? | Dedicada |
-| analytics-worker | ? | Dedicada |
-| journeys-worker | ? | Dedicada |
-| journeys-event-worker | ? | Dedicada |
-| email-campaign-worker | ? | Dedicada |
-| eduzz-enrichment | ? | Dedicada |
+**Estado factual:** Todos os 8 workers usam a mesma `DATABASE_URL` (conexão direta via `postgres` library). Nenhum usa Supabase JS client. Nenhum tem role dedicado.
+
+| Worker | Credencial atual | Risco |
+|--------|------------------|-------|
+| ingestion-worker | DATABASE_URL compartilhada | Comprometimento de 1 = acesso total |
+| analytics-worker | DATABASE_URL compartilhada | Idem |
+| journeys-worker | DATABASE_URL compartilhada | Idem |
+| journeys-event-worker | DATABASE_URL compartilhada | Idem |
+| email-campaign-worker | DATABASE_URL compartilhada | Idem |
+| email-sync-worker | DATABASE_URL compartilhada | Idem |
+| historical-sync-worker | DATABASE_URL compartilhada | Idem |
+| pull-sync-worker | DATABASE_URL compartilhada | Idem |
+
+**Alvo (Sprint 8+):** Roles PostgreSQL dedicados por worker com grants mínimos. Ex: `analytics_worker_role` com SELECT/INSERT em `analytics.*`, sem acesso a `email.*` ou `commerce.*`.
 
 ### 8.2 service_role Scope
 

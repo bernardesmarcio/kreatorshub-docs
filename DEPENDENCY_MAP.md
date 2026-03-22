@@ -3,7 +3,116 @@
 > **REGRA R37**: Antes de alterar qualquer item listado aqui, verificar TODOS os readers/writers.
 > Atualizar este arquivo sempre que adicionar novo consumidor.
 >
-> Gerado em: 2026-03-19 · Última atualização: 2026-03-19
+> Gerado em: 2026-03-19 · Última atualização: 2026-03-20
+
+---
+
+## Queue Routing Map
+
+> **REGRA R33**: Job enfileirado na tabela/worker errado fica pending infinitamente sem erro.
+> Antes de enfileirar: (1) confirmar a tabela-fila correta, (2) confirmar que o job_type está na allowlist do worker consumidor.
+
+### Roteamento por tabela-fila
+
+| Tabela-fila | Worker consumidor | Claim RPC | Job types aceitos |
+|---|---|---|---|
+| `integrations.jobs` | ingestion-worker | `worker.claim_jobs(worker_id, handler_list)` | `commerce:process_batch`, `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment` |
+| `integrations.jobs` | historical-sync-worker | `worker.claim_jobs(worker_id, handler_list)` | `eduzz:import_sales_page`, `eduzz:import_products`, `eduzz:enrich_sales`, `eduzz:enrich_invoice`, `eduzz:get_sales_count`, `sympla:historical_sync`, `typeform:sync_forms`, `typeform:sync_responses`, `typeform:enrich_themes`, `typeform:promote_forms`, `typeform:promote_responses`, `typeform:backfill_settings` |
+| `integrations.jobs` | email-sync-worker | `worker.claim_jobs(worker_id, handler_list)` | `nylas:deep_sync`, `nylas:deep_sync_folder`, `nylas:initial_sync`, `cache_attachments_scan`, `cache_attachment_batch`, `cleanup_jobs` |
+| `integrations.sync_schedules` | pull-sync-worker | `integrations.claim_sync_schedules(worker_id, providers)` | N/A (schedule-based por provider: `sympla`, `doare`, `typeform`) |
+| `analytics.processing_jobs` | analytics-worker APENAS | `analytics.claim_next_jobs(worker_id, batch)` | `refresh_features`, `refresh_rfm`, `refresh_reactivation`, `refresh_segments`, `compute_clusters`, `compute_lookalikes`, `compute_cluster_subgroups`, `sync_customers`, `compute_lookalike_audience`, `link_products`, `project_traits`, `sync_field_definitions` |
+| `journeys.processing_jobs` | journeys-worker | `journeys.claim_next_job(worker_id)` | `check_segment_entries`, `check_form_entries`, `check_event_entries`, `process_enrollment`, `link_submission_to_lead` |
+| `journeys.processing_jobs` | email-campaign-worker | `journeys.claim_next_job(worker_id)` | `prepare_email_batch`, `send_email_batch`, `retry_soft_bounce` |
+| `journeys.event_processing_jobs` | journeys-event-worker APENAS | FOR UPDATE SKIP LOCKED direto | Status-based (`pending`/`retry`), sem job_type — processa todos os eventos disponíveis |
+| `analytics.segment_eval_queue` | segment-eval-worker (analytics) | `analytics.claim_next_jobs` | N/A (item-based, não job_type) |
+| `analytics.segment_refresh_queue` | DB-only (RPC) | `analytics.process_segment_refresh_queue()` | N/A (item-based) |
+
+### Erros comuns de roteamento
+
+| Erro | Sintoma | Regra violada |
+|---|---|---|
+| `project_traits` enfileirado em `integrations.jobs` | Job pending infinito — ingestion-worker não reconhece o tipo | R33 |
+| Job sem `capability` em `integrations.jobs` | Worker filtra por capability e ignora o job | R31 |
+| `commerce:process_batch` enviado para analytics | analytics-worker não tem handler, job pending | R33 |
+| Qualquer job novo sem verificar allowlist | Pending sem erro até alguém investigar | R33 |
+
+### Regra para novo job_type
+
+1. Decidir: job coalescente (1 por tenant, ex: `refresh_rfm`) ou per-entity (1 por submission, ex: `project_traits`)
+2. Escolher tabela-fila com base no worker que vai consumir
+3. Verificar allowlist (`ENABLED_JOB_TYPES` / `ENABLED_HANDLERS` / handler map) do worker
+4. Se per-entity: verificar se unique index de coalescing não bloqueia (R32)
+5. Adicionar mapeamento nesta tabela
+
+---
+
+## Pipeline Invariants
+
+> **Propósito:** Cada pipeline tem pré-condições que DEVEM ser verdade antes do dado avançar.
+> Violação de invariante = dado corrompido propagando silenciosamente.
+> Regra geral: **falhar ruidosamente no ponto de entrada, não silenciosamente no ponto de consumo.**
+
+### Form → Traits (`traitProducer.ts`)
+
+| Invariante | Onde verificar | O que acontece se violado |
+|---|---|---|
+| `party_id IS NOT NULL` na submission | `traitProducer.ts:550` — desestrutura `party_id` da submission | Traits escritos com `party_id` do submission — se null, INSERT falha por FK constraint em `party_trait_*` |
+| `field_definitions` existem para o form | `traitProducer.ts:571` — `if (!fd) continue` | Retorna 0 traits silenciosamente (skip individual, não erro) |
+| `form_version.status = 'published'` | Trigger `trg_enqueue_field_sync` | `sync_field_definitions` só roda para published — se form não publicou, field_definitions não existem |
+| Rodar `sync_field_definitions` ANTES de `project_traits` | Ordem de execução no pipeline | Sem field_definitions, `processSubmission` retorna 0 traits. Guard: `if (!fd) continue` na linha 571 |
+
+### Form → Journey Enrollment (`checkFormEntries`)
+
+| Invariante | Onde verificar | O que acontece se violado |
+|---|---|---|
+| `party_id IS NOT NULL` na enrollment | `checkFormEntries.ts:148-156` — resolve via `vw_parties_unified` | **⚠️ GUARD AUSENTE (D40):** `partyId` pode ser `null` (email não encontrado em parties) e é inserido direto na linha 171. Enrollment com `party_id = null` → nodes `create_opportunity`/`send_email` ficam stuck (`next_execution_at = null`) |
+| `email IS NOT NULL` | `checkFormEntries.ts:129` — `if (!email) { skipped++ }` | ✅ Guard presente — submissions sem email são ignoradas |
+| Journey `status` ativa | `checkFormEntries.ts:37` — `if journey not active → skip` | ✅ Guard presente — retorna `{ skipped: true, reason: 'journey_not_active' }` |
+| Submission não duplicada | `checkFormEntries.ts:135` — `enrolledSubmissionIds.has()` | ✅ Guard presente — skip se já enrolled |
+
+### Form → Journey Enrollment (`trigger-form-journey` Edge Function)
+
+| Invariante | Onde verificar | O que acontece se violado |
+|---|---|---|
+| `party_id` resolvido via `upsert_party_person` | `trigger-form-journey/index.ts:131-139` — RPC upsert | Cria party se não existe (melhor que checkFormEntries). `partyId` pode ser `null` se RPC falha, mas enrollment é criado na linha 290 |
+| `respondentEmail` presente | `trigger-form-journey/index.ts:282-290` — INSERT enrollment | Enrollment com `customer_email = null` se sem email |
+
+### Ingestion → Analytics (`process_transactions_batch` RPC)
+
+| Invariante | Onde verificar | O que acontece se violado |
+|---|---|---|
+| `_version = 1` | RPC linha ~27 — `IF v_version != 1 THEN` | ✅ Guard presente — erro individual, batch continua. Registrado em `v_errors` |
+| `email` presente e não-vazio | RPC linha ~37 — `IF NULLIF(TRIM(email), '') IS NULL` | ✅ Guard presente — `v_skipped++`, CONTINUE (não consegue criar party) |
+| `product_name` presente | RPC linha ~42 — `IF v_product_name IS NULL` | ✅ Guard presente — erro registrado em `integrations.job_errors`, CONTINUE |
+| `external_transaction_id` presente | ON CONFLICT clause na RPC | Idempotência via `(tenant_id, source_name, external_transaction_id)` — sem ID, duplicatas possíveis |
+| Status normalizado válido | CHECK constraint em `commerce.transactions.status` | ✅ Guard presente (R31) — INSERT rejeitado se status inválido |
+| CPF ≤ 14 chars | RPC linha ~51 — `IF length(v_cpf) > 14 THEN NULL` | ✅ Guard presente — sanitiza documentos não-brasileiros |
+
+### Campaign Send (R38 fail-closed)
+
+| Invariante | Onde verificar | O que acontece se violado |
+|---|---|---|
+| `segment_parties` não vazio se segmento tem regras | `CampaignSend.tsx:607` — `getSegmentRecipientsFailClosed()` | **R38:** membership vazia = refresh pendente, não "enviar para todos". Fail-closed retorna 0 recipients |
+| Blast radius ≤ 1.1× segment size | Guard de blast radius no frontend | Envio abortado se ratio excede threshold |
+| Segmento não deletado (`deleted_at IS NULL`) | Query de seleção de segmentos | Segmento fantasma retorna 0 members via `segment_parties` |
+
+### Journey Node Execution
+
+| Invariante | Onde verificar | O que acontece se violado |
+|---|---|---|
+| `enrollment.party_id IS NOT NULL` | Nodes que dependem de party | **⚠️ D40:** `create_opportunity` e `send_email` ficam stuck se `party_id` null. Guard ausente no enrollment (ver tabela checkFormEntries acima) |
+| `send_email` skip retorna `success: false` | `process-journey` Edge Function | **R39:** skip com `success: true` perdia envio silenciosamente. Corrigido: `success: false` + `waitUntil` para retry |
+| `enrollment.status = 'active'` | Claim do job no worker | Enrollment completed/failed não deveria gerar novos jobs |
+
+### Checklist para novo pipeline
+
+Antes de implementar qualquer novo pipeline, responder:
+
+1. Qual a **pré-condição mínima** do dado na entrada? (ex: `party_id NOT NULL`)
+2. O que acontece se a pré-condição for violada? (erro ruidoso ou falha silenciosa?)
+3. O guard está no **ponto de entrada** ou no ponto de consumo?
+4. Existe **CHECK constraint** no banco para os valores esperados?
+5. O pipeline depende de **outro pipeline ter rodado antes**? (ex: `field_definitions` antes de `project_traits`)
 
 ---
 
@@ -18,7 +127,7 @@
   - `supabase/functions/generate-export/index.ts:711` — SELECT para check de has-rules no guard fail-closed
   - `src/pages/admin/CampaignSend.tsx:612` — check de has-rules no guard fail-closed
   - `src/lib/segmentStorage.ts:687,844` — passagem para `loadSegmentRules()` (display only)
-- **Status:** DEPRECATED. Nenhum reader deve depender de v1 para lógica de avaliação.
+- **Status:** DEPRECATED. Nenhum reader depende de v1 para avaliação. Dead code confirmado (D37, 2026-03-20): `segmentEvaluator.ts:86-100` (chama `build_segment_where_clause` que foi dropada do banco — executar causaria erro SQL), `scripts/runEquivalenceGate.ts` (inteiro), e testes em `equivalence.test.ts`.
 
 ### analytics.segments.rules_json_v2
 
@@ -255,6 +364,26 @@
   - SQL views/functions: `build_segment_where_clause_v2`, `v_segment_base` — segment evaluation
 - **Regra:** Idempotência via `(tenant_id, source_name, external_transaction_id)`. ON CONFLICT DO UPDATE apenas para transições válidas de status.
 
+### commerce.asaas_webhook_events — Raw storage Asaas
+
+- **Writers:**
+  - `supabase/functions/asaas-receiver-webhook/index.ts` — INSERT via `public.upsert_asaas_webhook_event()` RPC (contorna limitação PostgREST + partial unique index)
+  - `public.mark_asaas_webhook_processed()` — UPDATE `processed=true, job_id` após pipeline
+- **Readers:**
+  - `supabase/functions/asaas-receiver-webhook/index.ts` — dedup check via `event_id` (dentro da RPC)
+- **TTL:** pg_cron diário — DELETE WHERE `processed = true AND created_at < now() - 90 days`
+- **Regra:** Unique index parcial `(tenant_id, event_id) WHERE event_id IS NOT NULL`. Pipeline E2E validado com PIX real (2026-03-20).
+
+### commerce.asaas_config — Configuração Asaas por tenant
+
+- **Writers:**
+  - `src/lib/checkoutStorage.ts:311` — `upsertAsaasConfig()` UPSERT via frontend admin
+- **Readers:**
+  - `src/lib/checkoutStorage.ts:291` — `getAsaasConfig()` SELECT para tela de configuração
+  - `supabase/functions/asaas-receiver-webhook/index.ts:68` — SELECT `webhook_token` para validação do header `asaas-access-token`
+- **Triggers:** `audit_asaas_config` (INSERT/UPDATE/DELETE → `audit.log_change()`)
+- **Regra:** `api_key_encrypted` usa criptografia. `webhook_token` validado no receiver. `commerce.sync_checkout_order_from_transaction` trigger em `commerce.transactions` sincroniza status do `checkout_orders` quando transação muda.
+
 ---
 
 ## Forms Pipeline
@@ -357,3 +486,33 @@
 
 - **Assinatura nova (5 args):** `(p_rules_json, p_rules_json_v2, p_ast_version, p_limit, p_tenant_id)` — usada pelo frontend
 - **Assinatura antiga (3 args):** `(p_tenant_id, p_rules_json, p_limit)` — removida de `generate-export` (R38). Verificar se existe em outros lugares.
+
+---
+
+## Audit
+
+### audit.trail — Log de auditoria imutável
+
+- **Writers (triggers ONLY — nunca INSERT direto):**
+  - `analytics.segments` — trigger `audit_segments` (INSERT/UPDATE/DELETE)
+  - `commerce.asaas_config` — trigger `audit_asaas_config` (INSERT/UPDATE/DELETE)
+  - `core.system_admins` — trigger `audit_system_admins` (INSERT/UPDATE/DELETE)
+  - `core.tenant_users` — trigger `audit_tenant_users` (INSERT/UPDATE/DELETE)
+  - `core.tenants` — trigger `audit_tenants` (INSERT/UPDATE/DELETE)
+  - `email.tenant_config` — trigger `audit_tenant_config` (INSERT/UPDATE/DELETE)
+  - `forms.forms` — trigger `audit_forms` (INSERT/UPDATE/DELETE)
+  - `integrations.accounts` — trigger `audit_integrations_accounts` (INSERT/UPDATE/DELETE)
+  - `journeys.journeys` — trigger `audit_journeys` (INSERT/UPDATE/DELETE)
+  - `smart_forms.forms` — trigger `audit_smart_forms` (INSERT/UPDATE/DELETE)
+  - `whatsapp.instances` — trigger `audit_whatsapp_instances` (INSERT/UPDATE/DELETE)
+  - Todos delegam para `audit.log_change()` — captura `user_id`, `user_email`, `role_name`, `schema_name`, `table_name`, `operation`, `record_id`, `tenant_id`, `old_data`, `new_data`, `changed_fields`, `ip_address`, `user_agent`, `request_id`, `transaction_id`
+- **Readers:** Nenhum reader frontend implementado. Acesso via SQL direto (admin).
+- **Funções:**
+  - `audit.log_change()` — trigger function principal
+  - `audit.log_change_simple()` — versão simplificada
+  - `audit.get_record_history(record_id)` — histórico de um registro
+  - `audit.get_tenant_changes(tenant_id)` — mudanças de um tenant
+  - `audit.get_user_changes(user_id)` — mudanças de um usuário
+  - `audit.get_stats()` — estatísticas do audit trail
+  - `audit.export_trail()` — exportação
+- **Regra:** Append-only — nunca UPDATE ou DELETE. RLS habilitado. 33 triggers total (11 tabelas × 3 operações). Gap: `checkout_offers`, `checkout_orders`, `opportunities`, `eduzz.integrations` sem audit.
