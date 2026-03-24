@@ -516,3 +516,74 @@ Antes de implementar qualquer novo pipeline, responder:
   - `audit.get_stats()` — estatísticas do audit trail
   - `audit.export_trail()` — exportação
 - **Regra:** Append-only — nunca UPDATE ou DELETE. RLS habilitado. 33 triggers total (11 tabelas × 3 operações). Gap: `checkout_offers`, `checkout_orders`, `opportunities`, `eduzz.integrations` sem audit.
+
+---
+
+## Code Comments Standard
+
+> **Propósito:** Comentários existem nos **pontos de junção** — onde um erro silencioso propaga para outro sistema.
+> Não comentar "o que o código faz" (isso é legível). Comentar "por que essa decisão, e o que quebra se mudar".
+
+### Estado atual (diagnóstico 2026-03-23)
+
+- **R38** referenciada em 7 lugares (CampaignSend, check-journey-entries, generate-export, checkSegmentEntries) — bom padrão
+- **R28** referenciada em 1 lugar (traitProducer) — isolada
+- **D-series:** zero referências no código — workarounds não estão marcados
+- **TODOs:** zero nos workers e libs — limpo, mas pontos críticos sem anotação
+
+### Onde comentar (obrigatório)
+
+| Ponto de junção | Por quê | Exemplo |
+|---|---|---|
+| **Enqueue de job** | Job na fila errada = pending infinito (R33) | `// Queue: analytics.processing_jobs → analytics-worker. R33: NÃO usar integrations.jobs` |
+| **ON CONFLICT** | Idempotência errada = duplicata ou perda de update | `// Idempotência: (tenant_id, source_name, external_transaction_id). ON CONFLICT DO UPDATE apenas paid→refunded` |
+| **Guard / fail-closed** | Remoção acidental do guard = blast radius (R38) | `// R38 FAIL-CLOSED: segment_parties vazio + has rules = refresh pendente, NUNCA "enviar para todos"` |
+| **Pipeline pré-condição** | Dado incompleto propaga silenciosamente | `// INVARIANTE: party_id NOT NULL. Sem isso → D40: enrollment stuck, opportunity node falha` |
+| **CHECK constraint enum** | Novo valor sem migration = INSERT rejeitado (R31) | `// R31: valores devem estar na CHECK constraint do banco. Novo valor → migration ANTES do deploy` |
+| **Status transitions** | Transição inválida corrompe state | `// Status: pending→paid OK, paid→pending NUNCA. Ver process_transactions_batch` |
+| **contact_state write** | Múltiplos writers = divergência | `// WRITER: este é um dos N writers de contact_state. Ver DEPENDENCY_MAP.md > contact_state` |
+| **Array mutation (GIN)** | Array vazio = segmento silenciosamente errado (R17) | `// R17: array_append/array_remove. Validar que array não fica [] — segmento retornaria 0 members` |
+
+### Template de header para funções de pipeline
+
+```typescript
+/**
+ * [Nome da função] — [O que faz em uma linha]
+ *
+ * Pipeline: [origem] → [trigger/enqueue] → [tabela-fila] → [worker] → esta função
+ *
+ * Invariantes de entrada:
+ *   - [campo] NOT NULL (sem isso → [consequência])
+ *   - [pré-condição] (sem isso → [consequência])
+ *
+ * Rules: [R-series relevantes]
+ * Debts: [D-series se houver workaround ativo]
+ * Ref: ARCHITECTURE.md seção [N], DEPENDENCY_MAP.md > [tabela]
+ */
+```
+
+### Template de comentário inline para pontos críticos
+
+```typescript
+// R[N]: [descrição curta da regra]
+// Ref: DEPENDENCY_MAP.md > [seção] | ARCHITECTURE.md seção [N]
+
+// D[N] WORKAROUND: [descrição do workaround temporário]
+```
+
+### Anti-patterns de comentários
+
+| ❌ Não fazer | ✅ Fazer |
+|---|---|
+| `// Enfileira o job` | `// Queue: analytics.processing_jobs → analytics-worker (R33)` |
+| `// Verifica se tem party_id` | `// INVARIANTE D40: party_id NULL → enrollment stuck, opportunity node falha` |
+| `// Atualiza contact_state` | `// WRITER contact_state.tag_ids — ver DEPENDENCY_MAP.md para lista completa de writers` |
+| `// ON CONFLICT DO NOTHING` | `// Idempotência: (tenant_id, source_name, external_id). Duplicata = skip (camada 2)` |
+| Comentário sem referência a regra | Sempre incluir R[N], D[N] ou seção do ARCHITECTURE.md |
+
+### Regra de manutenção
+
+Ao resolver uma dívida D[N]:
+1. Buscar `D[N]` no código: `grep -rn "D[N]" workers/ src/ supabase/`
+2. Remover comentários de workaround marcados com `// D[N] WORKAROUND`
+3. Manter comentários de regra R[N] (são permanentes)
