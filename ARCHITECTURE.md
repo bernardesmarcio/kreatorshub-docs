@@ -847,9 +847,9 @@ O evaluator opera em dois tiers para equilibrar performance e expressividade:
 - Text: `starts_with`, `contains`
 - Existencial: `is_null`, `is_not_null`
 
-**Coexistência com legacy:** `refreshSegments.ts` usa `rules_json_v2` se `ast_version >= 1`, senão fallback para `build_segment_where_clause`. Métrica `v2_ratio` logada por ciclo. Meta: 100%.
+**Coexistência com legacy:** `refreshSegments.ts` usa `rules_json_v2` se `ast_version >= 1`, senão fallback para `build_segment_where_clause` (D37: função dropada do banco — fallback nunca atingido, dead code confirmado).
 
-**Estado da migração:** 24/24 segmentos do tenant principal migrados para `rules_json_v2`. Colunas adicionadas em `analytics.segments`: `rules_json_v2`, `ast_version`, `ast_hash`, `migrated_at`, `migration_warnings`.
+**Estado da migração:** Migração completa — 42/42 segmentos manuais com v2. Ver D33. Colunas adicionadas em `analytics.segments`: `rules_json_v2`, `ast_version`, `ast_hash`, `migrated_at`, `migration_warnings`.
 
 ---
 
@@ -1023,8 +1023,8 @@ forms.form_submissions status → projection
 | Compostos | contact_info, address | skip (futuro) |
 | Display | statement, website | skip |
 
-**Typeform — provider futuro:**
-Mesmo fluxo, origem diferente. Schema `typeform.*`, `field_definitions.source_system = 'typeform'`, `source_field_id` = ID do campo no Typeform. Webhook para ingestão contínua + Responses API para backfill histórico. Implementação: ver checklist de novo provider (seção 14).
+**Typeform — integração parcial (implementada):**
+Schema `typeform.*` com 6 tabelas (`forms_raw`, `responses_raw`, `import_runs`, `sync_checkpoints`, `themes_cache`, `webhook_events`). Forms e responses migrados via `historical-sync-worker` e `pull-sync-worker`. Handlers: `typeform:sync_forms`, `typeform:sync_responses`, `typeform:promote_forms`, `typeform:promote_responses`, `typeform:enrich_themes`, `typeform:backfill_settings`. Ver R34/R35 para lições aprendidas da implementação.
 
 ---
 
@@ -1116,16 +1116,16 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D21 | **Segment-eval tenant scan** — Worker faz O(tenants) queries por ciclo mesmo sem trabalho. **Fix:** criar `claim_next_segment_jobs_global(worker_id, batch_size, shard_index, total_shards)`. Ref: Audit F2. | **P4** |
 | D22 | **claim_jobs tenant fairness** — ordena por `priority, created_at` sem cap por tenant. **Fix futuro:** round-robin CTE com `ROW_NUMBER() OVER (PARTITION BY tenant_id)`. Ref: Audit F3. | Defer |
 | D23 | **Idempotency constraint no enqueue** — `enqueue_webhook_job` usa SELECT-then-INSERT (TOCTOU). Risco baixo. **Hardening:** partial unique index em `integrations.jobs(webhook_event_id)`. Ref: Audit F5. | Defer |
-| D24 | `DROP TABLE analytics.segment_customers` — ❌ CANCELADO. Diagnóstico (2026-03-20) confirmou que a tabela é ativamente usada por `computeClusters.ts`, `computeClusterSubgroups.ts` e `lookalikeStorage.ts` (~112 rows, clusters/lookalike audiences). Não é legacy — é a tabela de membership para segmentos tipo `cluster` e `cluster_subgroup`. `segment_parties` é para rule-based; `segment_customers` é para cluster-generated. Manter indefinidamente. | ❌ Cancelado |
+| D24 | DROP TABLE segment_customers — CANCELADO (2026-03-20). Tabela ativa para clusters/lookalikes. | ❌ Cancelado |
 | D25 | `refresh_tenant_distribution` + tela de monitoramento | Pendente |
-| D26 | `trg_record_email_engagement` — ✅ Completo. Trigger `trg_record_email_engagement` ativo em `email.email_events`. Colunas `last_email_opened_at`, `last_email_clicked_at`, `email_open_rate_30d`, `email_click_rate_30d` presentes em `contact_state`. | ✅ Done |
+| D26 | trg_record_email_engagement — ✅ Trigger + 4 colunas em contact_state operacionais. | ✅ Done |
 | D27 | UI: novos blocos de condição no segment builder (product picker, time window, CRM condition) | Pendente |
 | D28 | D6 Fase 3 — `DROP COLUMN customer_id`. Diagnóstico (2026-03-20): 17 tabelas/views ainda com `customer_id` — analytics (7): `customer_cluster_assignments`, `customer_cluster_subgroup_assignments`, `customer_lookalike_scores`, `lifecycle_events`, `segment_customers`, `v_segment_base`, `v_segment_leads_base`; commerce (2): `transactions`, `archived_transactions`; core (1): `eduzz_webhook_events`; crm (4): `customer_badges`, `customer_tags`, `opportunities`, `vw_parties_unified`; eduzz (2): `buyers`, `webhook_events`; journeys (1): `journey_enrollments`. Trabalho substancial — requer migração por fases com validação entre cada DROP. | Pendente |
 | D29 | Performance loading timeout — tenant escola-do-fluxo. Profiling de RPCs lentas (`get_dashboard_data`, `get_pareto_analysis`) + lazy loading analytics. Sentry JAVASCRIPT-REACT-22, 21, 1S | Investigar |
 | D30 | Decompor blocos contact_info e address em traits individuais — hoje kind: 'skip', sem dados reais ainda | Pendente |
-| D31 | Integração Typeform — schema raw + Edge Function receiver + Responses API backfill + field_definitions com source_system='typeform' | Pendente |
-| D32 | `evaluation_mode` em segments — ✅ Completo. Coluna existe e é populada automaticamente. Worker: `segment-sql-builder.ts:109-146` infere mode por condições temporais. Frontend: `segmentService.ts:104-120` `inferEvaluationMode()` no create/update. Estado atual: 70/70 segmentos = `event_driven` (nenhum usa condições temporais `within_last`). | ✅ Done |
-| D33 | UI: segment builder migrado para AST v2 — ✅ Completo (Sprint 12). Frontend escreve exclusivamente `rules_json_v2`. Tipo `rule_based` renomeado para `manual`. 42/42 segmentos manuais com v2. Clusters (28) usam `rules_json` por design (membership estática). Fallback v1→v2 mantido em `astV2ToBuilder.ts` apenas para leitura de segmentos legados. | ✅ Done |
+| D31 | Integração Typeform — ✅ Parcial. Schema `typeform.*` implementado (6 tabelas), sync via pull-sync e historical-sync. Pendente: analytics de choice blocks, webhook receiver para ingestão contínua. | Parcial |
+| D32 | evaluation_mode em segments — ✅ Coluna populada automaticamente. 70/70 = event_driven. | ✅ Done |
+| D33 | Segment builder UI → AST v2 — ✅ Frontend escreve exclusivamente rules_json_v2 desde Sprint 12. | ✅ Done |
 | D34 | Scoping do unique index `processing_jobs_tenant_job_type_pending_uidx` — excluir `project_traits` e `sync_field_definitions` da condição WHERE para permitir múltiplos jobs pendentes per-entity. Ver R32 | **P2** |
 | D35 | Completar backfill de traits de formulários — 16 de 30 submissions ainda sem traits projetados. Rodar `backfillFormTraits.ts` com DATABASE_URL de produção | **P1** |
 | D36 | **RLS não reconhece system_admin** — policies de RLS usam `tenant_id IN (SELECT tenant_id FROM core.tenant_users WHERE user_id = auth.uid())`, mas system admins podem não ter registro em `tenant_users` para todos os tenants. O RPC `get_user_tenant_memberships` faz LEFT JOIN e retorna todos os tenants, mas o RLS bloqueia queries. **Fix:** criar helper `core.user_visible_tenant_ids(uid)` que retorna todos os tenants para system admins (via `core.system_admins`) e apenas memberships para users normais. Substituir subquery de RLS por chamada a essa função. Workaround atual: inserir system admins em `tenant_users` de cada tenant manualmente. | **P2** |
