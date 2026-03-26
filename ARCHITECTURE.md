@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.11 — Sessão 20/03: workers migrados para worker.*, TTL integrations, D5 SendGrid pipeline completo*
+*Versão 7.13 — Automações v2 Etapa 1: D18, D18b, D40, D41 completos, push-based segments, orphan sweeper*
 
 ---
 
@@ -363,10 +363,10 @@ Uma única RPC executada dentro do loop de `process_transactions_batch`. Substit
 
 | RPC | O que faz |
 |---|---|
-| `public.claim_jobs(worker_id, batch_size, provider)` | Clama jobs para processamento (SKIP LOCKED) |
-| `public.complete_job(job_id, result)` | Marca success |
-| `public.fail_job(job_id, error)` | Retry com backoff exponencial (60s→86400s + jitter 20%) ou dead |
-| `public.block_job(job_id, reason)` | Bloqueia job sem consumir attempts |
+| `worker.claim_jobs(worker_id, batch_size, provider, handlers)` | Clama jobs para processamento (SKIP LOCKED) |
+| `worker.complete_job(job_id, result)` | Marca success |
+| `worker.fail_job(job_id, error)` | Retry com backoff exponencial ou dead |
+| `worker.block_job(job_id, reason)` | Bloqueia job sem consumir attempts |
 | `integrations.reprocess_blocked_jobs(...)` | Reactiva jobs blocked após fix |
 
 **Estrutura de arquivos do ingestion-worker:**
@@ -1110,7 +1110,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D12 | Normalização de telefone (`phone_normalized` E.164) — `crm.party_person`, `sympla.participants`, todos os providers. Função utilitária compartilhada. Backfill + UI de indicador de cobertura. Campanhas WhatsApp filtram por `phone_normalized IS NOT NULL` | Pendente |
 | D13 | `DROP TABLE eduzz.integrations` — tabela legada. Toda leitura/escrita já migrada para `integrations.accounts`. RPCs atualizadas. Dropar após validação. | Pendente |
 | D14 | Auditoria preventiva de TTL em todas as filas do sistema — verificar se todas as filas têm: (1) cron de purge para rows terminais, (2) índice parcial cobrindo status ativo, (3) NOT EXISTS filtrando apenas status ativos. Ver R20. | Pendente |
-| D18 | **Journey fanout não-atômico** — enrollment INSERT e `process_enrollment` job INSERT são statements separadas sem transação. **Fix:** (1) envolver ambos INSERTs em `sql.begin()` em `processEventJob.ts`, `processBackfillJob.ts` e `checkEventEntries.ts`; (2) criar sweeper pg_cron para enrollments órfãos; (3) remover comentários incorretos sobre sql.begin(). Ref: Audit F1. | **P1** |
+| D18 | ~~Journey fanout não-atômico~~ | ✅ Resolvido (v7.13) — `sql.begin()` em 5 entry handlers + send_email node (D18b). Sweeper `sweep-orphan-enrollments` (*/10 * * * *) como safety net. 3 órfãos históricos recuperados. |
 | D19 | **Observabilidade backend** — Sentry cobre apenas frontend React. Workers sem aggregação, dashboards ou alertas. **Fix:** (1) Sentry nos Railway workers; (2) dashboard de filas (depth, drain rate, p95 latency); (3) alertas: dead jobs > 0, queue depth crescendo, worker sem heartbeat >5min. Ref: Audit F10. | **P2** |
 | D20 | **Journeys batch claim** — `journeys.claim_next_job` retorna 1 job por vez. **Fix:** (1) criar `journeys.claim_next_jobs(worker_id, batch_size)` retornando SETOF; (2) batch processing em journeys-worker e email-campaign-worker; (3) per-tenant cap e `maxCycleRuntimeMs`. Ref: Audit F8. | **P3** |
 | D21 | **Segment-eval tenant scan** — Worker faz O(tenants) queries por ciclo mesmo sem trabalho. **Fix:** criar `claim_next_segment_jobs_global(worker_id, batch_size, shard_index, total_shards)`. Ref: Audit F2. | **P4** |
@@ -1132,11 +1132,11 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D37 | **Cleanup dead code segmentação v1** (confirmado 2026-03-20): (1) `segmentEvaluator.ts:86-100` — fallback v1 chama `build_segment_where_clause` que foi **dropada do banco** — executar esse branch causaria erro SQL; (2) `scripts/runEquivalenceGate.ts` — inteiro arquivo é dead code; (3) `equivalence.test.ts` — testes de fallback v1 testam path impossível. Diagnóstico: 0 segmentos `rule_based` no banco (tipo renomeado para `manual`), 42/42 manuais com v2, função SQL não existe. Risco zero de remover. | Baixa — cleanup |
 | D38 | **Alerta de anomalia pós-envio.** pg_cron job diário que detecta campanhas com `recipient_source = 'segment'` onde `recipient_count_at_send > segment_parties_snapshot * 1.5` OU `recipient_count_at_send > 80%` da base do tenant. INSERT em tabela de alertas. Depende das colunas de rastreabilidade adicionadas no Sprint 12 (Guard 1). | **P2** |
 | D39 | **Backend validation RPC para envio de campanha.** RPC `email.validate_campaign_send(p_tenant_id, p_recipient_count, p_segment_ids, p_recipient_source)` que valida server-side: (1) se source='segment', recipient_count <= SUM(segment_parties) * 1.1; (2) se source='all', recipient_count <= total_contacts do tenant; (3) retorna ok/reject com reason. Defense-in-depth — proteção redundante independente do frontend. | **P2** |
-| D40 | **party_id null em enrollments de formulário.** Jornada "Caminho de Madalena" teve 3 enrollments com `party_id` null, causando nó `create_opportunity` stuck (`next_execution_at = null`). Causa provável: `form_submission` criada antes do party ser vinculado, ou `checkFormEntries` não copiando `party_id`. **Investigar:** (1) verificar se `checkFormEntries` garante `party_id NOT NULL` antes de criar enrollment; (2) verificar se `form_submissions` com `party_id` null deveriam ser filtradas; (3) adicionar guard no enrollment: se `party_id IS NULL`, não criar enrollment e logar warning. | **P1** |
-| D41 | **Queue audit — filas sem TTL/purge.** ~~integrations.jobs~~ ✅ purge ativo (v7.11); ~~integrations.webhook_events~~ ✅ purge ativo (v7.11). Pendente: (1) `journeys.processing_jobs` — 76K rows / 55MB, sem cron. `analytics.segment_eval_queue` TTL 24h→4h pendente. Ref: R20. | **P3** — parcialmente resolvido |
+| D40 | ~~party_id null em enrollments de formulário~~ | ✅ Resolvido (v7.13) — `create_opportunity` node: fallback lookup + last resort `crm.upsert_party_person` + graceful skip. `checkFormEntries` já tinha 3-layer resolve (v7.11). 10 jobs failed corrigidos, 0 órfãos restantes. |
+| D41 | ~~Queue audit — filas sem TTL/purge~~ | ✅ Resolvido (v7.13) — integrations.jobs ✅, integrations.webhook_events ✅, journeys.processing_jobs ✅ (`cleanup-journey-processing-jobs` 0 4 * * *). Pendente apenas: `analytics.segment_eval_queue` TTL 24h→4h. |
 | D42 | **DROP tabelas Eduzz legadas** — `eduzz.integrations` e `core.eduzz_integrations`. Ambas substituídas por `integrations.accounts`. Bloqueado por Sprint Security — credenciais em texto plano precisam ser migradas antes do DROP. | Bloqueado |
 | B-17 | Testes de integração dos workers no tenant SaudeNow (`fe793fcd-7564-4d7c-b628-12a25e6d6656`) — criar jobs sintéticos para historical-sync, email-sync, ingestion e validar fluxo completo claim→running→success→analytics | Pendente |
-| B-18 | Mapper Eduzz — campos não mapeados em `commerce.transactions` (`installments`, `fee_value`, `net_gain`) — avaliar se devem ir para coluna dedicada ou campo extra do NormalizedTransaction | Pendente |
+| B-18 | Mapper Eduzz — `installments`, `fee_value`, `net_gain` já existem como colunas em `commerce.transactions` (confirmado 24/03) mas não são populadas pelo mapper Eduzz. Fix: atualizar o mapper para extrair e preencher esses campos a partir do payload do webhook/historical. Zero mudança de schema necessária. | Pendente |
 
 ---
 
@@ -1228,6 +1228,23 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.13] — 2026-03-25
+### Automações v2 — Etapa 1 completa
+- **D18 ✅:** Fanout atômico — enrollment + job INSERT wrapped em `sql.begin()` em 5 pontos (processEventJob, processBackfillJob, checkSegmentEntries, checkFormEntries, checkEventEntries)
+- **D18b ✅:** send_email node — 3 INSERTs (campaign_send + recipient + enqueue) wrapped em `sql.begin()`
+- **D40 ✅:** create_opportunity guard — last resort party upsert via `crm.upsert_party_person`, graceful skip se null
+- **D41 ✅ completo:** TTL para `journeys.processing_jobs` — pg_cron `cleanup-journey-processing-jobs` (0 4 * * *)
+- **Orphan sweeper:** `journeys.sweep_orphan_enrollments()` + pg_cron `sweep-orphan-enrollments` (*/10 * * * *) — recuperou 3 órfãos históricos
+- **Push-based segments:** `refresh_segment_parties_unified` detecta novos membros e enfileira `check_segment_entries` apenas para jornadas afetadas. Zero push se zero novos.
+- **Scheduler throttle:** `enqueue_journey_checks` skipa jornadas com check nos últimos 5 min. Projeção: ~12.9K/dia → ~2K/dia (fallback only) + push on-demand
+- Wait node UI: métricas separadas em "Aguardando" (amber) + "Concluídos" (verde) no flow e na Performance dos Nós
+
+## [v7.12] — 2026-03-24
+### Correções baseadas em validação direta no banco
+- **RPCs de lifecycle:** tabela na seção do ingestion-worker corrigida — `public.*` → `worker.*` (stubs confirmados removidos)
+- **B-18:** colunas `fee_value`, `installments`, `net_gain` confirmadas em `commerce.transactions` — fix é no mapper, não no schema
+- **D41:** `journeys.processing_jobs` atualizado — 90K rows / 66 MB (cresceu de 76K/55MB desde v7.11)
 
 ## [v7.11] — 2026-03-20
 
