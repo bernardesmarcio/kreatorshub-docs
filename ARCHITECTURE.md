@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.13 — Automações v2 Etapa 1: D18, D18b, D40, D41 completos, push-based segments, orphan sweeper*
+*Versão 7.14 — Sprint 14 completo: Automações v2 Etapa 1 (D18, D40, D41 resolvidos, push-based segments, orphan sweeper)*
 
 ---
 
@@ -183,8 +183,8 @@ analytics-worker (segment-eval-loop)
 
 **ENTRADA — como o contato entra na jornada**
 
-- Trigger `segment_entry` → journeys-worker scheduler (60s) → verifica `analytics.segment_parties` → cria enrollment → enfileira `process_enrollment`
-- Trigger `form_entry` → `trigger-form-journey` (Edge Function, imediato) ou journeys-worker scheduler (60s, fallback)
+- Trigger `segment_entry` → **push-based (Sprint 14):** `refresh_segment_parties_unified` detecta novos membros e enfileira `check_segment_entries` diretamente. Scheduler fallback a cada 5 min (throttled de 60s→5min). Redução ~85% no volume de jobs.
+- Trigger `form_entry` → `trigger-form-journey` (Edge Function, push principal) ou scheduler `check_form_entries` (fallback 5 min)
 - Trigger `event_entry` → arquitetura push-based (ver seção 4.5) ✅ Operacional desde Sprint 6
 
 **CICLO DE VIDA DA JORNADA**
@@ -204,6 +204,12 @@ journeys-worker worker mode → `claim_next_job` → `processJourneyNode.ts`
 - Time budget: 3 minutos (re-enfileira se exceder)
 - Idempotência via `journeys.journey_executions`
 - Tipos de nó: `send_email`, `add_tag`, `remove_tag`, `condition`, `wait`, `ab_split`, `webhook`, `goal`, `exit`, `create_opportunity`
+
+**ATOMICIDADE (Sprint 14 — D18/D18b)**
+
+- Enrollment INSERT + process_enrollment job INSERT: `sql.begin()` em 5 entry handlers
+- send_email node: 3 INSERTs (campaign_send + recipient + enqueue) em `sql.begin()`
+- Safety net: pg_cron `sweep-orphan-enrollments` (*/10 * * * *) detecta enrollments ativos sem job pendente e enfileira recovery com `dedupe_key = 'orphan_' + enrollment_id`
 
 ### 4.5 Trigger event_entry — Arquitetura Push-Based
 
@@ -1093,6 +1099,14 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R38 | **Fail-closed para membership vazia.** Se `segment_parties` retorna 0 rows para um `segment_id` que tem regras definidas (`rules_json_v2 IS NOT NULL`), a operação dependente (envio, export, enrollment) DEVE recusar, nunca prosseguir sem filtro. Zero members + regras definidas = refresh pendente, não "enviar para todos". **Implementações:** (1) `CampaignSend.tsx` — `getSegmentRecipientsFailClosed()` tenta refresh e rejeita se ainda 0; (2) `generate-export/index.ts` — enfileira refresh e aborta export; (3) `checkSegmentEntries.ts` (worker handler) — guard com verificação de `rules_json_v2` + enqueue refresh; (4) `check-journey-entries/index.ts` (Edge Function legada) — guard equivalente como safety net. | Incidente Sprint 12 — mesma origem de R37. |
 | R39 | **Skip em nó de automação DEVE retornar `success: false` + `waitUntil`.** Quando um nó `send_email` detecta que a campanha não está pronta (status não-enviável), o handler deve retornar `{ success: false, waitUntil }` para que o enrollment fique em espera e reprocesse. Retornar `success: true` com skip faz o enrollment avançar para o próximo nó sem enviar o email, perdendo o envio silenciosamente. Status `automation` é um status válido para envio em contexto de journey — não deve ser rejeitado. **Lição adicional: Docker layer cache.** Workers containerizados (Railway, ECS, etc.) podem reutilizar layer de build anterior mesmo após push de novo código. Sempre incluir `BUILD_VERSION` constante no entrypoint do worker para: (1) invalidar cache do `COPY src` layer a cada mudança, (2) confirmar nos logs qual versão está rodando. | Incidente Sprint 13 — commit `c3f172e` corrigiu send_email mas Railway serviu código antigo por cache Docker. Worker logava `campaign_not_ready/automation` com `success: true` (código antigo) em vez de enviar o email. 19 enrollments ficaram stuck. |
 
+| R40 | **Condition node deve usar Rule Engine v2.** O nó `condition` em journeys deve reutilizar os mesmos campos, operadores e resolvers do segmentation engine (AST v2). Implementação duplicada (6 campos hardcoded vs 40+ do Rule Engine) viola DRY e causa divergência silenciosa. Evaluator: carregar `ContactState` do party + `evaluateRules(state, ast.root)`. | Gap identificado Sprint 14 — condition node tem 6 campos, Rule Engine v2 tem 40+ |
+| R41 | **Journey version_id em enrollments.** Enrollment deve congelar `version_id` no momento da criação. Se a jornada é editada durante execução, enrollments existentes continuam com a versão original. Implementação: coluna `version_id` em `journey_enrollments` + snapshot `nodes_json`/`edges_json` em `journey_versions`. | Requisito Etapa 2 — versionamento de jornadas |
+| R42 | **Decisão de condition node deve ser persistida.** O resultado da avaliação (campo, valor, operador, resultado booleano) deve ser gravado em `journey_executions.output_json` para auditoria. Se o contato re-entrar, a decisão anterior é consultável sem re-executar a condição. | Requisito Etapa 2 — auditabilidade |
+| R43 | **Trigger context congelado no enrollment.** `context_json` deve capturar o estado do contato no momento do enrollment (valores de campos usados por conditions). Conditions avaliam contra esse snapshot, não contra o estado atual, para garantir determinismo na execução. Exceção: nós explicitamente marcados como "live evaluation" podem consultar estado atual. | Requisito Etapa 2 — determinismo |
+| R44 | **Extensibilidade de resolvers via registry.** Novos campos para condition node devem ser adicionados via registro (field → resolver function), não via switch/case hardcoded. O resolver recebe `(partyId, tenantId, fieldConfig)` e retorna o valor. Mesmo padrão do `semanticFieldRegistry.ts` do analytics. | Requisito Etapa 2 — condition engine extensível |
+| R45 | **Frequency guard em nós de comunicação.** Nós `send_email`, `webhook`, `notify` devem respeitar limite de frequência por contato configurável no journey settings. Default: max 1 email por contato por 24h na mesma jornada. Guard consultável em `journey_executions` (contagem de executions do mesmo node_type para o mesmo enrollment nas últimas N horas). | Requisito Etapa 2 — proteção contra spam |
+| R46 | **Workers separados por SLA.** journeys-event-worker (< 5s, push-based) e journeys-worker (minutos, batch) devem permanecer separados. Condition engine pesado (queries em contact_state) não deve rodar no event-worker. Se condition evaluation for necessária no fanout, delegar para journeys-worker via processing_job. | Confirmado Sprint 14 — audit comprovou separação necessária |
+
 ---
 
 # PARTE D — DÍVIDAS TÉCNICAS & ROADMAP
@@ -1137,6 +1151,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D42 | **DROP tabelas Eduzz legadas** — `eduzz.integrations` e `core.eduzz_integrations`. Ambas substituídas por `integrations.accounts`. Bloqueado por Sprint Security — credenciais em texto plano precisam ser migradas antes do DROP. | Bloqueado |
 | B-17 | Testes de integração dos workers no tenant SaudeNow (`fe793fcd-7564-4d7c-b628-12a25e6d6656`) — criar jobs sintéticos para historical-sync, email-sync, ingestion e validar fluxo completo claim→running→success→analytics | Pendente |
 | B-18 | Mapper Eduzz — `installments`, `fee_value`, `net_gain` já existem como colunas em `commerce.transactions` (confirmado 24/03) mas não são populadas pelo mapper Eduzz. Fix: atualizar o mapper para extrair e preencher esses campos a partir do payload do webhook/historical. Zero mudança de schema necessária. | Pendente |
+| D43 | **`segment_entered` events não gerados.** `refresh_segment_parties_unified` faz UPSERT/DELETE direto sem chamar `apply_segment_membership_diff` — eventos `segment_entered`/`segment_exited` não são criados em `journeys.journey_events`. Os 9 eventos segment_entered existentes são de antes de 13/Mar. Impacto: `event_entry` com `trigger_event_type='segment_entered'` não funciona. Fix: gerar eventos inline no refresh ou restaurar chamada a `apply_segment_membership_diff`. | **P3** — nenhuma jornada usa esse trigger hoje |
 
 ---
 
@@ -1230,11 +1245,16 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 # PARTE E — CHANGELOG
 
 ## [v7.13] — 2026-03-25
-### Automações v2 — Etapa 1 completa
-- **D18 ✅:** Fanout atômico — enrollment + job INSERT wrapped em `sql.begin()` em 5 pontos (processEventJob, processBackfillJob, checkSegmentEntries, checkFormEntries, checkEventEntries)
-- **D18b ✅:** send_email node — 3 INSERTs (campaign_send + recipient + enqueue) wrapped em `sql.begin()`
-- **D40 ✅:** create_opportunity guard — last resort party upsert via `crm.upsert_party_person`, graceful skip se null
-- **D41 ✅ completo:** TTL para `journeys.processing_jobs` — pg_cron `cleanup-journey-processing-jobs` (0 4 * * *)
+### Sprint 14 — Automações v2, Etapa 1: Estabilizar Runtime
+- **D18 ✅:** Fanout atômico — `sql.begin()` em 5 entry handlers (processEventJob, processBackfillJob, checkSegmentEntries, checkFormEntries, checkEventEntries). Zero enrollments órfãos possíveis.
+- **D18b ✅:** send_email node — 3 INSERTs (campaign_sends → campaign_recipients → enqueue) atômicos via `sql.begin()`
+- **D40 ✅:** create_opportunity guard — lookup parties → `crm.upsert_party_person` → skip gracioso. 10 jobs failed corrigidos.
+- **D41 ✅ completo:** TTL cleanup em TODAS as filas de journeys: processing_jobs (pg_cron 4AM + scheduler 1h), event_processing_jobs (3AM), backfill_jobs (3AM)
+- **Push-based segments:** `refresh_segment_parties_unified` detecta novos membros e enfileira `check_segment_entries` apenas para jornadas afetadas
+- **Scheduler throttle:** `enqueue_journey_checks` skipa jornadas com check nos últimos 5 min. ~12.9K→~2K jobs/dia (85% redução)
+- **Sweeper:** pg_cron `sweep-orphan-enrollments` (*/10 * * * *) — recuperou 3 órfãos históricos
+- **R40-R46:** Regras arquiteturais para Automações v2 Etapa 2
+- **D43 registrada:** `segment_entered` events não gerados pelo evaluator atual (P3)
 - **Orphan sweeper:** `journeys.sweep_orphan_enrollments()` + pg_cron `sweep-orphan-enrollments` (*/10 * * * *) — recuperou 3 órfãos históricos
 - **Push-based segments:** `refresh_segment_parties_unified` detecta novos membros e enfileira `check_segment_entries` apenas para jornadas afetadas. Zero push se zero novos.
 - **Scheduler throttle:** `enqueue_journey_checks` skipa jornadas com check nos últimos 5 min. Projeção: ~12.9K/dia → ~2K/dia (fallback only) + push on-demand
