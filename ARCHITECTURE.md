@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.15 — Sprint 17: Automações v2 Etapas 1-3 completas (D18/D20/D40/D41, batch claim, email paralelo, frequency guard)*
+*Versão 7.16 — B-18 done: campos financeiros Eduzz preenchidos via enrich_invoice + backfill 22K transações*
 
 ---
 
@@ -1157,7 +1157,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D41 | ~~Queue audit — filas sem TTL/purge~~ | ✅ Resolvido (v7.13) — integrations.jobs ✅, integrations.webhook_events ✅, journeys.processing_jobs ✅ (`cleanup-journey-processing-jobs` 0 4 * * *). Pendente apenas: `analytics.segment_eval_queue` TTL 24h→4h. |
 | D42 | **DROP tabelas Eduzz legadas** — `eduzz.integrations` e `core.eduzz_integrations`. Ambas substituídas por `integrations.accounts`. Bloqueado por Sprint Security — credenciais em texto plano precisam ser migradas antes do DROP. | Bloqueado |
 | B-17 | Testes de integração dos workers no tenant SaudeNow (`fe793fcd-7564-4d7c-b628-12a25e6d6656`) — criar jobs sintéticos para historical-sync, email-sync, ingestion e validar fluxo completo claim→running→success→analytics | Pendente |
-| B-18 | Mapper Eduzz — `installments`, `fee_value`, `net_gain` já existem como colunas em `commerce.transactions` (confirmado 24/03) mas não são populadas pelo mapper Eduzz. Fix: atualizar o mapper para extrair e preencher esses campos a partir do payload do webhook/historical. Zero mudança de schema necessária. | Pendente |
+| B-18 | ~~Mapper Eduzz — `installments`, `fee_value`, `net_gain`~~ ✅ Handler `eduzz:enrich_invoice` atualizado (26/03): popula campos financeiros a partir de `eduzz.invoices`. Backfill aplicado: 22K transações. Cobertura 99.9%. | **Done** |
 | D43 | **`segment_entered` events não gerados.** `refresh_segment_parties_unified` faz UPSERT/DELETE direto sem chamar `apply_segment_membership_diff` — eventos `segment_entered`/`segment_exited` não são criados em `journeys.journey_events`. Os 9 eventos segment_entered existentes são de antes de 13/Mar. Impacto: `event_entry` com `trigger_event_type='segment_entered'` não funciona. Fix: gerar eventos inline no refresh ou restaurar chamada a `apply_segment_membership_diff`. | **P3** — nenhuma jornada usa esse trigger hoje |
 | D44 | **Migrar template engine para SendGrid dynamic templates.** Atualmente o worker renderiza HTML com `substituteVariables()` (server-side). Migrar para `template_id` + `dynamic_template_data` habilitaria batch real (1000 emails/request via personalizations). Bloqueado por: cada recipient tem HTML diferente + `sendgrid_message_id` é 1 por request. | **P4** — quando precisar >50K emails/envio |
 
@@ -1251,6 +1251,13 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.16] — 2026-03-26
+### B-18 Done — Campos financeiros Eduzz
+- Handler `eduzz:enrich_invoice` atualizado: popula `fee_value`, `net_gain`, `installments` em `commerce.transactions` a partir de `eduzz.invoices`
+- Backfill aplicado: ~22K transações Eduzz existentes atualizadas (cobertura 99.9%)
+- Edge function `integrations-worker` deployed (v86)
+- B-18: ✅ Done
 
 ## [v7.15] — 2026-03-26
 ### Sprint 17 — Automações v2, Etapa 3: Batch, Fairness & Performance
