@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.14 — Sprint 14 completo: Automações v2 Etapa 1 (D18, D40, D41 resolvidos, push-based segments, orphan sweeper)*
+*Versão 7.15 — Sprint 17: Automações v2 Etapas 1-3 completas (D18/D20/D40/D41, batch claim, email paralelo, frequency guard)*
 
 ---
 
@@ -210,6 +210,13 @@ journeys-worker worker mode → `claim_next_job` → `processJourneyNode.ts`
 - Enrollment INSERT + process_enrollment job INSERT: `sql.begin()` em 5 entry handlers
 - send_email node: 3 INSERTs (campaign_send + recipient + enqueue) em `sql.begin()`
 - Safety net: pg_cron `sweep-orphan-enrollments` (*/10 * * * *) detecta enrollments ativos sem job pendente e enfileira recovery com `dedupe_key = 'orphan_' + enrollment_id`
+
+**PERFORMANCE (Sprint 17)**
+
+- Batch claim: `journeys.claim_next_jobs(worker_id, batch_size, job_types, tenant_cap)` com fairness round-robin por tenant via `ROW_NUMBER() OVER (PARTITION BY tenant_id)`. journeys-worker 10 jobs/poll, email-campaign 5 jobs/poll.
+- Email paralelo: `p-limit(10)` + rate limiter token bucket (100/sec) + circuit breaker (5 failures). ~50-90 emails/sec. `SEND_CONCURRENCY` configurável.
+- Frequency guard (R45): send_email node verifica último email sent < 16h antes de enviar. Skip = success (enrollment avança). Decisão persistida em `journey_executions.decision_result` (R42). `EMAIL_FREQUENCY_GUARD_HOURS` configurável, 0=disabled.
+- SLA separation (R46): journeys-worker (seconds) e email-campaign-worker (minutes) com zero overlap de job_types.
 
 ### 4.5 Trigger event_entry — Arquitetura Push-Based
 
@@ -1126,7 +1133,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D14 | Auditoria preventiva de TTL em todas as filas do sistema — verificar se todas as filas têm: (1) cron de purge para rows terminais, (2) índice parcial cobrindo status ativo, (3) NOT EXISTS filtrando apenas status ativos. Ver R20. | Pendente |
 | D18 | ~~Journey fanout não-atômico~~ | ✅ Resolvido (v7.13) — `sql.begin()` em 5 entry handlers + send_email node (D18b). Sweeper `sweep-orphan-enrollments` (*/10 * * * *) como safety net. 3 órfãos históricos recuperados. |
 | D19 | **Observabilidade backend** — Sentry cobre apenas frontend React. Workers sem aggregação, dashboards ou alertas. **Fix:** (1) Sentry nos Railway workers; (2) dashboard de filas (depth, drain rate, p95 latency); (3) alertas: dead jobs > 0, queue depth crescendo, worker sem heartbeat >5min. Ref: Audit F10. | **P2** |
-| D20 | **Journeys batch claim** — `journeys.claim_next_job` retorna 1 job por vez. **Fix:** (1) criar `journeys.claim_next_jobs(worker_id, batch_size)` retornando SETOF; (2) batch processing em journeys-worker e email-campaign-worker; (3) per-tenant cap e `maxCycleRuntimeMs`. Ref: Audit F8. | **P3** |
+| D20 | ~~Journeys batch claim~~ | ✅ Resolvido (Sprint 17) — `claim_next_jobs(worker_id, batch_size, job_types, tenant_cap)` com ROW_NUMBER fairness. journeys-worker 10/poll, email-campaign 5/poll. Singular preservado. |
 | D21 | **Segment-eval tenant scan** — Worker faz O(tenants) queries por ciclo mesmo sem trabalho. **Fix:** criar `claim_next_segment_jobs_global(worker_id, batch_size, shard_index, total_shards)`. Ref: Audit F2. | **P4** |
 | D22 | **claim_jobs tenant fairness** — ordena por `priority, created_at` sem cap por tenant. **Fix futuro:** round-robin CTE com `ROW_NUMBER() OVER (PARTITION BY tenant_id)`. Ref: Audit F3. | Defer |
 | D23 | **Idempotency constraint no enqueue** — `enqueue_webhook_job` usa SELECT-then-INSERT (TOCTOU). Risco baixo. **Hardening:** partial unique index em `integrations.jobs(webhook_event_id)`. Ref: Audit F5. | Defer |
@@ -1152,6 +1159,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | B-17 | Testes de integração dos workers no tenant SaudeNow (`fe793fcd-7564-4d7c-b628-12a25e6d6656`) — criar jobs sintéticos para historical-sync, email-sync, ingestion e validar fluxo completo claim→running→success→analytics | Pendente |
 | B-18 | Mapper Eduzz — `installments`, `fee_value`, `net_gain` já existem como colunas em `commerce.transactions` (confirmado 24/03) mas não são populadas pelo mapper Eduzz. Fix: atualizar o mapper para extrair e preencher esses campos a partir do payload do webhook/historical. Zero mudança de schema necessária. | Pendente |
 | D43 | **`segment_entered` events não gerados.** `refresh_segment_parties_unified` faz UPSERT/DELETE direto sem chamar `apply_segment_membership_diff` — eventos `segment_entered`/`segment_exited` não são criados em `journeys.journey_events`. Os 9 eventos segment_entered existentes são de antes de 13/Mar. Impacto: `event_entry` com `trigger_event_type='segment_entered'` não funciona. Fix: gerar eventos inline no refresh ou restaurar chamada a `apply_segment_membership_diff`. | **P3** — nenhuma jornada usa esse trigger hoje |
+| D44 | **Migrar template engine para SendGrid dynamic templates.** Atualmente o worker renderiza HTML com `substituteVariables()` (server-side). Migrar para `template_id` + `dynamic_template_data` habilitaria batch real (1000 emails/request via personalizations). Bloqueado por: cada recipient tem HTML diferente + `sendgrid_message_id` é 1 por request. | **P4** — quando precisar >50K emails/envio |
 
 ---
 
@@ -1243,6 +1251,22 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.15] — 2026-03-26
+### Sprint 17 — Automações v2, Etapa 3: Batch, Fairness & Performance
+- **D20 ✅:** Batch claim com fairness — `claim_next_jobs(batch_size, job_types, tenant_cap)` com `ROW_NUMBER() OVER (PARTITION BY tenant_id)`. journeys-worker 10 jobs/poll, email-campaign 5 jobs/poll. Singular preservado.
+- **Email paralelo:** `p-limit(10)` + rate limiter compartilhado. ~9→~50-90 emails/sec. `SEND_CONCURRENCY` configurável. Circuit breaker preservado.
+- **R45 ✅:** Channel frequency guard — 16h default entre emails por contato (cross-journey). Skip com razão persistida em `journey_executions` (R42). `EMAIL_FREQUENCY_GUARD_HOURS` configurável, 0=disabled. Index parcial `idx_campaign_recipients_frequency_guard`.
+- **R46 ✅:** SLA separation verificada — zero overlap de job_types. journeys-worker (seconds SLA), email-campaign (minutes SLA).
+- **D44 registrada:** Migrar template engine para SendGrid dynamic templates (P4).
+
+## [v7.14] — 2026-03-26
+### Automações v2, Etapa 2: Condition Engine + Versionamento
+- **R40 ✅:** Condition Engine — Rule Engine v2 modo SINGLE. 8 arquivos extraídos para `@creator-hub/shared/segmentation/`. `evaluateConditionSingle()` com 40+ campos/operadores. Dual path: v2 (rules_json_v2) + legacy fallback.
+- **R41 ✅:** Journey versions — `journey_versions` table, `publish_journey_version()` RPC, auto-publish on activation. `processJourneyNode` lê da versão congelada. Backfill: 8 jornadas + 39 enrollments vinculados.
+- **R42 ✅:** Decisão persistida — `decision_result`, `decision_input_snapshot`, `resolved_edge_id` em `journey_executions`.
+- **R43 ✅:** Trigger context — `context_json.trigger_payload` populado nos event handlers. `conditionEngine` flatten trigger fields como `trigger_<key>`.
+- **Entry policy:** `entry_policy` (once/after_exit/always), `reentry_cooldown_hours`, `max_concurrent_enrollments`. `canEnterJourney()` v2 com fallback legacy.
 
 ## [v7.13] — 2026-03-25
 ### Sprint 14 — Automações v2, Etapa 1: Estabilizar Runtime
