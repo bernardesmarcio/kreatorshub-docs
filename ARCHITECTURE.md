@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.17 — D35 ✅: backfill de traits completo (8.816 traits, 4 tenants)*
+*Versão 7.18 — Sprint 18: Automações v2 Etapa 4 parcial (condition engine no canvas, event triggers, wait until date)*
 
 ---
 
@@ -203,7 +203,7 @@ journeys-worker worker mode → `claim_next_job` → `processJourneyNode.ts`
 - Máximo 50 nós por execução
 - Time budget: 3 minutos (re-enfileira se exceder)
 - Idempotência via `journeys.journey_executions`
-- Tipos de nó: `send_email`, `add_tag`, `remove_tag`, `condition`, `wait`, `ab_split`, `webhook`, `goal`, `exit`, `create_opportunity`
+- Tipos de nó: `send_email`, `add_tag`, `remove_tag`, `condition`, `wait`, `ab_split`, `webhook`, `goal`, `exit`, `create_opportunity`, `add_badge`, `remove_badge`, `notify`
 
 **ATOMICIDADE (Sprint 14 — D18/D18b)**
 
@@ -215,7 +215,7 @@ journeys-worker worker mode → `claim_next_job` → `processJourneyNode.ts`
 
 - Batch claim: `journeys.claim_next_jobs(worker_id, batch_size, job_types, tenant_cap)` com fairness round-robin por tenant via `ROW_NUMBER() OVER (PARTITION BY tenant_id)`. journeys-worker 10 jobs/poll, email-campaign 5 jobs/poll.
 - Email paralelo: `p-limit(10)` + rate limiter token bucket (100/sec) + circuit breaker (5 failures). ~50-90 emails/sec. `SEND_CONCURRENCY` configurável.
-- Frequency guard (R45): send_email node verifica último email sent < 16h antes de enviar. Skip = success (enrollment avança). Decisão persistida em `journey_executions.decision_result` (R42). `EMAIL_FREQUENCY_GUARD_HOURS` configurável, 0=disabled.
+- Frequency guard (R45): send_email node verifica último email sent antes de enviar. Skip = success (enrollment avança). Decisão persistida em `journey_executions.decision_result` (R42). `EMAIL_FREQUENCY_GUARD_HOURS` configurável, **default=0 (desabilitado, opt-in)**. Automações triggered são contextuais — guard é opt-in via env var no Railway.
 - SLA separation (R46): journeys-worker (seconds) e email-campaign-worker (minutes) com zero overlap de job_types.
 
 ### 4.5 Trigger event_entry — Arquitetura Push-Based
@@ -250,6 +250,18 @@ Evento ocorre
 - `journeys.processing_jobs` → execução dos nós (existente, inalterado)
 
 **Routing index:** coluna derivada `trigger_event_type` (`GENERATED ALWAYS AS STORED`) com índice parcial em jornadas ativas para lookup O(log n).
+
+**Event types suportados (Sprint 18):**
+| event_type | Trigger SQL | Tabela fonte | Descrição |
+|---|---|---|---|
+| `purchase` | `trigger_purchase_journey_event()` | `commerce.transactions` | status → `paid` |
+| `transaction_pending` | `trigger_purchase_journey_event()` | `commerce.transactions` | status → `pending` (boleto/PIX) |
+| `cart_abandonment` | `trigger_cart_abandonment_journey_event()` | `eduzz.cart_abandonments` | Carrinho abandonado |
+| `email_opened` | `trigger_email_engagement_journey_event()` | `email.email_events` | Email aberto |
+| `email_clicked` | `trigger_email_engagement_journey_event()` | `email.email_events` | Link clicado |
+| `form_submitted` | — (scheduler/push) | — | Formulário enviado |
+
+Guards de transição: `purchase` só dispara se OLD.status != 'paid'; `transaction_pending` só dispara se OLD.status != 'pending'. INSERT direto como 'paid' gera APENAS purchase (sem transaction_pending). Pending → paid gera ambos (desejado: jornadas diferentes).
 
 **Backfill — decisão explícita na ativação:** Não é automático. O usuário escolhe ao ativar a jornada: apenas novos eventos (padrão) ou incluir histórico (desde quando?). A fronteira é `backfill_to = last_activated_at` — os dois workers nunca processam o mesmo evento. Rate limiting via `pg_try_advisory_lock` (máximo 1 backfill ativo por tenant). Cursor estável avança por `(created_at, id)` — nunca re-lê histórico completo.
 
@@ -720,6 +732,9 @@ eduzz:import_sales_page
 - [ ] Se envia comunicação: delegar para worker especializado (email, WhatsApp)
 - [ ] Se tem estado temporal (wait): salvar `wait_until`, scheduler acorda
 - [ ] Se cria/modifica entidade CRM: registrar em tabela de activities correspondente
+- [ ] Se tem condição/branch: usar `evaluateConditionSingle()` do Condition Engine (R40)
+- [ ] Se tem decisão: persistir em `journey_executions` (`decision_result`, `decision_input_snapshot`) (R42)
+- [ ] Se tem skip: registrar nós pulados em `journey_executions` com razão
 
 ---
 
@@ -1267,11 +1282,20 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 - Edge function `integrations-worker` deployed (v86)
 - B-18: ✅ Done
 
+## [v7.18] — 2026-03-30
+### Sprint 18 — Automações v2, Etapa 4: Novos Nodes (parcial)
+- **If/Then/Else (Condition Engine no Canvas):** SegmentBuilderV2 integrado no NodeInspector via Dialog popup. 40+ campos de profile + 10 campos de trigger (`trigger.amount`, `trigger.product_name`, `trigger.status`, `trigger.utm_*`, `trigger.payment_method`, etc.) via `TRIGGER_FIELD_CATEGORIES`. Dual path: v2 (`rules_json_v2` via `toBackendAST()`) + legacy (`conditions[]`) com badge "Condição legada" e botão de upgrade. `FieldSelectV2` com Dialog + busca + grid 2 colunas por categoria. `configSummary` descritivo gerado do AST.
+- **Cart abandonment trigger:** trigger SQL `on_cart_abandonment_journey_event` em `eduzz.cart_abandonments`. `event_data`: cart_id, product_ids, product_name, payment_method, UTMs, abandoned_at. Pipeline E2E: webhook → upsert cart → trigger → `journey_events` → `event_processing_jobs` → enrollment.
+- **Transaction pending trigger:** `trigger_purchase_journey_event` estendido. `status='pending'` (e OLD != 'pending') gera `event_type='transaction_pending'`. INSERT direto como 'paid' gera apenas purchase. `event_data`: transaction_id, amount, product_id, product_name, payment_type.
+- **Wait Until Date/Time:** nó wait expandido com 2 modos — `duration` (minutos/horas/dias) e `until_date` (data absoluta + timezone). Quando data já passou, 3 comportamentos via `if_passed`: `execute` (continua imediatamente), `skip_to_next_wait` (pula nós intermediários, registra em `journey_executions`), `exit_journey` (encerra enrollment). `convertLocalToUTC()` via Intl API nativa (Node 18+), sem dependência externa. `findNextWaitOrExit()` com safety limit 50 iterações.
+- **Frontend:** EventEntryConfig expandido (6 event_types). WaitConfig com seletor de tipo, date/time picker, timezone selector (8 opções BR/US/EU), dropdown `if_passed`. ConditionConfig com Dialog popup + SegmentBuilderV2 compact.
+- **Frequency guard default:** alterado de 16h para **0 (desabilitado)**. Opt-in via `EMAIL_FREQUENCY_GUARD_HOURS` env var no Railway.
+
 ## [v7.15] — 2026-03-26
 ### Sprint 17 — Automações v2, Etapa 3: Batch, Fairness & Performance
 - **D20 ✅:** Batch claim com fairness — `claim_next_jobs(batch_size, job_types, tenant_cap)` com `ROW_NUMBER() OVER (PARTITION BY tenant_id)`. journeys-worker 10 jobs/poll, email-campaign 5 jobs/poll. Singular preservado.
 - **Email paralelo:** `p-limit(10)` + rate limiter compartilhado. ~9→~50-90 emails/sec. `SEND_CONCURRENCY` configurável. Circuit breaker preservado.
-- **R45 ✅:** Channel frequency guard — 16h default entre emails por contato (cross-journey). Skip com razão persistida em `journey_executions` (R42). `EMAIL_FREQUENCY_GUARD_HOURS` configurável, 0=disabled. Index parcial `idx_campaign_recipients_frequency_guard`.
+- **R45 ✅:** Channel frequency guard — **default=0 (desabilitado, opt-in)** entre emails por contato (cross-journey). Skip com razão persistida em `journey_executions` (R42). `EMAIL_FREQUENCY_GUARD_HOURS` configurável. Index parcial `idx_campaign_recipients_frequency_guard`.
 - **R46 ✅:** SLA separation verificada — zero overlap de job_types. journeys-worker (seconds SLA), email-campaign (minutes SLA).
 - **D44 registrada:** Migrar template engine para SendGrid dynamic templates (P4).
 
