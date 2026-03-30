@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.16 — B-18 done: campos financeiros Eduzz preenchidos via enrich_invoice + backfill 22K transações*
+*Versão 7.17 — D35 ✅: backfill de traits completo (8.816 traits, 4 tenants)*
 
 ---
 
@@ -1148,7 +1148,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D32 | evaluation_mode em segments — ✅ Coluna populada automaticamente. 70/70 = event_driven. | ✅ Done |
 | D33 | Segment builder UI → AST v2 — ✅ Frontend escreve exclusivamente rules_json_v2 desde Sprint 12. | ✅ Done |
 | D34 | Scoping do unique index `processing_jobs_tenant_job_type_pending_uidx` — excluir `project_traits` e `sync_field_definitions` da condição WHERE para permitir múltiplos jobs pendentes per-entity. Ver R32 | **P2** |
-| D35 | Completar backfill de traits de formulários — 16 de 30 submissions ainda sem traits projetados. Rodar `backfillFormTraits.ts` com DATABASE_URL de produção | **P1** |
+| D35 | Backfill de traits de formulários — ✅ Resolvido (2026-03-30). Function SQL temporária `backfill_form_traits` projetou 8.816 traits (text: 8.464, number: 402, date: 368, boolean: 3) para 4 tenants. `segment_eval_queue` drenou em minutos. Gap restante: ~163K answers sem `field_definitions` (forms cujo `syncFieldDefinitions` nunca rodou — dívida separada, não D35). | ✅ Done |
 | D36 | **RLS não reconhece system_admin** — policies de RLS usam `tenant_id IN (SELECT tenant_id FROM core.tenant_users WHERE user_id = auth.uid())`, mas system admins podem não ter registro em `tenant_users` para todos os tenants. O RPC `get_user_tenant_memberships` faz LEFT JOIN e retorna todos os tenants, mas o RLS bloqueia queries. **Fix:** criar helper `core.user_visible_tenant_ids(uid)` que retorna todos os tenants para system admins (via `core.system_admins`) e apenas memberships para users normais. Substituir subquery de RLS por chamada a essa função. Workaround atual: inserir system admins em `tenant_users` de cada tenant manualmente. | **P2** |
 | D37 | **Cleanup dead code segmentação v1** (confirmado 2026-03-20): (1) `segmentEvaluator.ts:86-100` — fallback v1 chama `build_segment_where_clause` que foi **dropada do banco** — executar esse branch causaria erro SQL; (2) `scripts/runEquivalenceGate.ts` — inteiro arquivo é dead code; (3) `equivalence.test.ts` — testes de fallback v1 testam path impossível. Diagnóstico: 0 segmentos `rule_based` no banco (tipo renomeado para `manual`), 42/42 manuais com v2, função SQL não existe. Risco zero de remover. | Baixa — cleanup |
 | D38 | **Alerta de anomalia pós-envio.** pg_cron job diário que detecta campanhas com `recipient_source = 'segment'` onde `recipient_count_at_send > segment_parties_snapshot * 1.5` OU `recipient_count_at_send > 80%` da base do tenant. INSERT em tabela de alertas. Depende das colunas de rastreabilidade adicionadas no Sprint 12 (Guard 1). | **P2** |
@@ -1251,6 +1251,14 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.17] — 2026-03-30
+### D35 Done — Backfill de traits completo
+- 8.816 traits projetados via SQL function temporária (text: 8.464, number: 402, date: 368, boolean: 3)
+- 4 tenants processados: Escola do Fluxo (+8.694), Cone Island (+112), Thais Zacharias (+2), Instituto Socrates (+8)
+- `segment_eval_queue`: 1.187 entries processados, pipeline drenou em minutos
+- Function temporária `backfill_form_traits` dropada após uso
+- Gap documentado: ~163K answers sem `field_definitions` (`syncFieldDefinitions` pendente)
 
 ## [v7.16] — 2026-03-26
 ### B-18 Done — Campos financeiros Eduzz
