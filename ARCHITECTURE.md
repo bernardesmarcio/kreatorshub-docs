@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.18 — Sprint 18: Automações v2 Etapa 4 parcial (condition engine no canvas, event triggers, wait until date)*
+*Versão 7.19 — Cleanup: G-010 ✅, D34 ✅, D37 ✅, D41 ✅*
 
 ---
 
@@ -1162,14 +1162,14 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D31 | Integração Typeform — ✅ Parcial. Schema `typeform.*` implementado (6 tabelas), sync via pull-sync e historical-sync. Pendente: analytics de choice blocks, webhook receiver para ingestão contínua. | Parcial |
 | D32 | evaluation_mode em segments — ✅ Coluna populada automaticamente. 70/70 = event_driven. | ✅ Done |
 | D33 | Segment builder UI → AST v2 — ✅ Frontend escreve exclusivamente rules_json_v2 desde Sprint 12. | ✅ Done |
-| D34 | Scoping do unique index `processing_jobs_tenant_job_type_pending_uidx` — excluir `project_traits` e `sync_field_definitions` da condição WHERE para permitir múltiplos jobs pendentes per-entity. Ver R32 | **P2** |
+| D34 | Scoping unique index `processing_jobs_coalesced_pending_uidx` — ✅ Resolvido (2026-03-30). Index agora exclui `project_traits` e `sync_field_definitions` do WHERE. Múltiplos pending per-entity permitidos. | ✅ Done |
 | D35 | Backfill de traits de formulários — ✅ Resolvido (2026-03-30). Function SQL temporária `backfill_form_traits` projetou 8.816 traits (text: 8.464, number: 402, date: 368, boolean: 3) para 4 tenants. `segment_eval_queue` drenou em minutos. Gap restante: ~163K answers sem `field_definitions` (forms cujo `syncFieldDefinitions` nunca rodou — dívida separada, não D35). | ✅ Done |
 | D36 | **RLS não reconhece system_admin** — policies de RLS usam `tenant_id IN (SELECT tenant_id FROM core.tenant_users WHERE user_id = auth.uid())`, mas system admins podem não ter registro em `tenant_users` para todos os tenants. O RPC `get_user_tenant_memberships` faz LEFT JOIN e retorna todos os tenants, mas o RLS bloqueia queries. **Fix:** criar helper `core.user_visible_tenant_ids(uid)` que retorna todos os tenants para system admins (via `core.system_admins`) e apenas memberships para users normais. Substituir subquery de RLS por chamada a essa função. Workaround atual: inserir system admins em `tenant_users` de cada tenant manualmente. | **P2** |
-| D37 | **Cleanup dead code segmentação v1** (confirmado 2026-03-20): (1) `segmentEvaluator.ts:86-100` — fallback v1 chama `build_segment_where_clause` que foi **dropada do banco** — executar esse branch causaria erro SQL; (2) `scripts/runEquivalenceGate.ts` — inteiro arquivo é dead code; (3) `equivalence.test.ts` — testes de fallback v1 testam path impossível. Diagnóstico: 0 segmentos `rule_based` no banco (tipo renomeado para `manual`), 42/42 manuais com v2, função SQL não existe. Risco zero de remover. | Baixa — cleanup |
+| D37 | Cleanup dead code segmentação v1 — ✅ Resolvido (2026-03-30). Removidos: `runEquivalenceGate.ts`, `equivalence.test.ts`, fallback legacy em `segmentEvaluator.ts` (substituído por throw explícito). | ✅ Done |
 | D38 | **Alerta de anomalia pós-envio.** pg_cron job diário que detecta campanhas com `recipient_source = 'segment'` onde `recipient_count_at_send > segment_parties_snapshot * 1.5` OU `recipient_count_at_send > 80%` da base do tenant. INSERT em tabela de alertas. Depende das colunas de rastreabilidade adicionadas no Sprint 12 (Guard 1). | **P2** |
 | D39 | **Backend validation RPC para envio de campanha.** RPC `email.validate_campaign_send(p_tenant_id, p_recipient_count, p_segment_ids, p_recipient_source)` que valida server-side: (1) se source='segment', recipient_count <= SUM(segment_parties) * 1.1; (2) se source='all', recipient_count <= total_contacts do tenant; (3) retorna ok/reject com reason. Defense-in-depth — proteção redundante independente do frontend. | **P2** |
 | D40 | ~~party_id null em enrollments de formulário~~ | ✅ Resolvido (v7.13) — `create_opportunity` node: fallback lookup + last resort `crm.upsert_party_person` + graceful skip. `checkFormEntries` já tinha 3-layer resolve (v7.11). 10 jobs failed corrigidos, 0 órfãos restantes. |
-| D41 | ~~Queue audit — filas sem TTL/purge~~ | ✅ Resolvido (v7.13) — integrations.jobs ✅, integrations.webhook_events ✅, journeys.processing_jobs ✅ (`cleanup-journey-processing-jobs` 0 4 * * *). Pendente apenas: `analytics.segment_eval_queue` TTL 24h→4h. |
+| D41 | Queue audit — filas sem TTL/purge — ✅ Totalmente resolvido. Todas as filas com purge: `integrations.jobs` ✅, `integrations.webhook_events` ✅, `journeys.processing_jobs` ✅, `segment_eval_queue` TTL 24h→4h ✅ (2026-03-30). | ✅ Done |
 | D42 | **DROP tabelas Eduzz legadas** — `eduzz.integrations` e `core.eduzz_integrations`. Ambas substituídas por `integrations.accounts`. Bloqueado por Sprint Security — credenciais em texto plano precisam ser migradas antes do DROP. | Bloqueado |
 | B-17 | Testes de integração dos workers no tenant SaudeNow (`fe793fcd-7564-4d7c-b628-12a25e6d6656`) — criar jobs sintéticos para historical-sync, email-sync, ingestion e validar fluxo completo claim→running→success→analytics | Pendente |
 | B-18 | ~~Mapper Eduzz — `installments`, `fee_value`, `net_gain`~~ ✅ Handler `eduzz:enrich_invoice` atualizado (26/03): popula campos financeiros a partir de `eduzz.invoices`. Backfill aplicado: 22K transações. Cobertura 99.9%. | **Done** |
@@ -1266,6 +1266,13 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.19] — 2026-03-30
+### Cleanup sprint — G-010, D34, D37, D41
+- **G-010:** revogados TRUNCATE/REFERENCES/TRIGGER de `authenticated` em 63 tabelas / 10 schemas
+- **D34:** unique index `processing_jobs_coalesced_pending_uidx` agora exclui `project_traits` e `sync_field_definitions`
+- **D37:** dead code v1 removido — `runEquivalenceGate.ts`, `equivalence.test.ts`, fallback legacy em `segmentEvaluator.ts`
+- **D41:** `segment_eval_queue` TTL 24h→4h (projeção: 193MB→~50MB)
 
 ## [v7.17] — 2026-03-30
 ### D35 Done — Backfill de traits completo

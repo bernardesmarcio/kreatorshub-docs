@@ -65,7 +65,7 @@
 
 | Invariante | Onde verificar | O que acontece se violado |
 |---|---|---|
-| `party_id IS NOT NULL` na enrollment | `checkFormEntries.ts:148-156` — resolve via `vw_parties_unified` | **⚠️ GUARD AUSENTE (D40):** `partyId` pode ser `null` (email não encontrado em parties) e é inserido direto na linha 171. Enrollment com `party_id = null` → nodes `create_opportunity`/`send_email` ficam stuck (`next_execution_at = null`) |
+| `party_id IS NOT NULL` na enrollment | `checkFormEntries.ts:148-156` — 3-layer resolve (v7.13): (1) `vw_parties_unified` lookup, (2) `crm.upsert_party_person` fallback, (3) skip gracioso se ainda null | ✅ D40 resolvido (v7.13). Guard presente — enrollment com `party_id = null` impossível; `create_opportunity` node também tem fallback próprio. |
 | `email IS NOT NULL` | `checkFormEntries.ts:129` — `if (!email) { skipped++ }` | ✅ Guard presente — submissions sem email são ignoradas |
 | Journey `status` ativa | `checkFormEntries.ts:37` — `if journey not active → skip` | ✅ Guard presente — retorna `{ skipped: true, reason: 'journey_not_active' }` |
 | Submission não duplicada | `checkFormEntries.ts:135` — `enrolledSubmissionIds.has()` | ✅ Guard presente — skip se já enrolled |
@@ -100,7 +100,7 @@
 
 | Invariante | Onde verificar | O que acontece se violado |
 |---|---|---|
-| `enrollment.party_id IS NOT NULL` | Nodes que dependem de party | **⚠️ D40:** `create_opportunity` e `send_email` ficam stuck se `party_id` null. Guard ausente no enrollment (ver tabela checkFormEntries acima) |
+| `enrollment.party_id IS NOT NULL` | Nodes que dependem de party | ✅ D40 resolvido (v7.13). `checkFormEntries` tem 3-layer resolve; `create_opportunity` tem fallback próprio com `upsert_party_person` + skip gracioso. |
 | `send_email` skip retorna `success: false` | `process-journey` Edge Function | **R39:** skip com `success: true` perdia envio silenciosamente. Corrigido: `success: false` + `waitUntil` para retry |
 | `enrollment.status = 'active'` | Claim do job no worker | Enrollment completed/failed não deveria gerar novos jobs |
 
@@ -538,7 +538,7 @@ Antes de implementar qualquer novo pipeline, responder:
 | **Enqueue de job** | Job na fila errada = pending infinito (R33) | `// Queue: analytics.processing_jobs → analytics-worker. R33: NÃO usar integrations.jobs` |
 | **ON CONFLICT** | Idempotência errada = duplicata ou perda de update | `// Idempotência: (tenant_id, source_name, external_transaction_id). ON CONFLICT DO UPDATE apenas paid→refunded` |
 | **Guard / fail-closed** | Remoção acidental do guard = blast radius (R38) | `// R38 FAIL-CLOSED: segment_parties vazio + has rules = refresh pendente, NUNCA "enviar para todos"` |
-| **Pipeline pré-condição** | Dado incompleto propaga silenciosamente | `// INVARIANTE: party_id NOT NULL. Sem isso → D40: enrollment stuck, opportunity node falha` |
+| **Pipeline pré-condição** | Dado incompleto propaga silenciosamente | `// INVARIANTE: party_id NOT NULL. D40 resolvido (v7.13): 3-layer resolve + fallback em create_opportunity` |
 | **CHECK constraint enum** | Novo valor sem migration = INSERT rejeitado (R31) | `// R31: valores devem estar na CHECK constraint do banco. Novo valor → migration ANTES do deploy` |
 | **Status transitions** | Transição inválida corrompe state | `// Status: pending→paid OK, paid→pending NUNCA. Ver process_transactions_batch` |
 | **contact_state write** | Múltiplos writers = divergência | `// WRITER: este é um dos N writers de contact_state. Ver DEPENDENCY_MAP.md > contact_state` |
@@ -576,7 +576,7 @@ Antes de implementar qualquer novo pipeline, responder:
 | ❌ Não fazer | ✅ Fazer |
 |---|---|
 | `// Enfileira o job` | `// Queue: analytics.processing_jobs → analytics-worker (R33)` |
-| `// Verifica se tem party_id` | `// INVARIANTE D40: party_id NULL → enrollment stuck, opportunity node falha` |
+| `// Verifica se tem party_id` | `// INVARIANTE D40 (resolvido v7.13): 3-layer resolve garante party_id NOT NULL` |
 | `// Atualiza contact_state` | `// WRITER contact_state.tag_ids — ver DEPENDENCY_MAP.md para lista completa de writers` |
 | `// ON CONFLICT DO NOTHING` | `// Idempotência: (tenant_id, source_name, external_id). Duplicata = skip (camada 2)` |
 | Comentário sem referência a regra | Sempre incluir R[N], D[N] ou seção do ARCHITECTURE.md |
