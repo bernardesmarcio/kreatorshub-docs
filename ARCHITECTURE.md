@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.19 — Cleanup: G-010 ✅, D34 ✅, D37 ✅, D41 ✅*
+*Versão 7.20 — Sprint 19: Email Engagement Conditions*
 
 ---
 
@@ -1128,6 +1128,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R44 | **Extensibilidade de resolvers via registry.** Novos campos para condition node devem ser adicionados via registro (field → resolver function), não via switch/case hardcoded. O resolver recebe `(partyId, tenantId, fieldConfig)` e retorna o valor. Mesmo padrão do `semanticFieldRegistry.ts` do analytics. | Requisito Etapa 2 — condition engine extensível |
 | R45 | **Frequency guard em nós de comunicação.** Nós `send_email`, `webhook`, `notify` devem respeitar limite de frequência por contato configurável no journey settings. Default: max 1 email por contato por 24h na mesma jornada. Guard consultável em `journey_executions` (contagem de executions do mesmo node_type para o mesmo enrollment nas últimas N horas). | Requisito Etapa 2 — proteção contra spam |
 | R46 | **Workers separados por SLA.** journeys-event-worker (< 5s, push-based) e journeys-worker (minutos, batch) devem permanecer separados. Condition engine pesado (queries em contact_state) não deve rodar no event-worker. Se condition evaluation for necessária no fanout, delegar para journeys-worker via processing_job. | Confirmado Sprint 14 — audit comprovou separação necessária |
+| R47 | **Email engagement via subquery, não snapshot.** Campos `campaign_opened`/`campaign_clicked` usam resolver `email_engagement` com EXISTS em `email.email_events`. Engagement data é per-campaign — nunca materializar em `contact_state`. Condition node usa pre-enrichment (`__email_engagement` injetado pelo conditionEngine). Padrão replicável para futuros campos relacionais (ex: `opened_journey_email_X`). | Sprint 19 |
 
 ---
 
@@ -1266,6 +1267,24 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.20] — 2026-04-08
+### Sprint 19 — Email Engagement Conditions (Segmentação + Jornadas)
+
+**Handler fix:** `sendgrid:engagement_event` e `sendgrid:delivery_event` agora propagam `campaign_id`, `send_id`, `recipient_id` no INSERT de `email.email_events` via `resolveCampaignContext()` (1 query JOIN `campaign_recipients` → `campaign_sends`). Backfill aplicado: 75.2% opens e 68.0% clicks linkados (restante = transacionais/teste sem campaign — esperado).
+
+**Novo resolver `email_engagement`:** Dual-mode (compileSQL para segmentação bulk + compileMemory para condition node). EXISTS subquery em `email.email_events` filtrado por `send_id` + `event_type`. Suporta operadores `is_true`, `is_false`, `url_contains`.
+
+**Campos registrados:**
+- `campaign_opened` — "Abriu campanha" (uuid[] send_ids, operator_family engagement)
+- `campaign_clicked` — "Clicou em campanha" (uuid[] send_ids, + url_contains para filtro de URL)
+- `last_email_opened_at` / `last_email_clicked_at` — expostos no frontend (já existiam no registry)
+
+**Pre-enrichment no conditionEngine:** `extractEngagementSendIds()` scanneia AST, faz 1 query em `email.email_events`, injeta `__email_engagement` no contactState. Custo: 1 query extra apenas quando condição de engagement é usada.
+
+**Frontend:** Categoria "Engajamento de email" no SegmentBuilderV2 com 4 campos. `useCampaignSends()` hook busca `campaign_sends` + `email_campaigns` JOIN. `CampaignSelectInput` via MultiSelectInput pattern (mesmo de bought_product). Operador `url_contains` renderiza input text adicional.
+
+**Regra R47:** Campos de email engagement usam resolver `email_engagement` com EXISTS subquery — nunca materializar engagement data em `contact_state` (dados são per-campaign, não per-contact snapshot). Pre-enrichment no conditionEngine é o padrão para campos que dependem de dados relacionais no modo SINGLE.
 
 ## [v7.19] — 2026-03-30
 ### Cleanup sprint — G-010, D34, D37, D41

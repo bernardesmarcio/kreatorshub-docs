@@ -3,7 +3,7 @@
 > **REGRA R37**: Antes de alterar qualquer item listado aqui, verificar TODOS os readers/writers.
 > Atualizar este arquivo sempre que adicionar novo consumidor.
 >
-> Gerado em: 2026-03-19 · Última atualização: 2026-03-20
+> Gerado em: 2026-03-19 · Última atualização: 2026-04-09
 
 ---
 
@@ -267,6 +267,17 @@ Antes de implementar qualquer novo pipeline, responder:
 - **Readers:**
   - `src/pages/admin/UnsubscribeGroupDetail.tsx:87` — SELECT for group detail
   - `src/pages/admin/UnsubscribeGroups.tsx:87` — SELECT for group counts
+
+### email.email_events — Email engagement tracking
+
+- **Writers:**
+  - `supabase/functions/integrations-worker/handlers/sendgrid.ts` — INSERT com campaign context via `resolveCampaignContext()` (open, click, delivered, bounce, etc.)
+- **Readers:**
+  - `workers/shared/src/segmentation/resolvers.ts` — `email_engagement` resolver compileSQL (EXISTS subquery por `send_id` + `event_type`)
+  - `workers/analytics/src/segmentation/resolvers.ts` — mesma cópia do resolver
+  - `workers/journeys/src/conditionEngine.ts` — pre-enrichment query (`extractEngagementSendIds` → `__email_engagement` no contactState)
+- **Indexes:** `idx_email_events_send` (btree on `send_id` WHERE `send_id IS NOT NULL`)
+- **Regra R47:** Engagement data lida via subquery/enrichment, nunca materializada em `contact_state`.
 
 ---
 
