@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.22 — Auditoria pg_cron + R50 + D-CRON-1..4*
+*Versão 7.25 — D28 Fase 1: DROP customer_id em 6 tabelas zero-data*
 
 ---
 
@@ -485,6 +485,9 @@ sem registro = violação arquitetural.
 | `purge-integrations-webhook-events` | `45 3 * * *` | DELETE TTL com guard `NOT EXISTS jobs` | `integrations.purge_old_webhook_events` | **A** | TTL puro. |
 | `expire-soft-bounce-suppressions` | `0 * * * *` | UPDATE TTL `expires_at <= NOW()` | `email.expire_soft_bounce_suppressions` | **A** | TTL puro. |
 | `create-contact-events-partition` | `0 2 25 * *` | DDL `CREATE TABLE PARTITION` idempotente | `analytics.create_contact_events_partition_if_needed` | **A** | DDL maintenance. |
+| `etl-event-health-metrics` | `5 * * * *` | Pulse ETL hourly: agrega `fallback_log` + `contact_events` + `segment_eval_queue` em `event_health_metrics` via `emit_health_metric` | `analytics.etl_event_health_metrics` | **A** | D-CRON-3 (v7.24). Banco-only, sem lógica de domínio. Substituível por workers em D-CRON-4 sem mudar view/handler (R52). |
+| `event-health-metrics-partition-create` | `30 2 25 * *` | DDL idempotente — cria partição mensal de `event_health_metrics` | `analytics.event_health_metrics_partition_create_if_needed` | **A** | D-CRON-3 (v7.24). Mesmo padrão de `create-contact-events-partition`. |
+| `event-health-metrics-purge-old` | `30 4 * * *` | DROP partition para retention 90d em `event_health_metrics` | `analytics.event_health_metrics_purge_old` | **A** | D-CRON-3 (v7.24). TTL puro via DROP (mais barato que DELETE). |
 | `sweep-orphan-enrollments` | `*/10 * * * *` | Re-enqueue de enrollments órfãos LIMIT 100 | `journeys.sweep_orphan_enrollments` | **A** | Safety net pós D18 (fanout não-atômico). Sem lógica de domínio. **TODO:** alarmar quando `count > 0` indica bug em fanout. |
 | `rfm-rolling-refresh` | `0 * * * *` | Enqueue `refresh_features` para 1/24 dos tenants/hora com threshold 20h via `MOD(HASHTEXT(t.id), 24) = HOUR(NOW())` | `analytics.enqueue_job_internal` | **B** | Loop bloqueante de tenants no banco (viola §2.4). Lógica de sharding e threshold em SQL. **D-CRON-2** — migrar para worker. |
 | `segment-eval-fallback` | `*/5 * * * *` | Itera tenants ativos, detecta contatos com `state_updated_at < 15min` sem job pending, enqueue na `segment_eval_queue` | `analytics.run_segment_eval_fallback` | **B** | Safety net pro event-driven path. Loop bloqueante de tenants (viola §2.4). Mascara bugs do path event-driven sem alarme. **D-CRON-3** (instrumentar `analytics.fallback_log`) é pré-requisito de **D-CRON-4** (migrar para worker). |
@@ -798,6 +801,95 @@ Ver `workers/journeys-event/src/monitoring.sql` para queries completas:
 6. Backfills ativos
 7. Alerta: pending > 2min
 8. Alerta: P95 > 5s
+
+---
+
+## 17.1 Platform Health Observability (D-CRON-3)
+
+**Status:** ✅ Operacional (v7.24).
+
+Camada própria de observability arquitetural — desacoplada do mecanismo observado
+(R52). Mudança no path observado (ex: `segment-eval-fallback` cron → worker em
+D-CRON-4) NÃO obriga reescrever a view nem o handler de alerta.
+
+### Arquitetura — três camadas decoupled
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Camada A — TELEMETRIA                                       │
+│  analytics.event_health_metrics (particionada mensal, 90d)   │
+│  Populada por:                                               │
+│    • cron `etl-event-health-metrics` (hourly, categoria A)   │
+│    • workers via RPC analytics.emit_health_metric()          │
+│      ex: segment-eval-worker emite `segment_membership_      │
+│          changes` em batch 60s                               │
+└──────────────────────────────────────────────────────────────┘
+                          ↓ lida APENAS por
+┌──────────────────────────────────────────────────────────────┐
+│  Camada B — SAÚDE                                            │
+│  analytics.v_event_driven_health (view)                      │
+│  Tier classification per-tenant: HEALTHY / WARN / ERROR /    │
+│  CRITICAL / INSUFFICIENT_DATA                                │
+│  Baseline: rolling 7d P50/P95/P99 do PRÓPRIO tenant,         │
+│  excluindo a hora atual (evita auto-inflação).               │
+│  Whitelist via core.platform_health_whitelist.               │
+└──────────────────────────────────────────────────────────────┘
+                          ↓ lida APENAS por
+┌──────────────────────────────────────────────────────────────┐
+│  Camada C — ALERTA                                           │
+│  workers/journeys/src/handlers/healthCheck.ts (5min cadence) │
+│  Emite Sentry em transição p/ tier pior. Recovery silencioso │
+│  (HEALTHY sustentado 30min). Dedup via                       │
+│  analytics.platform_alert_state.                             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Tier classification
+
+| Condição | Tier |
+|---|---|
+| baseline samples < 168 (7d × 24h) | `INSUFFICIENT_DATA` |
+| `error_sustained_1h` E `hits_1h > p99` | `CRITICAL` |
+| `hits_1h > p95` | `ERROR` |
+| `hits_1h > p50 * 1.5` | `WARN` |
+| caso contrário | `HEALTHY` |
+
+### Métricas coletadas (v7.24)
+
+| metric_name | semântica | fonte v7.24 | fonte D-CRON-4 |
+|---|---|---|---|
+| `fallback_hits` | contacts detectados pelo cron `segment-eval-fallback` | ETL hourly de `analytics.fallback_log` | worker emite direto (cron some) |
+| `event_driven_hits` | event-driven entries no segmento | ETL hourly de `analytics.contact_events` (event_type='segment_entered', source='system') | inalterado |
+| `eval_queue_throughput` | jobs com status='processed' por hora | ETL hourly de `analytics.segment_eval_queue` | inalterado |
+| `eval_queue_error_rate` | errors / (errors + processed) por hora (mín 10 jobs) | ETL hourly de `analytics.segment_eval_queue` | inalterado |
+| `eval_queue_p95_latency_ms` | p95 latency `processed_at - claimed_at` (ms) | ETL hourly de `analytics.segment_eval_queue` | inalterado |
+| `segment_membership_changes` | sum(entered + exited) por bucket hora | `segment-eval-worker` emite em batch 60s direto via `emit_health_metric` | inalterado |
+
+### Regras de alerta (Camada C)
+
+1. **WARN não dispara Sentry.** Tier informativo apenas — handler trackeia state mas não notifica.
+2. **ERROR/CRITICAL alertam em transição PARA pior** (HEALTHY/WARN/null → ERROR/CRITICAL OU ERROR → CRITICAL).
+3. **Re-alerta no mesmo tier ≥ ERROR só após 1h.** Evita alert fatigue.
+4. **Transição CRITICAL → ERROR não re-alerta** (tier melhor sem ser HEALTHY).
+5. **Recovery silencioso:** ERROR/CRITICAL → HEALTHY sustentado 30min apenas atualiza state + log info. Sem Sentry. Auditoria via `platform_alert_state.last_changed_at`.
+6. **Whitelist:** `core.platform_health_whitelist` (auditável, com `reason` CHECK constraint, `added_by`, `expires_at`). Começa vazia em v7.24. Adicionar tenant nominalmente via migration.
+
+### Pré-requisito de produção
+
+Sentry DSN do project `workers-railway` deve estar em `SENTRY_DSN_WORKERS` no
+Railway. Se ausente, `initSentryWorker` loga `sentry_disabled` e o handler segue
+funcionando — escreve em `platform_alert_state` + log estruturado, mas não emite
+no Sentry. Permite deploy do código antes do DSN estar configurado.
+
+### Arquivos
+
+| Arquivo | Papel |
+|---|---|
+| `supabase/migrations/20260501100000_dcron3_observability.sql` | Schema completo (whitelist, tabela particionada, RPC, view, ETL function, partition rotation, TTL purge, 3 crons categoria A) |
+| `workers/shared/src/sentry.ts` | `initSentryWorker`, `captureWorkerException`, `flushSentry` — reutilizável por qualquer worker. No-op se DSN ausente. |
+| `workers/journeys/src/handlers/healthCheck.ts` | Handler `runEventDrivenHealthCheck` + `shouldAlert`/`isWorseTier` puros (testáveis). |
+| `workers/journeys/src/index.ts:runSchedulerLoop` | Hook `lastHealthCheck` (5min interval). |
+| `workers/analytics/src/segment-eval-worker.ts` | `flushHealthMetricBatch` (60s) emite `segment_membership_changes`. |
 
 ---
 
@@ -1163,6 +1255,8 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R47 | **Email engagement via subquery, não snapshot.** Campos `campaign_opened`/`campaign_clicked` usam resolver `email_engagement` com EXISTS em `email.email_events`. Engagement data é per-campaign — nunca materializar em `contact_state`. Condition node usa pre-enrichment (`__email_engagement` injetado pelo conditionEngine). Padrão replicável para futuros campos relacionais (ex: `opened_journey_email_X`). | Sprint 19 |
 | R48 | **`analytics.segments.rules_json_v2.root.children` deve conter exclusivamente nós `kind: 'group'`.** Conditions soltas no nível root são deprecated (shape B legado). Adapter UI (`normalizeAstV2ForUI`) é safety net que normaliza shapes legacy em runtime no load — até Fase 2 (backfill SQL canonicalizando todos os segmentos) e Fase 4 (trigger BEFORE INSERT/UPDATE em `analytics.segments` validando o shape). Após Fase 4, R48 vira enforcement estrutural; antes disso, é convenção. | Hotfix v7.21 — 46/52 segmentos manuais ativos com shape B causaram builder vazio em produção; duas rotas de criação coexistiam, escrevendo formatos divergentes. |
 | R50 | **pg_cron é APENAS housekeeping.** Permitido: DELETE/UPDATE de TTL em filas/logs/audit; DDL maintenance (criar partição, REINDEX, VACUUM); pulse simples sem lógica de domínio (`SELECT some_fn()` que apenas dispara cleanup banco-only). **Proibido:** loop sobre tenants (`FROM core.tenants WHERE is_active`) — viola §2.4 Isolamento por tenant; lógica de negócio embutida (thresholds dinâmicos, sharding heurístico, condições de domínio); INSERT/UPDATE em tabelas de domínio (não-fila/log); fanout que cresce com volume. Lógica com schedule tenant-aware ou condições de negócio = worker no Railway. Cron novo requer entrada na tabela §11 + classificação A; cron categoria B/C/D requer auditoria arquitetural antes de aprovar. | Auditoria v7.22 — `rfm-rolling-refresh` e `segment-eval-fallback` foram criados sem registro arquitetural, com loop bloqueante de tenants no banco e mascarando bugs do event-driven path. Reclassificados como categoria B; D-CRON-2..4 abertos. |
+| R52 | **Observability de plataforma reside em camada própria desacoplada do mecanismo observado.** Telemetria (Camada A — `analytics.event_health_metrics`), view de saúde (Camada B — `analytics.v_event_driven_health`) e alerta (Camada C — handler em worker) são entidades separadas. View e handler leem APENAS a tabela de telemetria — NUNCA tabelas operacionais (`fallback_log`, `segment_eval_queue`, etc). Mudança no mecanismo observado (ex: substituir cron por worker em D-CRON-4) afeta APENAS quem POPULA a métrica, não quem consome. **Como identificar violação:** PR adicionando `JOIN analytics.fallback_log` ou similar dentro de `v_event_driven_health` ou do handler de alerta = violação. Caminho correto: novo emissor escreve em `event_health_metrics` via `analytics.emit_health_metric()`. | D-CRON-3 (v7.24) — primeira camada de observability arquitetural; precedente para futura observabilidade de outros paths (workers, integrações, journey throughput). |
+| R51 | **Campos de domínio separado fora de `contact_state` e `v_segment_unified` são avaliados como optimistic (`true`) no worker in-memory; a filtragem definitiva acontece no SQL path via subquery em `eval_condition_v2`.** Extensão operacional de R36: campos 1:N (oportunidades, tickets, etc.) NÃO devem ser denormalizados em `contact_state`. No fast-path do worker (planner/evaluator de jornadas e segmentação), quando o campo não tiver resolver disponível na avaliação in-memory, retornar `true` (optimistic) e deixar o SQL path do `eval_condition_v2` aplicar o filtro real via subquery indexada. Nunca adicionar coluna em `contact_state` para "facilitar" — isso reintroduz o drift entre snapshot stale e regra fresh que motivou R36. **Como identificar violação:** PR adicionando `has_*` ou `*_count` em `contact_state` para resolver gap de avaliação no worker = violação. Caminho correto: criar/ajustar resolver no SQL path. | Sprint de Performance v7.23 — `has_open_opportunity` resolvia false em CRM conditions porque o worker in-memory não conhecia oportunidades; fix correto foi optimistic no worker + subquery no SQL path, não materialização. |
 
 ---
 
@@ -1191,8 +1285,8 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D25 | `refresh_tenant_distribution` + tela de monitoramento | Pendente |
 | D26 | trg_record_email_engagement — ✅ Trigger + 4 colunas em contact_state operacionais. | ✅ Done |
 | D27 | UI: novos blocos de condição no segment builder (product picker, time window, CRM condition) | Pendente |
-| D28 | D6 Fase 3 — `DROP COLUMN customer_id`. Diagnóstico (2026-03-20): 17 tabelas/views ainda com `customer_id` — analytics (7): `customer_cluster_assignments`, `customer_cluster_subgroup_assignments`, `customer_lookalike_scores`, `lifecycle_events`, `segment_customers`, `v_segment_base`, `v_segment_leads_base`; commerce (2): `transactions`, `archived_transactions`; core (1): `eduzz_webhook_events`; crm (4): `customer_badges`, `customer_tags`, `opportunities`, `vw_parties_unified`; eduzz (2): `buyers`, `webhook_events`; journeys (1): `journey_enrollments`. Trabalho substancial — requer migração por fases com validação entre cada DROP. | Pendente |
-| D29 | Performance loading timeout — tenant escola-do-fluxo. Profiling de RPCs lentas (`get_dashboard_data`, `get_pareto_analysis`) + lazy loading analytics. Sentry JAVASCRIPT-REACT-22, 21, 1S | Investigar |
+| D28 | D6 Fase 3 — `DROP COLUMN customer_id`. **Fase 1 ✅ (2026-04-08, v7.25):** 6 colunas zero-data dropadas — `analytics.customer_cluster_assignments`, `analytics.customer_cluster_subgroup_assignments`, `analytics.customer_lookalike_scores`, `core.eduzz_webhook_events`, `eduzz.webhook_events`, `crm.customer_badges`. **Restante (11 entradas):** 8 base tables — `commerce.transactions`, `commerce.archived_transactions`, `journeys.journey_enrollments`, `crm.opportunities`, `crm.customer_tags`, `analytics.lifecycle_events`, `analytics.segment_customers`, `eduzz.buyers`; 3 views — `analytics.v_segment_base`, `analytics.v_segment_leads_base`, `crm.vw_parties_unified`. 5 FKs ativas → `crm.customers` (bridge table, 16.4K rows 100% party_id). 35 funções com "customer" no nome — auditoria necessária antes da Fase 3. **Próximas fases:** Fase 2 (tabelas com party_id 100%: transactions, enrollments, opportunities), Fase 3 (audit das 35 funções + drop FKs → `crm.customers`), Fase 4 (DROP `crm.customers` + rebuild views). | Fase 1 ✅ · Fase 2–4 Pendente |
+| D29 | Performance loading timeout — ✅ Resolvido (v7.23, Sprint de Performance). `crm.get_dashboard_data` 534ms→17ms (3 lead CTEs colapsados em 1 `COUNT FILTER`); `analytics.get_analytics_data` 4 scans→1 (CTE `base_txn`); `crm.list_parties` reescrito de subqueries correlacionadas para CTEs batch. Novas RPCs: `crm.get_parties_stats(p_tenant_id)` (stats globais separados, staleTime 5min) e `analytics.get_transactions_chart_data(p_tenant_id, p_granularity, p_start_date, p_end_date)` (agregação por período: 26K rows→37 buckets, 22ms). `segment_eval_queue` purgada de 533K erros. Polling -99.8%. Frontend: React Query Persist (IndexedDB, 24h, limpa no logout), connection heartbeat (4min, pausa em tab inativa), prefetch durante auth (dashboard, tags, features), loading progressivo (Campaigns, Segmentation, Forms, Analytics), AccessGate bypass em warm path, dynamic imports −924K bundle, vendor chunks (`@xyflow`, `@tiptap`, `zod`), `useTenantTags` (6 query keys→1), `usePartiesStats` (cache 5min), polling 1s→30s, fix `has_open_opportunity` optimistic no worker + SQL subquery (R51). Rollbacks em `docs/rollback/`. Sentry JAVASCRIPT-REACT-22, 21, 1S fechados. | ✅ Done |
 | D30 | Decompor blocos contact_info e address em traits individuais — hoje kind: 'skip', sem dados reais ainda | Pendente |
 | D31 | Integração Typeform — ✅ Parcial. Schema `typeform.*` implementado (6 tabelas), sync via pull-sync e historical-sync. Pendente: analytics de choice blocks, webhook receiver para ingestão contínua. | Parcial |
 | D32 | evaluation_mode em segments — ✅ Coluna populada automaticamente. 70/70 = event_driven. | ✅ Done |
@@ -1226,7 +1320,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D-DATA-1-RFM-ACCENT | Acentuação inconsistente em `analytics.contact_state.rfm_segment` em produção: `Clientes Fiéis` (com agudo) coexiste com `Potenciais Fieis` (sem agudo). Outros labels OK. UI replica o estado do banco para preservar igualdade de string no SQL. Resolver junto com D-RFM-LABELS quando enum compartilhado for criado. | **P4** |
 | D-CRON-1 | **Documentar todos os pg_cron jobs em `ARCHITECTURE.md`.** Mandatório (independente de categoria A/B/C/D). Tabela em §11 com jobname, schedule, command resumido, função SQL invocada, categoria, owner. Cron novo daqui pra frente requer entrada nessa tabela antes de ser criado. | ✅ Done (v7.22) |
 | D-CRON-2 | **`rfm-rolling-refresh` migrar para worker no Railway.** Cron some, lógica de sharding (`MOD(HASHTEXT, 24)`) + threshold (20h staleness) vai pro código TS no `journeys-worker` ou novo `analytics-scheduler`. Risco: timing/SLA de RFM crítico — fazer com testes A/B em staging. Bloqueado por: revisar threshold 20h e estratégia de sharding em código antes de migrar. | **P3** |
-| D-CRON-3 | **`segment-eval-fallback` instrumentar.** Dashboard/alarme sobre `analytics.fallback_log` — se hits/dia > limite (a calibrar), o event-driven path está degradado. Sem este alarme, o cron mascara bugs silenciosamente. Pré-requisito de D-CRON-4. **Próximo a virar fix calibrado** (acordado em v7.22). | **P2** |
+| D-CRON-3 | **`segment-eval-fallback` instrumentar.** ✅ **Resolvido (v7.24).** Implementação muito além do "alarme em fallback_log" original: 3-camada Platform Health Observability decoupled (Camada A `event_health_metrics` particionada mensal + RPC `emit_health_metric` + 3 crons categoria A; Camada B view `v_event_driven_health` com tier classification per-tenant baseado em rolling 7d P50/P95/P99; Camada C handler `runEventDrivenHealthCheck` em `journeys-worker` com dedup, recovery silencioso, integração Sentry via `workers/shared/src/sentry.ts` reutilizável). 19 testes unit/integration. R52 estabelece o decoupling como regra para futura observability arquitetural. Pré-requisito de produção: criar Sentry project `workers-railway` e setar `SENTRY_DSN_WORKERS`. Auto-noop sem DSN. | ✅ Done |
 | D-CRON-4 | **`segment-eval-fallback` migrar para worker.** Após baseline de D-CRON-3 estabelecido, mover loop de tenants para Railway. Cron vira pulse simples ou desaparece se métrica de hits zerar. Bloqueado por: D-CRON-3 + D-SEG-7 (event-driven audit) fechado. | **P3** |
 | D-SEG-12-LOOKALIKE-DIRECT-WRITE | **`src/lib/analyticsStorage.ts:527 createSegmentFromLookalikes`** faz BULK INSERT direto no `analytics.segment_parties` da UI com `source: "customer"` hardcoded — bypassa todas as funções canonical. Para segmentos lookalike (todos os membros são customers por definição) é semanticamente correto, mas é mais um produtor fora do path canonical. Migrar para função SQL canonical (ex: `analytics.create_lookalike_segment_from_scores`) que reuse `apply_segment_membership_diff` para determinar `source` via `party_type` e mantenha audit trail. | **P3** |
 
@@ -1320,6 +1414,122 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.25] — 2026-04-08
+### D28 Fase 1 — DROP customer_id em 6 tabelas zero-data
+
+**Contexto:** diagnóstico de 2026-03-20 listou 17 tabelas/views ainda com coluna `customer_id`. Re-auditoria em 2026-04-08 identificou que 6 dessas tabelas tinham a coluna mas com **zero linhas populadas** — seguro dropar sem backfill nem migração de leitores.
+
+**Tabelas afetadas (6 colunas dropadas):**
+- `analytics.customer_cluster_assignments`
+- `analytics.customer_cluster_subgroup_assignments`
+- `analytics.customer_lookalike_scores`
+- `core.eduzz_webhook_events`
+- `eduzz.webhook_events`
+- `crm.customer_badges`
+
+**Procedimento:**
+1. `SELECT COUNT(customer_id)` em cada tabela → todas retornaram 0.
+2. `ALTER TABLE … DROP COLUMN IF EXISTS customer_id` nas 6 tabelas.
+3. Re-query do `information_schema.columns` confirmou 0 ocorrências restantes nas 6.
+
+**Inventário D28 restante (11 entradas):**
+- **Base tables (8):** `commerce.transactions` (35K rows, 100% `party_id`), `commerce.archived_transactions` (7.9K), `journeys.journey_enrollments` (17, 99.8% `party_id`), `crm.opportunities` (22, 100% `party_id`), `crm.customer_tags` (7), `analytics.lifecycle_events` (9.4K, 5 órfãos), `analytics.segment_customers` (112), `eduzz.buyers` (46).
+- **Views (3):** `analytics.v_segment_base`, `analytics.v_segment_leads_base`, `crm.vw_parties_unified`.
+- **FKs ativas:** 5 → `crm.customers` (bridge table, 16.4K rows 100% party_id).
+- **Funções:** 35 com "customer" no nome — auditoria obrigatória antes da Fase 3.
+
+**Mudanças nos docs:**
+- **D28** atualizada: Fase 1 ✅; restante e roadmap (Fase 2–4) detalhados.
+
+**Próximas fases (não executadas nesta sprint):**
+- **Fase 2:** tabelas com `party_id` 100% — `transactions`, `journey_enrollments`, `opportunities` ganham DROP de `customer_id` direto.
+- **Fase 3:** audit das 35 funções com "customer" + drop das 5 FKs → `crm.customers`.
+- **Fase 4:** DROP `crm.customers` + rebuild das 3 views (`v_segment_base`, `v_segment_leads_base`, `vw_parties_unified`).
+
+---
+
+## [v7.24] — 2026-05-01
+### Platform Health Observability (D-CRON-3) + R52
+
+**Contexto:** D-CRON-3 evoluiu de "alarme simples em `fallback_log`" para a primeira camada de observability arquitetural da plataforma. Princípio guia: instrumentação não pode ficar acoplada ao mecanismo observado — quando D-CRON-4 substituir o cron `segment-eval-fallback` por worker, view e handler permanecem inalterados.
+
+**Migration `20260501100000_dcron3_observability.sql`:**
+- `core.platform_health_whitelist` — whitelist auditável (reason CHECK, added_by, expires_at). Começa vazia. Tenant `00000000-...001` (Escola do Fluxo) NÃO entra: é tenant real.
+- `analytics.event_health_metrics` — tabela particionada mensal (PK `tenant_id, metric_name, bucket_hour`), RLS service-only. Partições 2026-04 + 2026-05 criadas para warmup retroativo dos 7d iniciais de baseline.
+- `analytics.emit_health_metric()` — RPC SECURITY DEFINER para UPSERT. Workers consomem.
+- `analytics.platform_alert_state` — dedup state (last_tier, last_changed_at, last_alert_at).
+- `analytics.v_event_driven_health` — tier classification per-tenant baseada em rolling 7d P50/P95/P99 do PRÓPRIO tenant, excluindo a hora atual. Tier `INSUFFICIENT_DATA` durante warmup (< 168 samples).
+- `analytics.etl_event_health_metrics(window_hours)` — pulse banco-only (R50 categoria A). Agrega `fallback_log` + `contact_events` + `segment_eval_queue` em 5 métricas. Substituível por workers em D-CRON-4 sem mudar consumidores (R52).
+- `analytics.event_health_metrics_partition_create_if_needed()` — DDL idempotente para rotação mensal.
+- `analytics.event_health_metrics_purge_old(retention_days)` — DROP partition (90d retention).
+- 3 novos pg_cron jobs categoria A registrados em §11: `etl-event-health-metrics` (5 * * * *), `event-health-metrics-partition-create` (30 2 25 * *), `event-health-metrics-purge-old` (30 4 * * *).
+
+**Worker code:**
+- `workers/shared/src/sentry.ts` — helper reutilizável. `initSentryWorker(opts)` no-op silencioso se `SENTRY_DSN_WORKERS` ausente — permite deploy do código antes do DSN. Adicionado `@sentry/node ^8.55.2` em deps de `@creator-hub/shared`. Re-exportado em `index.ts` + entrada em `exports` map.
+- `workers/journeys/src/handlers/healthCheck.ts` — handler `runEventDrivenHealthCheck` (5min cadence). `shouldAlert` puro, testável. Lê apenas `v_event_driven_health` + `platform_alert_state`. Recovery silencioso (HEALTHY sustentado 30min).
+- `workers/journeys/src/index.ts` — hook `lastHealthCheck` em `runSchedulerLoop` E `runCombinedLoop`. Sentry init no startup. Flush Sentry no shutdown.
+- `workers/analytics/src/segment-eval-worker.ts` — `flushHealthMetricBatch` (60s) acumula `segment_membership_changes` em memória e emite via `emit_health_metric`. Custo zero no hot path.
+
+**R52 nova:** Observability em camada própria desacoplada do mecanismo observado. View e handler nunca consultam tabelas operacionais — apenas `event_health_metrics`. Garante que substituir cron por worker (D-CRON-4) não invalide instrumentação. Precedente para futura observabilidade arquitetural.
+
+**Testes (19 passing):**
+- Pure fns: `isWorseTier`, `shouldAlert` (8 cenários — transições, dedup, intervalos).
+- Integration: tier classification, multi-tenant isolation, recovery, WARN não emite, CRITICAL→ERROR não re-alerta.
+
+**Baseline real coletado em Fase 1.b** (P50=8.613 hits/h, P95=26.420, P99=36.348 fallback_hits global) usado como sanity check da view; thresholds são per-tenant e bootstrap automático após 168h de coleta.
+
+**Pré-requisito de produção:**
+- Criar Sentry project `workers-railway` em org `creators-hub-ur`.
+- Setar `SENTRY_DSN_WORKERS`, `SENTRY_ENVIRONMENT`, `RELEASE_SHA` em env vars Railway do `journeys-worker`.
+- Sem isso: handler funciona normalmente, escreve em `platform_alert_state` + log, mas nada vai pro Sentry. **Não bloqueia deploy do código.**
+
+**Pendências encadeadas:**
+- D-CRON-4 (migrar `segment-eval-fallback` cron para worker) agora desbloqueado — D-CRON-3 forneceu observability + métrica `fallback_hits` que o substituto deve emitir.
+- D-SEG-7 (event-driven audit) ganha visibility via `event_driven_hits` métrica.
+
+---
+
+## [v7.23] — 2026-05-01
+### Sprint de Performance — RPCs, frontend e cache
+
+**Contexto:** loading timeouts em tenants grandes (escola-do-fluxo, Sentry JAVASCRIPT-REACT-22/21/1S) escalaram para sprint dedicado de performance. Foco: matar full scans em RPCs quentes, eliminar polling agressivo, segmentar bundle, cachear o que é estável e arrumar fast-path do CRM condition. D29 era a dívida-mãe; ficou resolvida.
+
+**Backend — RPCs novas:**
+- `crm.get_parties_stats(p_tenant_id)` — stats globais separados da listagem paginada. Frontend cacheia com `staleTime` 5min, evita recalcular contagem a cada paginação.
+- `analytics.get_transactions_chart_data(p_tenant_id, p_granularity, p_start_date, p_end_date)` — substitui query de 26K rows brutas por agregação por período (37 buckets, 22ms). Granularidade controlada server-side.
+
+**Backend — RPCs otimizadas in-place** (rollbacks em `docs/rollback/`):
+- `crm.list_parties` — subqueries correlacionadas → CTEs batch.
+- `analytics.get_analytics_data` — 4 scans da tabela de transactions → 1 CTE `base_txn` reusada.
+- `analytics.get_dashboard_data` — 3 lead CTEs colapsados em 1 `COUNT FILTER`. **534ms → 17ms**.
+
+**Frontend:**
+- React Query Persist com IndexedDB, TTL 24h, limpeza no logout.
+- Connection heartbeat (4min, pausa quando tab inativa).
+- Prefetch durante auth: dashboard, tags, features.
+- Loading progressivo: Campaigns, Segmentation, Forms, Analytics.
+- `AccessGate` com bypass em warm path (cache válido).
+- Dynamic imports cortando **−924K** do bundle inicial.
+- Vendor chunks dedicados: `@xyflow`, `@tiptap`, `zod`.
+- `useTenantTags` — 6 query keys colapsados em 1.
+- `usePartiesStats` — stats separados da listagem, cache 5min.
+- Polling **1s → 30s** (redução -99.8% de requests em sessões idle).
+
+**Worker / SQL — fix `has_open_opportunity`:**
+- Worker in-memory não tem oportunidades carregadas → retorna optimistic (`true`).
+- Filtragem definitiva no SQL path via subquery indexada em `eval_condition_v2`.
+- **Não adicionou coluna em `contact_state`** (R36 + R51).
+
+**Mudanças nos docs:**
+- **R51** registrada: campos de domínio separado avaliam optimistic no worker, SQL path filtra de fato.
+- **D29** marcada como ✅ Done com checklist completo do sprint.
+
+**Pendências encadeadas:**
+- D-CRON-3 (P2) segue como próximo fix calibrado (alarme sobre `analytics.fallback_log`).
+- Padrão optimistic+subquery vira referência para futuros campos 1:N (tickets, custom relations).
+
+---
 
 ## [v7.22] — 2026-05-01
 ### Auditoria pg_cron + R50 + D-CRON-1..4 + D-SEG-12
