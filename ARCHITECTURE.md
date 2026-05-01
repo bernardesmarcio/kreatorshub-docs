@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.20 — Sprint 19: Email Engagement Conditions*
+*Versão 7.21 — Hotfix segment builder + auditoria de membership*
 
 ---
 
@@ -939,6 +939,22 @@ O builder de segmentação usa **blocos paralelos** no primeiro nível. Cada blo
 | `src/components/segmentation/RuleRow.tsx` | Uma condição individual (campo, operador, valor) |
 | `src/types/segmentation.ts` | Tipos: `RuleGroup`, `RuleCondition`, `FieldDefinition` |
 | `src/types/segmentation-v2.ts` | Tipos AST v2: `ConditionNode`, `GroupNode`, `RulesJsonV2` + helpers de conversão |
+| `src/lib/segmentation/normalizeAstV2.ts` | Adapter de normalização aplicado no load (R48). Resiliência a shapes legacy até Fase 2/4 |
+
+### Shape canônico de `rules_json_v2`
+
+O AST v2 dos segmentos rule-based segue o shape canônico:
+
+- `root.children` contém EXCLUSIVAMENTE nós `kind: 'group'` (cada filho é um UIBlock).
+- Conditions vivem dentro de cada bloco (AND interno).
+- `root.op` define o joinOp entre blocos: AND ou OR.
+- Conditions com `__ui_locked: true` são metadado de UI somente — nunca persistido no banco (strip em `toBackendAST`).
+- Sentinelas `all_leads` / `all_customers` são deprecated (dropadas em load).
+- Fields fora do `FIELD_OPTIONS` da UI mas presentes no `eval_condition_v2` do backend são preservados em modo locked até a UI ganhar suporte.
+
+O adapter `normalizeAstV2ForUI` em `src/lib/segmentation/normalizeAstV2.ts` aplica esse shape em runtime durante o load (defensive). Após Fase 2 (backfill), o adapter vira no-op porque o banco terá shape A em todos os segmentos. Após Fase 4 (trigger guardrail), gravar shape não-canônico fica impossível.
+
+**Classificação de warnings:** o normalizador emite seis tipos de warning. `field_dropped` e `field_locked` são **actionable** (renderizam banner amarelo na UI — usuário precisa revisar/recriar). `shape_wrapped`, `field_aliased`, `op_aliased`, `expanded_array_op` são **cosméticos** (transformações idempotentes que preservam semântica — silenciados no banner, mantidos no array para devs). Helpers: `hasActionableWarnings()` e `summarizeActionableWarnings()`.
 
 ---
 
@@ -1117,8 +1133,8 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R34 | **Todo novo provider obrigatoriamente passa pelo sistema canônico de integração.** Ao conectar qualquer novo provider (Typeform, HubSpot, Google Calendar, etc.), o caminho é sempre: `integrations.accounts` → `integrations.capabilities` → `integrations.jobs` → `pull-sync-worker` ou `historical-sync-worker`. É **proibido**: (1) criar tabelas `{provider}.import_runs` ou equivalentes para controlar execução, (2) criar workers isolados por provider fora do sistema canônico, (3) fazer chamadas de API de sync diretamente de Edge Functions, (4) implementar scheduling fora de `integrations.jobs`. Padrão de nomeação: `{provider}:{ação}` (ex: `typeform:sync_responses`, `typeform:promote_forms`). **Como identificar violação:** se você está prestes a criar uma tabela de controle de execução ou um worker dedicado a um provider, pare — você está criando uma pipeline paralela. | Typeform implementado com pipeline própria (`typeform.import_runs`, zero capabilities, zero jobs) em Março/2026. Corrigido no mesmo sprint. |
 | R35 | **Import de provider externo exige filtro de organização antes de gravar no raw.** Todo sync que busca dados de uma API externa deve filtrar pelo `provider_account_id` da conta vinculada ao tenant antes de inserir no raw. Nunca importar "tudo que a conta vê" sem validar que o dado pertence ao escopo daquele tenant. Checklist obrigatório antes de gravar qualquer registro no raw: (1) `tenant_id` está correto e explícito? (2) `integration_account_id` está preenchido? (3) O dado pertence à organização/conta vinculada ao tenant (não apenas acessível pelo token)? | Typeform importou forms de todas as organizações acessíveis pelo personal token sem filtrar por organização, gerando 271 registros órfãos com contaminação entre tenants. Corrigido com limpeza em Março/2026. |
 | R36 | **Campos 1:N nunca são denormalizados em `contact_state`.** `contact_state` é estritamente escalar (um valor por contato). Entidades com cardinalidade 1:N (oportunidades, tickets, forms futuras) são avaliadas via `EXISTS` subquery direta na tabela relacional com índices corretos. O worker planner (`opportunity_exists` resolver) e o SQL function (`eval_condition_v2`) devem gerar SQL equivalente para esses campos. Denormalizar 1:N em `contact_state` (ex: `has_open_opportunity boolean`) cria divergência semântica entre preview (SQL function faz subquery real) e refresh (worker lê snapshot stale), além de exigir pipeline de sync impossível de manter consistente. **Modo de execução: BULK_ONLY** — mudanças em oportunidades (criar, mover estágio, fechar) NÃO disparam reavaliação incremental do segmento; atualiza apenas no próximo ciclo de `evaluate_segment`. Se no futuro for necessário reatividade em tempo real, o pipeline de CRM deve enfileirar `evaluate_segment` jobs ao mudar status de oportunidades. **Campos implementados:** `has_opportunity`, `opportunity_status`, `opportunity_pipeline`, `opportunity_stage`, `opportunity_assigned_to`, `opportunity_lost_reason`, `opportunity_created_days`, `opportunity_closed_days`, `opportunity_won_days`, `opportunity_lost_days`. | `has_open_opportunity` e `open_opportunity_count` foram dropados de `contact_state` em Março/2026 após auditoria confirmar zero segmentos referenciando. Substituídos por 10 campos `opportunity_exists` no worker planner. Índice `idx_opportunities_party_tenant_status` criado para suportar as subqueries. |
-| R37 | **Impact Analysis obrigatória antes de mudança em contrato compartilhado.** Antes de alterar formato, renomear ou deprecar qualquer conceito listado em `DEPENDENCY_MAP.md`: (1) listar todos os readers e writers; (2) confirmar que TODOS os readers suportam o novo formato; (3) dual-write por pelo menos 1 sprint antes de dropar formato antigo; (4) campo vazio usado para filtrar = fail-closed (zero resultados, nunca "todos"). | Incidente Sprint 12 — campanha blast radius: migração `rules_json` → `rules_json_v2` quebrou email-campaign-worker que ainda lia v1 vazio, disparando para base inteira do tenant. |
-| R38 | **Fail-closed para membership vazia.** Se `segment_parties` retorna 0 rows para um `segment_id` que tem regras definidas (`rules_json_v2 IS NOT NULL`), a operação dependente (envio, export, enrollment) DEVE recusar, nunca prosseguir sem filtro. Zero members + regras definidas = refresh pendente, não "enviar para todos". **Implementações:** (1) `CampaignSend.tsx` — `getSegmentRecipientsFailClosed()` tenta refresh e rejeita se ainda 0; (2) `generate-export/index.ts` — enfileira refresh e aborta export; (3) `checkSegmentEntries.ts` (worker handler) — guard com verificação de `rules_json_v2` + enqueue refresh; (4) `check-journey-entries/index.ts` (Edge Function legada) — guard equivalente como safety net. | Incidente Sprint 12 — mesma origem de R37. |
+| R37 | **Impact Analysis obrigatória antes de mudança em contrato compartilhado.** Antes de alterar formato, renomear ou deprecar qualquer conceito listado em `DEPENDENCY_MAP.md`: (1) listar todos os readers e writers; (2) confirmar que TODOS os readers suportam o novo formato; (3) dual-write por pelo menos 1 sprint antes de dropar formato antigo; (4) campo vazio usado para filtrar = fail-closed (zero resultados, nunca "todos"). **Nota (v7.21):** R37 protege contra migração mal feita, mas pressupõe que `segment_parties` reflita as regras. Drift entre `segment_parties` e avaliação fresh (D-SEG-5) burla a proteção: o worker lê membership stale e dispara para um conjunto que não casa com o segmento atual. Operação A em 30/04 reconciliou 22 segmentos divergentes; causa-raiz do drift segue em investigação. | Incidente Sprint 12 — campanha blast radius: migração `rules_json` → `rules_json_v2` quebrou email-campaign-worker que ainda lia v1 vazio, disparando para base inteira do tenant. |
+| R38 | **Fail-closed para membership vazia.** Se `segment_parties` retorna 0 rows para um `segment_id` que tem regras definidas (`rules_json_v2 IS NOT NULL`), a operação dependente (envio, export, enrollment) DEVE recusar, nunca prosseguir sem filtro. Zero members + regras definidas = refresh pendente, não "enviar para todos". **Implementações:** (1) `CampaignSend.tsx` — `getSegmentRecipientsFailClosed()` tenta refresh e rejeita se ainda 0; (2) `generate-export/index.ts` — enfileira refresh e aborta export; (3) `checkSegmentEntries.ts` (worker handler) — guard com verificação de `rules_json_v2` + enqueue refresh; (4) `check-journey-entries/index.ts` (Edge Function legada) — guard equivalente como safety net. **Nota (v7.21):** R38 protege contra membership vazia mas não detecta membership *errada*. Drift cap (D-SEG-5) é o caso "membership populada mas não corresponde às regras". Auditoria recomendada (D-SEG-8 — job diário) até a causa-raiz ser fechada. | Incidente Sprint 12 — mesma origem de R37. |
 | R39 | **Skip em nó de automação DEVE retornar `success: false` + `waitUntil`.** Quando um nó `send_email` detecta que a campanha não está pronta (status não-enviável), o handler deve retornar `{ success: false, waitUntil }` para que o enrollment fique em espera e reprocesse. Retornar `success: true` com skip faz o enrollment avançar para o próximo nó sem enviar o email, perdendo o envio silenciosamente. Status `automation` é um status válido para envio em contexto de journey — não deve ser rejeitado. **Lição adicional: Docker layer cache.** Workers containerizados (Railway, ECS, etc.) podem reutilizar layer de build anterior mesmo após push de novo código. Sempre incluir `BUILD_VERSION` constante no entrypoint do worker para: (1) invalidar cache do `COPY src` layer a cada mudança, (2) confirmar nos logs qual versão está rodando. | Incidente Sprint 13 — commit `c3f172e` corrigiu send_email mas Railway serviu código antigo por cache Docker. Worker logava `campaign_not_ready/automation` com `success: true` (código antigo) em vez de enviar o email. 19 enrollments ficaram stuck. |
 
 | R40 | **Condition node deve usar Rule Engine v2.** O nó `condition` em journeys deve reutilizar os mesmos campos, operadores e resolvers do segmentation engine (AST v2). Implementação duplicada (6 campos hardcoded vs 40+ do Rule Engine) viola DRY e causa divergência silenciosa. Evaluator: carregar `ContactState` do party + `evaluateRules(state, ast.root)`. | Gap identificado Sprint 14 — condition node tem 6 campos, Rule Engine v2 tem 40+ |
@@ -1129,6 +1145,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R45 | **Frequency guard em nós de comunicação.** Nós `send_email`, `webhook`, `notify` devem respeitar limite de frequência por contato configurável no journey settings. Default: max 1 email por contato por 24h na mesma jornada. Guard consultável em `journey_executions` (contagem de executions do mesmo node_type para o mesmo enrollment nas últimas N horas). | Requisito Etapa 2 — proteção contra spam |
 | R46 | **Workers separados por SLA.** journeys-event-worker (< 5s, push-based) e journeys-worker (minutos, batch) devem permanecer separados. Condition engine pesado (queries em contact_state) não deve rodar no event-worker. Se condition evaluation for necessária no fanout, delegar para journeys-worker via processing_job. | Confirmado Sprint 14 — audit comprovou separação necessária |
 | R47 | **Email engagement via subquery, não snapshot.** Campos `campaign_opened`/`campaign_clicked` usam resolver `email_engagement` com EXISTS em `email.email_events`. Engagement data é per-campaign — nunca materializar em `contact_state`. Condition node usa pre-enrichment (`__email_engagement` injetado pelo conditionEngine). Padrão replicável para futuros campos relacionais (ex: `opened_journey_email_X`). | Sprint 19 |
+| R48 | **`analytics.segments.rules_json_v2.root.children` deve conter exclusivamente nós `kind: 'group'`.** Conditions soltas no nível root são deprecated (shape B legado). Adapter UI (`normalizeAstV2ForUI`) é safety net que normaliza shapes legacy em runtime no load — até Fase 2 (backfill SQL canonicalizando todos os segmentos) e Fase 4 (trigger BEFORE INSERT/UPDATE em `analytics.segments` validando o shape). Após Fase 4, R48 vira enforcement estrutural; antes disso, é convenção. | Hotfix v7.21 — 46/52 segmentos manuais ativos com shape B causaram builder vazio em produção; duas rotas de criação coexistiam, escrevendo formatos divergentes. |
 
 ---
 
@@ -1176,6 +1193,20 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | B-18 | ~~Mapper Eduzz — `installments`, `fee_value`, `net_gain`~~ ✅ Handler `eduzz:enrich_invoice` atualizado (26/03): popula campos financeiros a partir de `eduzz.invoices`. Backfill aplicado: 22K transações. Cobertura 99.9%. | **Done** |
 | D43 | **`segment_entered` events não gerados.** `refresh_segment_parties_unified` faz UPSERT/DELETE direto sem chamar `apply_segment_membership_diff` — eventos `segment_entered`/`segment_exited` não são criados em `journeys.journey_events`. Os 9 eventos segment_entered existentes são de antes de 13/Mar. Impacto: `event_entry` com `trigger_event_type='segment_entered'` não funciona. Fix: gerar eventos inline no refresh ou restaurar chamada a `apply_segment_membership_diff`. | **P3** — nenhuma jornada usa esse trigger hoje |
 | D44 | **Migrar template engine para SendGrid dynamic templates.** Atualmente o worker renderiza HTML com `substituteVariables()` (server-side). Migrar para `template_id` + `dynamic_template_data` habilitaria batch real (1000 emails/request via personalizations). Bloqueado por: cada recipient tem HTML diferente + `sendgrid_message_id` é 1 por request. | **P4** — quando precisar >50K emails/envio |
+| D-SEG-2-BACKFILL | Canonicalizar todos `rules_json_v2` para shape A no banco. Após 48h estável de v7.21 em produção, rodar migração SQL que reescreve `root.children` envolvendo conditions soltas em grupos. Adapter `normalizeAstV2ForUI` vira no-op defensivo. | **P2** |
+| D-SEG-3-CONTROLLED-COMPONENT | `SegmentBuilderV2` deve virar controlled — derivar `ast` interno do prop `initialAST` via `useEffect` de sync, ou eliminar o estado interno e fazer setter sobir todo via `onChange`. Hoje o gate na page (`!initialized → spinner`) elimina o sintoma sem reescrever o componente. | **P3** |
+| D-SEG-4-INTEGRATION-TESTS | Aumentar cobertura de testes de integração da page de segmentos. Hoje cobre regression do state-lock (3 cenários). Faltam: salvar/atualizar segmento, locked condition que sobrevive round-trip e salva sem `__ui_locked`, navegação entre segmentos sem refresh da page. | **P3** |
+| D-SEG-5-MEMBERSHIP-DRIFT | Causa-raiz do drift entre `segment_parties` e avaliação fresh não identificada. 22/52 segmentos ativos divergentes em 30/04. Operação A reconciliou (sintoma), causa segue aberta. Investigação: scheduler de refresh, trigger event-driven, regra invertida em path antigo. | **P1** |
+| D-SEG-6-LAST-CALC-LIES | `last_calculated_at` é atualizado em paths que não fazem refresh real. Coluna não é confiável para detectar staleness. Auditar todos os writers da coluna; ou (1) só atualizar quando `refresh_segment_parties_unified` rodar com sucesso, ou (2) renomear para deixar semântica clara. | **P2** |
+| D-SEG-7-EVENT-DRIVEN-AUDIT | Rota event-driven populou complemento semântico no segmento "Segmentação Amazônia" (3 contatos no card vs 4.167 fresh). Suspeita de regra invertida em path antigo (`apply_segment_membership_diff` ou trigger relacionado). Auditar inputs/outputs do event-driven path antes de Fase 4. | **P2** |
+| D-SEG-8-DAILY-AUDIT-JOB | Job diário (pg_cron) que para cada segmento ativo: avalia regras fresh, compara com `segment_parties`, registra divergência em tabela de alertas e auto-refresh quando |drift| > N. Bloqueado por D-SEG-5 (sem causa-raiz, auto-refresh corre risco de mascarar problema). | **P2** |
+| D-SEG-9-LEGACY-TRIGGER | `trg_refresh_segment_parties_on_change` em `analytics.segments` chama `refresh_segment_parties` (legacy v1) em vez de `_unified` (canonical v2). Possível parte da causa-raiz do drift (D-SEG-5). Auditar o trigger e migrar para a função unificada. | **P2** |
+| D-RFM-LABELS | Lista canônica dos 11 labels `rfm_segment` está hardcoded em `workers/analytics/src/handlers/refreshRfm.ts:449-476` e duplicada em `src/components/segments/fieldConfig.ts FIELD_OPTIONS.rfm_segment`. Acentuação inconsistente em produção (D-DATA-1). Extrair enum compartilhado e re-exportar de ambos os lados. | **P3** |
+| D-PRODUCT-FIRST-PURCHASE-UI | Campo `product_first_purchase` (temporal scoped por `product_id`) é válido no backend (`semanticFieldRegistry`) e usado por 1 segmento ativo, mas exige UI nova: scope picker (produto) + temporal window (`within_last N dias`). Atualmente preservado em modo locked após v7.21. Construir UI dedicada para destravar edição. | **P3** |
+| D-OPP-FIELDS-UI | Campos `opportunity_pipeline`/`opportunity_stage`/`opportunity_assigned_to` precisam de pickers UUID com nome humanizado. Hooks (`usePipelines` etc.) já existem em `useSegmentOptions.ts`, mas não estão plugados no novo builder. Não ocorre em segmentos ativos hoje; se ocorrer ficará locked. | **P3** |
+| D-RECENCY-DAYS-UNIT | `recency_days` foi registrado como `number` no fieldConfig, mas conceitualmente representa dias. Adicionar suffix "dias" no input (suporte ao campo `suffix` que já existe no `SemanticFieldMeta` do worker). | **P4** |
+| D-CONVERSION-TEST-FIX | 4 testes em `src/lib/segmentation/conversion.test.ts` quebrados desde commit `8e38c4d` (anterior ao hotfix v7.21). Testam `builderToAstV2`/`astV2ToBuilder` (paths legacy não usados pelo builder novo). Avaliar se ainda têm valor antes da Fase 3 (eliminação do builder antigo). | **P4** |
+| D-DATA-1-RFM-ACCENT | Acentuação inconsistente em `analytics.contact_state.rfm_segment` em produção: `Clientes Fiéis` (com agudo) coexiste com `Potenciais Fieis` (sem agudo). Outros labels OK. UI replica o estado do banco para preservar igualdade de string no SQL. Resolver junto com D-RFM-LABELS quando enum compartilhado for criado. | **P4** |
 
 ---
 
@@ -1267,6 +1298,48 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.21] — 2026-04-30
+### Hotfix segment builder + auditoria de membership
+
+**Frontend (UI):**
+- **Sintoma reportado:** segmentos antigos abriam vazios no builder; banner amarelo aparecia em loop.
+- **Causa-raiz 1 (shape AST v2):** 46/52 segmentos manuais ativos tinham `rules_json_v2.root.children` com conditions diretas (shape B legado), enquanto o builder novo espera grupos (shape A "Blocos Paralelos"). 23 desses foram criados nativamente entre 10/03 e 01/04 — duas rotas de criação coexistiam.
+- **Causa-raiz 2 (state-lock):** `SegmentBuilderV2` é uncontrolled — `useState(initialAST)` capturava o valor inicial vazio antes do useEffect de hidratação, ignorando o prop atualizado.
+- **Fix 1 — adapter no load:** `normalizeAstV2ForUI` aplicado antes de `fromBackendAST`. Wraps loose conditions em grupos AND preservando `root.op`. Aliasing de fields/ops deprecated. Postura preserve > drop: fields desconhecidos viram conditions read-only com flag `__ui_locked` (strip antes de salvar). Apenas sentinelas (`all_leads`, `all_customers`) são dropadas.
+- **Fix 2 — gate na page:** `SegmentationBuilder.tsx` não monta `<SegmentBuilderV2>` até `initialized === true`. Spinner inline durante hidratação. Banner de warnings no mesmo gate (não aparece antes do builder).
+- **Fix 3 — banner só para warnings actionable:** apenas `field_dropped` e `field_locked` geram banner amarelo. `shape_wrapped`, `field_aliased`, `op_aliased`, `expanded_array_op` continuam logados internamente mas são silenciosos no UI (transformações cosméticas que preservam semântica).
+- **Validação:** smoke test sobre 52 segmentos, 0 falhas. Suite de 30+ testes incluindo fixtures dos 7 segmentos críticos do banco. Build verde.
+
+**Banco (operação A):**
+- **Sintoma reportado:** segmento "Segmentação Amazônia" (3a487e5d) com 3 contatos no card mas 4.167 na lista; campanhas atingindo 3 errados em vez de 4.167 corretos.
+- **Auditoria:** 22 de 52 segmentos manuais ativos com `segment_parties` divergente da avaliação fresh via `build_unified_where_clause_v2`. Top 3 com >700 contatos de excesso; "LEADS COM TELEFONE" sozinho com 9.153 contatos a mais do que a regra permite — violação direta de R37 (blast radius cap) e R38 (fail-closed).
+- **Operação executada:** `refresh_segment_parties_unified` em massa nos 22 divergentes, ~13s total, zero erros. Snapshot pré-operação preservado em `analytics._segment_parties_audit_20260430` por 7 dias.
+- **Resultado:** 22/22 com `segment_parties` = avaliação fresh = cache (`customer_count`/`lead_count`). Estado matematicamente correto.
+
+**Pendências registradas:**
+- D-SEG-3-CONTROLLED-COMPONENT (P3): `SegmentBuilderV2` deve virar controlled.
+- D-SEG-4-INTEGRATION-TESTS (P3): cobertura de integração da page.
+- D-SEG-5-MEMBERSHIP-DRIFT (P1): causa-raiz do drift entre segment_parties e regras não identificada. Operação A trata sintoma, não causa.
+- D-SEG-6-LAST-CALC-LIES (P2): `last_calculated_at` é atualizado sem refresh real.
+- D-SEG-7-EVENT-DRIVEN-AUDIT (P2): rota event-driven populou complemento semântico no Amazônia. Suspeita de regra invertida em path antigo.
+- D-SEG-8-DAILY-AUDIT-JOB (P2): implementar job diário de auditoria + auto-refresh.
+- D-SEG-9-LEGACY-TRIGGER (P2): `trg_refresh_segment_parties_on_change` chama `refresh_segment_parties` (legacy) em vez de `_unified` — possível parte da causa-raiz.
+- D-RFM-LABELS (P3): RFM labels duplicados worker↔frontend.
+- D-PRODUCT-FIRST-PURCHASE-UI (P3): campo válido no backend, exige UI nova.
+- D-OPP-FIELDS-UI (P3): pickers UUID humanizados para campos de oportunidade.
+- D-RECENCY-DAYS-UNIT (P4): adicionar suffix "dias" no input.
+- D-CONVERSION-TEST-FIX (P4): 4 testes pré-existentes broken em `conversion.test.ts`.
+- D-DATA-1-RFM-ACCENT (P4): acentuação inconsistente de labels rfm_segment em produção.
+- D-SEG-2-BACKFILL (P2): canonicalizar todos rules_json_v2 para shape A no banco.
+
+**Próximas fases planejadas:**
+- Fase 2 (backfill SQL): após 48h estável em produção, canonicalizar shape A em todos os segmentos. Adapter `normalizeAstV2ForUI` vira no-op defensivo.
+- Fase 3: eliminar `SegmentBuilder.tsx` antigo, `astV2ToBuilder.ts`, `conversion.test.ts`.
+- Fase 4: guardrail estrutural — trigger BEFORE INSERT/UPDATE em `analytics.segments` validando shape canônico de `rules_json_v2`. R48 vira enforcement.
+- Investigação D-SEG-5: diagnóstico do worker, do scheduler e do trigger event-driven para descobrir por que o drift acontece.
+
+---
 
 ## [v7.20] — 2026-04-08
 ### Sprint 19 — Email Engagement Conditions (Segmentação + Jornadas)

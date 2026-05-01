@@ -142,16 +142,18 @@ Antes de implementar qualquer novo pipeline, responder:
   - `supabase/functions/generate-export/index.ts:711,812` — has-rules check (fail-closed)
   - `src/pages/admin/CampaignSend.tsx:611` — has-rules check (fail-closed)
   - `src/lib/segmentStorage.ts:291,356` — passagem para preview RPCs
-  - `src/lib/segmentation/astV2ToBuilder.ts:432` — hydrate builder UI
+  - `src/lib/segmentation/astV2ToBuilder.ts:432` — hydrate builder UI (legado, não usado pela page atual)
+  - `src/lib/segmentation/normalizeAstV2.ts` — adapter de shape no load (R48)
   - `src/components/segments/SegmentBuilderV2.tsx:46` — preview RPC
   - `src/pages/admin/SegmentationList.tsx:258` — duplicate segment
-  - `src/pages/admin/SegmentationBuilder.tsx:103` — load segment for editing
-- **Regra:** Source of truth para regras de segmentação rule-based. Avaliação feita por `build_unified_where_clause_v2()`.
+  - `src/pages/admin/SegmentationBuilder.tsx` — load segment for editing (chama `normalizeAstV2ForUI` + `fromBackendAST`)
+- **Regra:** Source of truth para regras rule-based. Avaliação por `build_unified_where_clause_v2()`. Shape canônico: `root.children` apenas grupos (R48). UI aplica `normalizeAstV2ForUI` no load para resiliência a shapes legacy até Fase 2/4.
 
 ### analytics.segment_parties
 
 - **Writers (SQL):**
-  - `refresh_segment_parties_unified()` — INSERT/DELETE diff após avaliação v2 (chamada via `process_segment_refresh_queue`)
+  - `refresh_segment_parties_unified()` — INSERT/DELETE diff após avaliação v2 (canonical, chamada via `process_segment_refresh_queue`)
+  - `refresh_segment_parties()` — legacy v1 (D-SEG-9: `trg_refresh_segment_parties_on_change` ainda chama esta versão; suspeita de parte da causa-raiz do drift)
   - `apply_segment_membership_diff()` — diff incremental (triggers de transação)
   - `sync_cluster_segment_customers()` — clusters/subgroups
 - **Writers (Node.js):**
@@ -159,12 +161,16 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/analytics/src/handlers/computeClusters.ts` — cluster party_ids
   - `workers/analytics/src/handlers/computeLookalikeAudience.ts` — lookalike party_ids
 - **Readers:**
+  - `email-campaign-worker` — campanhas (fail-closed por R37/R38)
+  - `journeys-worker` — segment-trigger journeys
+  - `generate-export` Edge Function — export de segmentos
   - `src/lib/segmentStorage.ts:555` — `getSegmentPartiesForCampaign()` → envio de campanha
   - `src/pages/admin/CampaignSend.tsx` — via `getSegmentRecipientsFailClosed()` (R38)
-  - `supabase/functions/generate-export/index.ts:738` — export de segmento
   - `supabase/functions/check-journey-entries/index.ts:213` — enrollment de journey
+  - UI — counts, listagens (`get_segment_parties_preview`)
   - Views: `analytics.v_segment_unified` (preview)
 - **Regra R38:** ÚNICA fonte para membership de segmento. Todo código que precisa de lista de membros/recipients DEVE ler daqui. NUNCA re-avaliar regras no momento do consumo.
+- **Drift conhecido (D-SEG-5):** sem causa-raiz identificada, divergência entre `segment_parties` e avaliação fresh já foi observada em 22/52 segmentos manuais ativos (auditoria 30/04, "LEADS COM TELEFONE" com +9.153 contatos a mais que a regra permite). Operação A em 30/04 reconciliou tudo via `refresh_segment_parties_unified` em massa. Auditoria periódica recomendada (D-SEG-8) até D-SEG-5 ser fechado.
 
 ### analytics.segment_refresh_queue
 
