@@ -3,7 +3,7 @@
 > **REGRA R37**: Antes de alterar qualquer item listado aqui, verificar TODOS os readers/writers.
 > Atualizar este arquivo sempre que adicionar novo consumidor.
 >
-> Gerado em: 2026-03-19 · Última atualização: 2026-04-09
+> Gerado em: 2026-03-19 · Última atualização: 2026-05-01
 
 ---
 
@@ -536,6 +536,65 @@ Antes de implementar qualquer novo pipeline, responder:
   - `audit.get_stats()` — estatísticas do audit trail
   - `audit.export_trail()` — exportação
 - **Regra:** Append-only — nunca UPDATE ou DELETE. RLS habilitado. 33 triggers total (11 tabelas × 3 operações). Gap: `checkout_offers`, `checkout_orders`, `opportunities`, `eduzz.integrations` sem audit.
+
+---
+
+## Platform Health Observability (D-CRON-3)
+
+> **R52** (v7.24): Camada de saúde (view) e camada de alerta (handler) leem APENAS `analytics.event_health_metrics`. Nunca tabelas operacionais (`fallback_log`, `segment_eval_queue`, `contact_events`).
+> Antes de adicionar reader/writer aqui: verificar §17.1 do ARCHITECTURE.md e a migration `20260501100000_dcron3_observability.sql`.
+
+### analytics.event_health_metrics — Telemetria normalizada (Camada A)
+
+- **Writers (sempre via RPC `analytics.emit_health_metric`):**
+  - `analytics.etl_event_health_metrics()` — pulse hourly (cron `etl-event-health-metrics`). Agrega `analytics.fallback_log` + `analytics.contact_events` + `analytics.segment_eval_queue` em 5 métricas (`fallback_hits`, `event_driven_hits`, `eval_queue_throughput`, `eval_queue_error_rate`, `eval_queue_p95_latency_ms`).
+  - `workers/analytics/src/segment-eval-worker.ts:flushHealthMetricBatch` — flush 60s acumula `segment_membership_changes` em memória e emite via `emit_health_metric` (primeiro caso de worker emitting telemetry direto).
+- **Readers (R52 — apenas via Camada B):**
+  - `analytics.v_event_driven_health` — view de tier classification. Único reader operacional em produção.
+- **Schema:** `PARTITION BY RANGE (bucket_hour)` mensal. PK `(tenant_id, metric_name, bucket_hour)`. RLS service-only.
+- **Indexes:** `event_health_metrics_metric_bucket_idx (metric_name, bucket_hour DESC)`, `event_health_metrics_tenant_metric_idx (tenant_id, metric_name, bucket_hour DESC)`.
+- **Lifecycle:** `analytics.event_health_metrics_partition_create_if_needed()` cria próxima partição mensal (cron dia 25 às 02:30); `analytics.event_health_metrics_purge_old(retention_days)` faz DROP partition de >90d (cron daily 04:30).
+
+### analytics.platform_alert_state — Dedup state (Camada C)
+
+- **Writers:**
+  - `workers/journeys/src/handlers/healthCheck.ts:runEventDrivenHealthCheck` — UPSERT `last_tier`, `last_changed_at`, `last_alert_at` por `(tenant_id, metric_name)`.
+- **Readers:**
+  - `workers/journeys/src/handlers/healthCheck.ts:shouldAlert` — decide se emite Sentry (transição p/ tier pior, dedup 1h em mesmo tier ≥ ERROR, recovery silencioso 30min).
+- **Schema:** PK `(tenant_id, metric_name)`. RLS service-only. Index `platform_alert_state_tier_idx` em `last_tier` para query de dashboard "tenants em ERROR/CRITICAL agora".
+
+### analytics.v_event_driven_health — View de saúde (Camada B)
+
+- **Source:** `analytics.event_health_metrics` (rolling 7d P50/P95/P99 per-tenant excluindo a hora atual — evita auto-inflação).
+- **Readers:**
+  - `workers/journeys/src/handlers/healthCheck.ts:runEventDrivenHealthCheck` — único reader em produção (5min cadence dentro do `runSchedulerLoop`/`runCombinedLoop`).
+  - Possíveis dashboards admin futuros (não implementados em v7.24).
+- **Tier output:** `HEALTHY`, `INSUFFICIENT_DATA` (< 168 samples warmup), `WARN` (`hits_1h > p50 * 1.5`), `ERROR` (`hits_1h > p95`), `CRITICAL` (`error_sustained_1h AND hits_1h > p99`).
+- **Whitelist:** `LEFT JOIN core.platform_health_whitelist` exclui tenants nominalmente listados.
+
+### core.platform_health_whitelist — Tenants excluídos do alerta
+
+- **Writers (apenas manual via migration):** INSERT nominal com `reason` (CHECK in `seed_test`, `demo_internal`, `paused_investigation`, `opcit`), `added_by`, `expires_at`, `notes`. Auditável.
+- **Readers:**
+  - `analytics.v_event_driven_health` — filtro embutido via LEFT JOIN.
+- **Schema:** PK `tenant_id` com FK ON DELETE CASCADE → `core.tenants(id)`. RLS service-only. Começa vazia em v7.24.
+
+### analytics.emit_health_metric() — RPC de UPSERT (escrita única)
+
+- **Callers (Camada A producers):**
+  - `analytics.etl_event_health_metrics()` — cron hourly.
+  - `workers/analytics/src/segment-eval-worker.ts:flushHealthMetricBatch` — worker batch 60s.
+  - **Futuros workers em D-CRON-4** (substituto do `segment-eval-fallback`) — emitirão `fallback_hits` direto, sem cron intermediário.
+- **Behavior:** SECURITY DEFINER. ON CONFLICT `(tenant_id, metric_name, bucket_hour)` DO UPDATE — idempotente para retries.
+- **Regra R52:** Único caminho válido de escrita em `event_health_metrics`. INSERT direto = violação.
+
+### workers/shared/src/sentry.ts — Helper compartilhado
+
+- **Callers:**
+  - `workers/journeys/src/index.ts` — `initSentryWorker` no startup, `flushSentry` no shutdown. Primeiro consumer.
+  - Workers futuros podem importar `captureWorkerException` para alertar incidentes.
+- **Behavior:** No-op silencioso se `SENTRY_DSN_WORKERS` ausente. Importação dinâmica de `@sentry/node` — workers que não chamam Sentry não pagam custo de bundle.
+- **Env vars:** `SENTRY_DSN_WORKERS`, `SENTRY_ENVIRONMENT`, `RELEASE_SHA` (todos opcionais — sem DSN, handler escreve em `platform_alert_state` + log e segue).
 
 ---
 
