@@ -157,9 +157,12 @@ Antes de implementar qualquer novo pipeline, responder:
   - `apply_segment_membership_diff()` — diff incremental (triggers de transação)
   - `sync_cluster_segment_customers()` — clusters/subgroups
 - **Writers (Node.js):**
-  - `workers/analytics/src/segmentation/segmentEvaluator.ts:112` — `refreshSegmentV2()` INSERT/DELETE dentro de transaction
-  - `workers/analytics/src/handlers/computeClusters.ts` — cluster party_ids
-  - `workers/analytics/src/handlers/computeLookalikeAudience.ts` — lookalike party_ids
+  - `workers/analytics/src/segmentation/segmentEvaluator.ts` — `refreshSegmentV2()` é **wrapper de `analytics.refresh_segment_parties_unified()` desde D-SEG-10/v7.21** (não escreve direto)
+  - `workers/analytics/src/handlers/computeClusters.ts:737` — DELETE orphan ids
+  - `workers/analytics/src/handlers/computeClusterSubgroups.ts:908` — DELETE orphan ids
+  - `workers/analytics/src/handlers/computeLookalikeAudience.ts:607,644` — DELETE+INSERT bulk para lookalike (`source='customer'` é correto — todos os membros são customers por definição)
+- **Writers (Frontend — irregular, D-SEG-12):**
+  - `src/lib/analyticsStorage.ts:527` — `createSegmentFromLookalikes()` faz BULK INSERT direto via `supabase.schema("analytics").from("segment_parties").insert(batch)` com `source: "customer"` hardcoded. Bypassa funções canonical. Migrar para função SQL canonical (D-SEG-12).
 - **Readers:**
   - `email-campaign-worker` — campanhas (fail-closed por R37/R38)
   - `journeys-worker` — segment-trigger journeys

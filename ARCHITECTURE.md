@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.21 — Hotfix segment builder + auditoria de membership*
+*Versão 7.22 — Auditoria pg_cron + R50 + D-CRON-1..4*
 
 ---
 
@@ -464,18 +464,34 @@ workers/journeys-event/src/
 
 ---
 
-## 11. pg_cron — Jobs Agendados
+## 11. pg_cron — Jobs Agendados (auditados)
 
-| Job | Schedule | O que faz |
-|---|---|---|
-| `segment-eval-fallback` | `*/5 * * * *` | Detecta contatos sem segmentação |
-| `expire-soft-bounce-suppressions` | `0 * * * *` | Expira bounces suaves |
-| `cleanup-old-analytics-jobs` | `0 4 * * *` | Limpa jobs antigos |
-| `create-contact-events-partition` | `0 2 25 * *` | Cria partição mensal |
-| `cleanup-event-processing-jobs` | `0 3 * * *` | DELETE success com > 7 dias |
-| `rfm-rolling-refresh` | `0 * * * *` | Recalcula RFM de 1/24 dos tenants por hora via `MOD(HASHTEXT(tenant_id), 24)` — garante atualização em até 24h para tenants sem atividade |
+Auditoria arquitetural completa em v7.22. Cada cron é classificado por categoria
+(R50): **A** = housekeeping puro (manter); **B** = enqueue com lógica embutida
+(refatorar para worker no Railway); **C** = lógica de domínio inline (substituir
+totalmente); **D** = caduco (deletar). Cron novo requer entrada nesta tabela —
+sem registro = violação arquitetural.
+
+| jobname | schedule | command (resumido) | função SQL invocada | categoria | nota |
+|---|---|---|---|---|---|
+| `archive-opportunity-activities` | `0 2 * * 0` | INSERT archive + DELETE source TTL 2y | inline | **A** | Banco-only. Monitorar lock duration se volume crescer. |
+| `cleanup-asaas-webhook-events` | `0 4 * * *` | DELETE TTL 90d processed | inline | **A** | TTL puro. |
+| `cleanup-backfill-jobs` | `0 3 * * *` | DELETE TTL 30d completed | inline | **A** | TTL puro. |
+| `cleanup-event-processing-jobs` | `0 3 * * *` | DELETE TTL 7d success | inline | **A** | TTL puro. |
+| `cleanup-journey-processing-jobs` | `0 4 * * *` | DELETE TTL 7d completed/failed | inline | **A** | TTL puro. |
+| `cleanup-old-analytics-jobs` | `0 4 * * *` | DELETE TTL 7d completed/failed | inline | **A** | TTL puro. |
+| `purge-eval-queue` | `15 * * * *` | DELETE TTL 4h processed | `analytics.purge_processed_eval_queue` | **A** | TTL puro (R20). |
+| `purge-integrations-jobs` | `30 3 * * *` | DELETE TTL 7d/30d | `integrations.purge_old_jobs` | **A** | TTL puro com cleanup de `job_errors`. |
+| `purge-integrations-webhook-events` | `45 3 * * *` | DELETE TTL com guard `NOT EXISTS jobs` | `integrations.purge_old_webhook_events` | **A** | TTL puro. |
+| `expire-soft-bounce-suppressions` | `0 * * * *` | UPDATE TTL `expires_at <= NOW()` | `email.expire_soft_bounce_suppressions` | **A** | TTL puro. |
+| `create-contact-events-partition` | `0 2 25 * *` | DDL `CREATE TABLE PARTITION` idempotente | `analytics.create_contact_events_partition_if_needed` | **A** | DDL maintenance. |
+| `sweep-orphan-enrollments` | `*/10 * * * *` | Re-enqueue de enrollments órfãos LIMIT 100 | `journeys.sweep_orphan_enrollments` | **A** | Safety net pós D18 (fanout não-atômico). Sem lógica de domínio. **TODO:** alarmar quando `count > 0` indica bug em fanout. |
+| `rfm-rolling-refresh` | `0 * * * *` | Enqueue `refresh_features` para 1/24 dos tenants/hora com threshold 20h via `MOD(HASHTEXT(t.id), 24) = HOUR(NOW())` | `analytics.enqueue_job_internal` | **B** | Loop bloqueante de tenants no banco (viola §2.4). Lógica de sharding e threshold em SQL. **D-CRON-2** — migrar para worker. |
+| `segment-eval-fallback` | `*/5 * * * *` | Itera tenants ativos, detecta contatos com `state_updated_at < 15min` sem job pending, enqueue na `segment_eval_queue` | `analytics.run_segment_eval_fallback` | **B** | Safety net pro event-driven path. Loop bloqueante de tenants (viola §2.4). Mascara bugs do path event-driven sem alarme. **D-CRON-3** (instrumentar `analytics.fallback_log`) é pré-requisito de **D-CRON-4** (migrar para worker). |
 
 > **Pull-based providers (Sympla, Doare):** sync periódico gerenciado pelo pull-sync-worker via `integrations.sync_schedules`. Não usam pg_cron.
+
+> **R50 (v7.22):** pg_cron é APENAS para housekeeping (DELETE/UPDATE de TTL, DDL maintenance, pulse simples sem lógica de domínio). Lógica com tenant awareness, sharding heurístico, thresholds dinâmicos ou INSERT em tabelas de domínio = worker no Railway. Cron novo requer entrada nesta tabela + classificação A.
 
 ---
 
@@ -1146,6 +1162,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R46 | **Workers separados por SLA.** journeys-event-worker (< 5s, push-based) e journeys-worker (minutos, batch) devem permanecer separados. Condition engine pesado (queries em contact_state) não deve rodar no event-worker. Se condition evaluation for necessária no fanout, delegar para journeys-worker via processing_job. | Confirmado Sprint 14 — audit comprovou separação necessária |
 | R47 | **Email engagement via subquery, não snapshot.** Campos `campaign_opened`/`campaign_clicked` usam resolver `email_engagement` com EXISTS em `email.email_events`. Engagement data é per-campaign — nunca materializar em `contact_state`. Condition node usa pre-enrichment (`__email_engagement` injetado pelo conditionEngine). Padrão replicável para futuros campos relacionais (ex: `opened_journey_email_X`). | Sprint 19 |
 | R48 | **`analytics.segments.rules_json_v2.root.children` deve conter exclusivamente nós `kind: 'group'`.** Conditions soltas no nível root são deprecated (shape B legado). Adapter UI (`normalizeAstV2ForUI`) é safety net que normaliza shapes legacy em runtime no load — até Fase 2 (backfill SQL canonicalizando todos os segmentos) e Fase 4 (trigger BEFORE INSERT/UPDATE em `analytics.segments` validando o shape). Após Fase 4, R48 vira enforcement estrutural; antes disso, é convenção. | Hotfix v7.21 — 46/52 segmentos manuais ativos com shape B causaram builder vazio em produção; duas rotas de criação coexistiam, escrevendo formatos divergentes. |
+| R50 | **pg_cron é APENAS housekeeping.** Permitido: DELETE/UPDATE de TTL em filas/logs/audit; DDL maintenance (criar partição, REINDEX, VACUUM); pulse simples sem lógica de domínio (`SELECT some_fn()` que apenas dispara cleanup banco-only). **Proibido:** loop sobre tenants (`FROM core.tenants WHERE is_active`) — viola §2.4 Isolamento por tenant; lógica de negócio embutida (thresholds dinâmicos, sharding heurístico, condições de domínio); INSERT/UPDATE em tabelas de domínio (não-fila/log); fanout que cresce com volume. Lógica com schedule tenant-aware ou condições de negócio = worker no Railway. Cron novo requer entrada na tabela §11 + classificação A; cron categoria B/C/D requer auditoria arquitetural antes de aprovar. | Auditoria v7.22 — `rfm-rolling-refresh` e `segment-eval-fallback` foram criados sem registro arquitetural, com loop bloqueante de tenants no banco e mascarando bugs do event-driven path. Reclassificados como categoria B; D-CRON-2..4 abertos. |
 
 ---
 
@@ -1207,6 +1224,11 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D-RECENCY-DAYS-UNIT | `recency_days` foi registrado como `number` no fieldConfig, mas conceitualmente representa dias. Adicionar suffix "dias" no input (suporte ao campo `suffix` que já existe no `SemanticFieldMeta` do worker). | **P4** |
 | D-CONVERSION-TEST-FIX | 4 testes em `src/lib/segmentation/conversion.test.ts` quebrados desde commit `8e38c4d` (anterior ao hotfix v7.21). Testam `builderToAstV2`/`astV2ToBuilder` (paths legacy não usados pelo builder novo). Avaliar se ainda têm valor antes da Fase 3 (eliminação do builder antigo). | **P4** |
 | D-DATA-1-RFM-ACCENT | Acentuação inconsistente em `analytics.contact_state.rfm_segment` em produção: `Clientes Fiéis` (com agudo) coexiste com `Potenciais Fieis` (sem agudo). Outros labels OK. UI replica o estado do banco para preservar igualdade de string no SQL. Resolver junto com D-RFM-LABELS quando enum compartilhado for criado. | **P4** |
+| D-CRON-1 | **Documentar todos os pg_cron jobs em `ARCHITECTURE.md`.** Mandatório (independente de categoria A/B/C/D). Tabela em §11 com jobname, schedule, command resumido, função SQL invocada, categoria, owner. Cron novo daqui pra frente requer entrada nessa tabela antes de ser criado. | ✅ Done (v7.22) |
+| D-CRON-2 | **`rfm-rolling-refresh` migrar para worker no Railway.** Cron some, lógica de sharding (`MOD(HASHTEXT, 24)`) + threshold (20h staleness) vai pro código TS no `journeys-worker` ou novo `analytics-scheduler`. Risco: timing/SLA de RFM crítico — fazer com testes A/B em staging. Bloqueado por: revisar threshold 20h e estratégia de sharding em código antes de migrar. | **P3** |
+| D-CRON-3 | **`segment-eval-fallback` instrumentar.** Dashboard/alarme sobre `analytics.fallback_log` — se hits/dia > limite (a calibrar), o event-driven path está degradado. Sem este alarme, o cron mascara bugs silenciosamente. Pré-requisito de D-CRON-4. **Próximo a virar fix calibrado** (acordado em v7.22). | **P2** |
+| D-CRON-4 | **`segment-eval-fallback` migrar para worker.** Após baseline de D-CRON-3 estabelecido, mover loop de tenants para Railway. Cron vira pulse simples ou desaparece se métrica de hits zerar. Bloqueado por: D-CRON-3 + D-SEG-7 (event-driven audit) fechado. | **P3** |
+| D-SEG-12-LOOKALIKE-DIRECT-WRITE | **`src/lib/analyticsStorage.ts:527 createSegmentFromLookalikes`** faz BULK INSERT direto no `analytics.segment_parties` da UI com `source: "customer"` hardcoded — bypassa todas as funções canonical. Para segmentos lookalike (todos os membros são customers por definição) é semanticamente correto, mas é mais um produtor fora do path canonical. Migrar para função SQL canonical (ex: `analytics.create_lookalike_segment_from_scores`) que reuse `apply_segment_membership_diff` para determinar `source` via `party_type` e mantenha audit trail. | **P3** |
 
 ---
 
@@ -1298,6 +1320,27 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.22] — 2026-05-01
+### Auditoria pg_cron + R50 + D-CRON-1..4 + D-SEG-12
+
+**Contexto:** investigação dupla pós-fix D-SEG-10. Q1 confirmou que NÃO existe rota oculta corrompendo `segment_parties` — a percepção de "BULK 4168 hoje" referia-se ao bulk de 30/04 19:10:52 UTC (Operação A pré-fix); pós-deploy, apenas 44 rows entraram via `apply_segment_membership_diff` per-party com `source` correto baseado em `contact_state.party_type`. Q2 auditou 14 pg_cron jobs ativos — 12 são housekeeping puro (categoria A), 2 violam §2.4 com loop bloqueante de tenants (`rfm-rolling-refresh`, `segment-eval-fallback`).
+
+**Mudanças nos docs:**
+- §11 expandida: tabela completa dos 14 crons com schedule, command, função SQL, categoria A/B/C/D, notas. Substitui a lista incompleta anterior.
+- **R50** adicionada: pg_cron é APENAS housekeeping. Loop de tenants, lógica de negócio embutida, INSERT em tabelas de domínio, fanout dependente de volume — tudo proibido em SQL. Vai pra worker.
+- **D-CRON-1** marcado como Done (auditoria + tabela já em §11).
+- **D-CRON-2** (rfm-rolling-refresh → worker), **D-CRON-3** (instrumentar fallback_log), **D-CRON-4** (segment-eval-fallback → worker), **D-SEG-12-LOOKALIKE-DIRECT-WRITE** (`analyticsStorage.ts:527` migrar para SQL canonical) registrados.
+
+**Pendências encadeadas:**
+- D-CRON-3 (P2) é o próximo fix calibrado — alarme sobre `analytics.fallback_log` antes de qualquer migração.
+- D-CRON-4 bloqueado por D-CRON-3 + D-SEG-7 (event-driven audit).
+- D-SEG-12 é PR independente, pode ir junto com qualquer outro de cleanup do segmentation path.
+
+**Próximas fases:**
+- Fase 2 (backfill SQL canonicalizando shape A) e Fase 4 (trigger guardrail de R48) seguem planejadas mas não-iniciadas — aguardam 48h estável de v7.21 em produção.
+
+---
 
 ## [v7.21] — 2026-04-30
 ### Hotfix segment builder + auditoria de membership
