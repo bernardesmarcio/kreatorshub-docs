@@ -105,21 +105,32 @@ PRs da Fase 2 começarem.
 
 ### R-1.4 — apply_segment_membership_diff para de bumpar state_version
 
-**Status:** todo
+**Status:** done
 **Owner:** Dev (via Claude Code)
-**Estimativa:** 2h
-**Risco:** médio (função core)
+**Concluído em:** 2026-05-02 19:45 UTC
+**Estimativa:** 2h (real: ~30min com audit + validações)
+**Risco:** médio (função core) — mitigado por audit independente (D-2026-05-02-09)
 **Bloqueado por:** R-1.3
 **Bloqueia:** R-1.5
 
-**Critérios de aceite:**
-- Função `apply_segment_membership_diff` modificada:
-  - REMOVE `state_version = state_version + 1`
-  - MANTÉM `state_updated_at = now()`
-  - ADICIONA `segment_membership_updated_at = now()`
-- Testes existentes passando
-- Validado em branch develop com replay de 100 jobs reais
-- Plano de rollback: function preservada como `apply_segment_membership_diff__pre_refactor_2026_05` para backup. Drop após 30 dias com Fase 1 estável (registrar em PROGRESS.md).
+**Critérios de aceite (atendidos):**
+- ✅ Função `apply_segment_membership_diff` modificada:
+  - REMOVE `state_version = state_version + 1` (ambos os UPDATEs — entered + exited)
+  - MANTÉM `state_updated_at = now()` (cache invalidation, D-2026-05-02-03)
+  - ADICIONA `segment_membership_updated_at = now()` (rastreabilidade dedicada)
+- ⚠️ Branch develop pulada via D-2026-05-02-08 — replay de 100 jobs substituído por audit independente de readers (D-2026-05-02-09)
+- ✅ Plano de rollback: function preservada como `apply_segment_membership_diff__pre_refactor_2026_05` para backup. Drop após 30 dias com Fase 1 estável (registrar em PROGRESS.md).
+
+**Migration aplicada:**
+- `r14_apply_segment_membership_diff_no_state_version_bump` (em `pbfpwfkgjaqotbudihpy`)
+
+**Validações pós-R-1.4:**
+1. ✅ 2 funções presentes em `analytics`: `apply_segment_membership_diff` (nova) + `apply_segment_membership_diff__pre_refactor_2026_05` (backup), ambas com mesmo signature
+2. ✅ Função nova **não bumpa** `state_version` (regex check em `pg_get_functiondef` retornou `false`)
+3. ✅ Função nova **bumpa** `segment_membership_updated_at` (regex check retornou `true`)
+4. ✅ Backup preserva comportamento antigo (regex check retornou `true` para `state_version+1`) — rollback funcional
+
+**Audit pré-aplicação (D-2026-05-02-09):** 6 funções SQL bumpam `state_version`, apenas `apply_segment_membership_diff` removida. 2 readers (`populate_contact_state_from_existing`, `trigger_auto_populate_contact_state`) — ambos init/populate, não decisão. Cron fallback usa `state_updated_at` (preservado). Zero readers dependem do bump específico. P4 implementado.
 
 ### R-1.5 — Trocar predicate do cron fallback para versão semântica
 

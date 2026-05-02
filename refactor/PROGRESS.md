@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 1 — Fase 1 (Estabilização)
-**Fase ativa:** Fase 1, R-1.3 done, R-1.4 desbloqueada
-**Última atualização:** 2026-05-02 19:30 UTC
-**Quem atualizou:** Claude Code via R-1.3 + Marcio aprovação
+**Fase ativa:** Fase 1, R-1.4 done, PAUSE 1h em curso
+**Última atualização:** 2026-05-02 19:45 UTC
+**Quem atualizou:** Claude Code via R-1.4 + Marcio aprovação (audit D-09)
 
 ## Próximas 3 ações
 
-1. **R-1.4** — `apply_segment_membership_diff` para de bumpar `state_version`. Backup como `apply_segment_membership_diff__pre_refactor_2026_05`. Aplicar e validar com replay de membership diff real.
-2. **PAUSE 1h após R-1.4** — observar baseline antes de R-1.5/1.6.
-3. **R-1.5** — trocar predicate do cron fallback de `state_updated_at >= now()-15min` para `segmentation_input_version > last_evaluated_segmentation_version`. Predicate antigo via feature flag.
+1. **PAUSE 1h** — observar baseline pós-R-1.4 antes de R-1.5/1.6. Métricas a observar: `fallback_hits` (esperado: redução pontual nos parties que entram/saem de segmento), `jobs criados` (não muda — fallback ainda usa `state_updated_at`), state_version writes (deve manter mesmo padrão menos diff de membership).
+2. **R-1.6** — worker patch para atualizar watermark (`workers/analytics/src/segment-eval-worker.ts`). Pode ser paralelo, mas exige aprovação explícita (mexe em hot path do worker).
+3. **R-1.5** — predicate cron usa novo watermark (`segmentation_input_version > last_evaluated_segmentation_version`). DEPENDE de R-1.6 deployado (worker precisa estar atualizando o watermark antes do cron começar a usá-lo).
 
 ## Bloqueadores ativos
 
@@ -191,6 +191,34 @@ tarefa (criar/usar/deletar em horas, não semanas).
 
 **Custo evitado:** ~$28 USD + 12 semanas de overhead operacional.
 
+### D-2026-05-02-09 — Audit pré-R-1.4 confirma zero risco de regressão
+
+**Contexto:** R-1.4 muda comportamento de `apply_segment_membership_diff` (deixa
+de bumpar `state_version`). Dev solicitou audit antes de aplicar.
+
+**Decisão:** prosseguir com R-1.4 conforme spec.
+
+**Audit realizada via Supabase MCP (Claude chat) em 2026-05-02 19:35 UTC:**
+- 6 funções SQL no schema `analytics` bumpam `state_version`. Apenas
+  `apply_segment_membership_diff` foi removida do conjunto.
+- 2 funções SQL leem `state_version` (apenas em paths de init/populate, não decisão):
+  `populate_contact_state_from_existing` (init/backfill) e
+  `trigger_auto_populate_contact_state` (init de party novo).
+- Cron fallback (`run_segment_eval_fallback`) usa `state_updated_at` (preservado em
+  R-1.4 — D-2026-05-02-03), **não** `state_version`. Continua disparando inalterado
+  até R-1.5.
+- Workers de membership reagem a `contact_events.segment_entered` (preservado em R-1.4),
+  **não** a mudança de `state_version`.
+- 5 outros producers de `state_version` (`process_purchase_analytics`,
+  `upsert_contact_state_on_purchase`, `sync_party_type`, `sync_party_types_batch`,
+  `sync_tag_ids_to_contact_state`) continuam bumpando — apenas
+  `apply_segment_membership_diff` para.
+
+**Conclusão:** `state_version` continua refletindo mudanças reais de estado, mas
+membership recalculation deixa de ser side effect (P4 implementado).
+
+**Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
 ## Histórico de sprints
 
 ### Sprint 0 — Setup (CONCLUÍDO 2026-05-02)
@@ -210,9 +238,9 @@ tarefa (criar/usar/deletar em horas, não semanas).
 
 **Início:** 2026-05-02
 **Fim previsto:** ~2 semanas (~16/05)
-**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx)
-**Tarefas em andamento:** —
-**Tarefas pendentes:** R-1.4, R-1.5, R-1.6, R-1.7
+**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx), R-1.4 (apply_segment_membership_diff sem state_version bump)
+**Tarefas em andamento:** PAUSE 1h pós-R-1.4 (observação de baseline)
+**Tarefas pendentes:** R-1.5, R-1.6, R-1.7
 
 **Notas:**
 - R-1.2 aplicada direto em produção (`pbfpwfkgjaqotbudihpy`) via D-2026-05-02-08
@@ -223,7 +251,12 @@ tarefa (criar/usar/deletar em horas, não semanas).
 - 2 migrations: `r13_backfill_segmentation_versioning` + `r13_create_contact_state_drift_idx`
 - 42.632 parties backfilled (`segmentation_input_version = last_evaluated_segmentation_version = state_version`)
 - Drift count = 0 em todos os 7 tenants ativos (validado via `contact_state_drift_idx`)
-- Próximo: R-1.4 (apply_segment_membership_diff stop bumping state_version)
+- R-1.4 aplicada após audit independente (D-2026-05-02-09 — zero risco de regressão)
+- Migration `r14_apply_segment_membership_diff_no_state_version_bump`
+- Backup: `apply_segment_membership_diff__pre_refactor_2026_05` (rollback em <1min via DROP+CREATE OR REPLACE)
+- Função nova: NÃO bumpa `state_version` (P4), MANTÉM `state_updated_at` (D-03), ADICIONA `segment_membership_updated_at`
+- 4 validações ✓ (2 funções presentes, no-bump-state_version=false, bumps-membership_at=true, backup-still-bumps=true)
+- Próximo: PAUSE 1h, depois R-1.6 (worker watermark) + R-1.5 (predicate cron, depende de R-1.6)
 
 ## Lições aprendidas (acumulando)
 
