@@ -10,16 +10,16 @@
 
 ## Estado atual
 
-**Sprint:** 0 — Setup
-**Fase ativa:** Plano aprovado, aguardando início Sprint 1
-**Última atualização:** 2026-05-02 16:30 UTC
-**Quem atualizou:** Claude (chat) via aprovação de Marcio
+**Sprint:** 1 — Fase 1 (Estabilização)
+**Fase ativa:** Fase 1, R-1.2 done, R-1.3 desbloqueada
+**Última atualização:** 2026-05-02 19:14 UTC
+**Quem atualizou:** Claude Code via R-1.2 + Marcio aprovação
 
 ## Próximas 3 ações
 
-1. **Marcio revisar PLAN.md, PROGRESS.md, BACKLOG.md** e aprovar ou propor ajustes
-2. **Dev committar os 3 documentos** em `docs/refactor/` no repo principal
-3. **Iniciar Sprint 1** com Tarefa R-1.1 (criar branch develop Supabase + aplicar migrations da Fase 1 em ambiente espelho)
+1. **R-1.3** — backfill: `UPDATE analytics.contact_state SET segmentation_input_version = state_version, last_evaluated_segmentation_version = state_version`. One-shot, ~42.6k rows. Aplicar fora de janela de pico.
+2. **R-1.4** — `apply_segment_membership_diff` para de bumpar `state_version`. Backup como `apply_segment_membership_diff__pre_refactor_2026_05`.
+3. **PAUSE 1h após R-1.4** — observar baseline antes de R-1.5/1.6.
 
 ## Bloqueadores ativos
 
@@ -43,6 +43,30 @@ Estado pré-refactor. Valores que vamos comparar contra ao longo das fases.
 | Producers de contact_state | 12 | inventário do dev |
 | Producers de segment_parties | 6 | idem |
 | pg_cron categoria B (lógica de domínio) | 2 | rfm-rolling-refresh, segment-eval-fallback |
+
+## Snapshot pré-Fase 1 (2026-05-02 19:10 UTC)
+
+Capturado via Supabase MCP imediatamente antes de aplicar R-1.2. Travado para
+comparações posteriores ao longo da Fase 1.
+
+| Métrica | Valor |
+|---|---|
+| Total parties (`contact_state`) | 42.632 |
+| Total memberships (`segment_parties`) | 130.548 |
+| Pending jobs (`segment_eval_queue`) | 0 |
+| Claimed jobs | 0 |
+| Max `state_version` | 35 |
+| Avg `state_version` | 5.16 |
+| Fallback runs 24h | 173 |
+| Enqueues fallback 24h | 284.501 |
+| Jobs criados 24h | 20.144 |
+| Active segments | 78 |
+| Manual segments | 52 |
+| Active tenants | 7 |
+
+**Definições preservadas para rollback (md5 captured):**
+- `analytics.apply_segment_membership_diff` — md5 `3e35fb8c1cf3b40c3251564bc5ac5fbc` (3.705 chars)
+- `analytics.run_segment_eval_fallback` — md5 `6a41cfe1c50bbeb6def9c9413e4b1196` (1.652 chars)
 
 ## Decisões arquiteturais tomadas durante o plano
 
@@ -139,20 +163,63 @@ segmentos com `{}`. Se houver gap, registrar como sub-tarefa R-3.4-followup.
 
 **Custo:** zero. Apenas usar o que já existe + fail-open conservador.
 
+### D-2026-05-02-08 — Cancelar criação de branch develop Supabase
+
+**Contexto:** plano original previa branch develop ($9.68/mês, ~$28 total) para
+testar migrations da Fase 1 antes de produção. Marcio questionou necessidade.
+
+**Decisão:** cancelar branch. Aplicar todas as migrations da Fase 1 diretamente
+em produção (`pbfpwfkgjaqotbudihpy`) com checkpoints de validação cruzada entre
+cada uma.
+
+**Justificativa:**
+- Migrations Fase 1 são aditivas + CREATE OR REPLACE — risco intrínseco baixo
+- Branch é schema-only (zero dados) — não testa backfill 42k rows nem
+  comportamento de worker, que é onde está o risco real
+- Custo cognitivo de manter branch sincronizada por 12 semanas supera benefício
+- D-CRON-3 v7.24 (3 camadas, 19 testes, 3 crons) foi aplicado direto em
+  produção com sucesso usando checkpoint cruzado
+
+**Alternativa rejeitada:** criar branch para Fase 1 inteira.
+
+**Mitigação:** R-1.1 redefinida como pre-flight checklist (snapshot, backup
+auto Supabase confirmado, definições antigas capturadas para rollback via md5).
+
+**Reavaliação:** se aparecer tarefa específica de alto risco (ex: R-2.16
+trigger BEFORE UPDATE em contact_state), criar branch ad-hoc no ciclo da
+tarefa (criar/usar/deletar em horas, não semanas).
+
+**Custo evitado:** ~$28 USD + 12 semanas de overhead operacional.
+
 ## Histórico de sprints
 
-### Sprint 0 — Setup (em andamento)
+### Sprint 0 — Setup (CONCLUÍDO 2026-05-02)
 
 **Início:** 2026-05-02
-**Fim previsto:** 2026-05-04
-**Tarefas concluídas:** 0
-**Tarefas em andamento:** preparação de PLAN, PROGRESS, BACKLOG
-**Tarefas bloqueadas:** —
+**Fim:** 2026-05-02
+**Tarefas concluídas:** R-1.0 (whitelist em ARCHITECTURE.md §22.3), R-1.1 (pre-flight checklist via D-2026-05-02-08)
 
 **Notas:**
-- Diagnóstico (29/04 → 02/05) que originou o plano está em `transcripts/2026-05-02-refactor-decision/`
-- Decisões arquiteturais formalizadas em D-2026-05-02-01 a 05 acima
-- Aguardando aprovação de Marcio para iniciar Sprint 1
+- 3 documentos de refactor publicados (PLAN, PROGRESS, BACKLOG)
+- ARCHITECTURE.md §22.3 (whitelist canônica) publicada
+- D-2026-05-02-01..08 registrados
+- Cleanup pós-validação aplicado em v7.28
+- Sprint 1 inicia com R-1.2 (R-1.1 redefinida como pre-flight, sem branch)
+
+### Sprint 1 — Fase 1 Estabilização (em andamento)
+
+**Início:** 2026-05-02
+**Fim previsto:** ~2 semanas (~16/05)
+**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas)
+**Tarefas em andamento:** —
+**Tarefas pendentes:** R-1.3, R-1.4, R-1.5, R-1.6, R-1.7
+
+**Notas:**
+- R-1.2 aplicada direto em produção (`pbfpwfkgjaqotbudihpy`) via D-2026-05-02-08
+- Migration version: `20260502191444 r12_add_segmentation_versioning_columns`
+- 3 colunas novas em `analytics.contact_state` com defaults zerados em 42.632 parties
+- 5 validações pós-migration ✓ (colunas, comments, defaults, smoke, list_migrations)
+- Próximo: R-1.3 (backfill `segmentation_input_version = state_version` + `last_evaluated_segmentation_version = state_version`)
 
 ## Lições aprendidas (acumulando)
 

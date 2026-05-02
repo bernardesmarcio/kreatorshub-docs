@@ -32,36 +32,49 @@ critério de aceite ambíguo. Risco de cada writer migrado decidir whitelist soz
 12 implementações divergentes. Whitelist tem que ser fonte única, escrita ANTES dos
 PRs da Fase 2 começarem.
 
-### R-1.1 — Criar branch develop no Supabase + aplicar migrations base
+### R-1.1 — Pre-flight checklist em produção (substitui criação de branch)
 
-**Status:** todo
-**Owner:** Dev (via Claude Code)
-**Estimativa:** 1h
-**Risco:** baixo
-**Bloqueia:** R-1.2
+**Status:** done
+**Owner:** Marcio + Claude (chat)
+**Concluído em:** 2026-05-02
+**Decisão arquitetural:** D-2026-05-02-08 (cancelar branch develop)
 
-**Critérios de aceite:**
-- Branch `develop` criada via `Supabase:create_branch`
-- `project_id` da branch registrado em PROGRESS.md
-- Schemas espelhados de produção
-- ARCHITECTURE.md, SECURITY.md, DEPENDENCY_MAP.md commitados na branch
+**Critérios de aceite (atendidos):**
+- ✅ Snapshot baseline em PROGRESS.md ("Snapshot pré-Fase 1")
+- ✅ Definições atuais de funções críticas preservadas via md5:
+  - `apply_segment_membership_diff` md5 `3e35fb8c1cf3b40c3251564bc5ac5fbc`
+  - `run_segment_eval_fallback` md5 `6a41cfe1c50bbeb6def9c9413e4b1196`
+- ✅ Sistema em estado consistente (0 pending, 0 claimed em 2026-05-02 19:10 UTC)
+- ✅ Backup automático Supabase ativo (validar via dashboard antes de R-1.3)
+
+**Não fazer:** branch develop (cancelada via D-2026-05-02-08).
 
 ### R-1.2 — Migration: adicionar versões semânticas em contact_state
 
-**Status:** todo
+**Status:** done
 **Owner:** Dev (via Claude Code)
-**Estimativa:** 30min
+**Concluído em:** 2026-05-02 19:14 UTC
+**Estimativa:** 30min (real: ~25min com validações)
 **Risco:** baixo
 **Bloqueado por:** R-1.1
 **Bloqueia:** R-1.3
 
-**Critérios de aceite:**
-- `ALTER TABLE analytics.contact_state ADD COLUMN segmentation_input_version bigint NOT NULL DEFAULT 0`
-- `ALTER TABLE analytics.contact_state ADD COLUMN last_evaluated_segmentation_version bigint NOT NULL DEFAULT 0`
-- `ALTER TABLE analytics.contact_state ADD COLUMN segment_membership_updated_at timestamptz`
-- Index novo: `CREATE INDEX contact_state_drift_idx ON analytics.contact_state (tenant_id) WHERE segmentation_input_version > last_evaluated_segmentation_version`
-- Migration aplicada em branch develop primeiro
-- Validado: queries existentes não regrediram
+**Critérios de aceite (atendidos):**
+- ✅ `ALTER TABLE analytics.contact_state ADD COLUMN segmentation_input_version bigint NOT NULL DEFAULT 0`
+- ✅ `ALTER TABLE analytics.contact_state ADD COLUMN last_evaluated_segmentation_version bigint NOT NULL DEFAULT 0`
+- ✅ `ALTER TABLE analytics.contact_state ADD COLUMN segment_membership_updated_at timestamptz`
+- ⏸️ Index `contact_state_drift_idx` — postergado para R-1.3 (criar pós-backfill, evita escrita inútil em 42k rows com versões zeradas)
+- ✅ Migration aplicada direto em produção (D-2026-05-02-08 — sem branch develop)
+- ✅ Queries existentes validadas, sem regressão
+
+**Concluído em:** 2026-05-02 19:14 UTC
+**Migration aplicada:** `20260502191444 r12_add_segmentation_versioning_columns` em `pbfpwfkgjaqotbudihpy`
+**Validações realizadas:**
+- 3 colunas presentes com tipos/defaults corretos (V1)
+- 3 comments com referência a §22.3 e R-1.2 aplicados (V2)
+- 42.632 parties com defaults zerados (V3)
+- Smoke test: queries críticas (`state_version > 0`, `MAX(state_updated_at)`, `segment_ids LIMIT 1`, `COUNT(*)`) sem regressão (V4)
+- Migration listada em `supabase_migrations.schema_migrations` (V5)
 
 ### R-1.3 — Backfill: zerar drift histórico
 
