@@ -134,12 +134,12 @@ PRs da Fase 2 começarem.
 
 ### R-1.5 — Trocar predicate do cron fallback para versão semântica
 
-**Status:** todo
+**Status:** todo (desbloqueada — R-1.6 estável em produção)
 **Owner:** Dev (via Claude Code)
 **Estimativa:** 1h
 **Risco:** médio (predicate é hot path)
-**Bloqueado por:** R-1.4
-**Bloqueia:** R-1.6
+**Bloqueado por:** R-1.6 (ordem invertida — D-2026-05-02-10)
+**Bloqueia:** R-1.7
 
 **Critérios de aceite:**
 - Função `run_segment_eval_fallback` modificada:
@@ -151,30 +151,63 @@ PRs da Fase 2 começarem.
 
 ### R-1.6 — Worker atualiza watermark ao terminar processamento
 
-**Status:** todo
+**Status:** done
 **Owner:** Dev (via Claude Code)
-**Estimativa:** 2h
-**Risco:** médio
-**Bloqueado por:** R-1.5
-**Bloqueia:** R-1.7
+**Concluído em:** 2026-05-02 21:50 UTC (deploy Railway) — Checkpoint B fechado 22:00 UTC
+**Estimativa:** 2h (real: ~2h30min com testes + cross-check)
+**Risco:** médio (hot path do worker)
+**Bloqueado por:** R-1.4 (precisa de `segmentation_input_version` populado)
+**Bloqueia:** R-1.5 (predicate cron) e R-1.7 (telemetria drift)
+**Decisão arquitetural relacionada:** D-2026-05-02-10 (ordem R-1.6 antes de R-1.5)
 
-**Critérios de aceite:**
-- `workers/analytics/src/segment-eval-worker.ts` patch:
-  - No início do `processEvalJob`: ler `segmentation_input_version` atual
-  - Ao terminar com sucesso: `UPDATE contact_state SET last_evaluated_segmentation_version = X WHERE state_version_unchanged_check`
-  - Guard: se `segmentation_input_version` mudou durante processamento, NÃO avança watermark (próxima eval refaz)
-- Testes unit cobrindo:
-  - Watermark avança em processamento normal
-  - Watermark NÃO avança se versão mudou durante processamento
-  - Watermark NÃO avança em erro
+**Critérios de aceite (atendidos):**
+- ✅ `workers/analytics/src/segment-eval-worker.ts` patch:
+  - No início do `processEvalJob`: lê `segmentation_input_version` (`observed_version`)
+  - Ao terminar com sucesso (após `mark_job_result`): chama `analytics.update_segmentation_watermark(tenant_id, party_id, observed_version)` via helper exportado `advanceSegmentationWatermark`
+  - Guard atômico: RPC faz `UPDATE ... WHERE segmentation_input_version = p_observed_version AND last_evaluated_segmentation_version < p_observed_version` (CAS, sem race window)
+  - Falha não-fatal: erros da RPC são logados (`segment_eval_watermark_error`) mas não derrubam o job
+- ✅ Testes unit cobrindo (`segmentationWatermark.test.ts`, 7 testes):
+  - Happy path: observed == current → advanced=true
+  - Race condition: outro writer bumpou seg_version antes do worker chamar RPC → advanced=false
+  - Idempotência: replay de job já em sync → advanced=false sem erro
+  - Falha de conexão na RPC: captura erro, retorna null
+  - Resposta vazia (sem rows): retorna null
+  - args passthrough (`tenant_id`, `party_id`, `observed_version` literalmente repassados)
+  - Coerção bigint-as-string → number (driver postgres.js)
+
+**Migrations aplicadas:**
+- `r16_update_segmentation_watermark_rpc` — função `analytics.update_segmentation_watermark(uuid, uuid, bigint) RETURNS jsonb` SECURITY DEFINER
+
+**Validações pós-deploy (Checkpoint B):**
+
+*Cross-check independente via `pg_stat_statements` (Marcio, 22:00 UTC):*
+1. ✅ RPC `analytics.update_segmentation_watermark` executada 2x com formato prepared statement = driver postgres.js do worker (não Supabase MCP nem outro caller)
+2. ✅ Latência média 5.85ms/call (UPDATE pequeno por PK + SELECT por PK)
+3. ✅ Drift global = 0 mantido pós-deploy (integridade preservada)
+4. ✅ Cron fallback continua rodando normal (4 runs em 30min) — predicate antigo sem regressão
+5. ✅ 0 erros em logs de Postgres relacionados à nova RPC nos primeiros 30min
+6. ✅ 0 jobs em status `pending` ou `claimed` durante a janela
+
+*Sanity 15min pós-deploy via Supabase MCP:*
+- 9 jobs processados (3 parties distintas — sistema fim-de-semana baixo tráfego)
+- 100% dos parties pós-job em `last_evaluated_segmentation_version = segmentation_input_version` (in_sync)
+- `state_updated_at` propagou para parties cujo watermark avançou (trigger nativo do `contact_state` continua funcionando — efeito colateral aceitável)
+- Latest_processed: 2026-05-02 21:56:08.881351+00
+
+**Plano de rollback:**
+- Helper `advanceSegmentationWatermark` é não-fatal: revert do worker → jobs continuam processando, watermark para de avançar (drift cresce, mas funcional). Recovery: cron fallback compensa via predicate atual `state_updated_at`.
+- RPC pode ficar instalada mesmo após revert (apenas não é chamada). Se houver razão para drop, `DROP FUNCTION analytics.update_segmentation_watermark(uuid, uuid, bigint)` é seguro pós-revert do worker.
+
+**Notas:**
+- Deploy strategy: NÃO escalou Railway para 1 réplica. Justificativa Marcio: sistema quieto, sharding já distribui jobs, watermark tem CAS atômico, falha é não-fatal. Confirmado: 0 conflitos observados.
 
 ### R-1.7 — Telemetria de drift em event_health_metrics
 
-**Status:** todo
+**Status:** todo (desbloqueada — R-1.6 estável)
 **Owner:** Dev (via Claude Code)
 **Estimativa:** 1h
 **Risco:** baixo
-**Bloqueado por:** R-1.6
+**Bloqueado por:** R-1.5 (executar após para fechar Fase 1 sequencialmente)
 
 **Critérios de aceite:**
 - Nova métrica `eval_drift_count` em `event_health_metrics`

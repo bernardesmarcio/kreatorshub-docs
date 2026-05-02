@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 1 — Fase 1 (Estabilização)
-**Fase ativa:** Fase 1, R-1.4 done, PAUSE 1h em curso
-**Última atualização:** 2026-05-02 19:45 UTC
-**Quem atualizou:** Claude Code via R-1.4 + Marcio aprovação (audit D-09)
+**Fase ativa:** Fase 1, R-1.6 done (Checkpoint B fechado), monitoramento +1h em curso
+**Última atualização:** 2026-05-02 22:00 UTC
+**Quem atualizou:** Claude Code via R-1.6 + Marcio (cross-check independente via pg_stat_statements)
 
 ## Próximas 3 ações
 
-1. **PAUSE 1h** — observar baseline pós-R-1.4 antes de R-1.5/1.6. Métricas a observar: `fallback_hits` (esperado: redução pontual nos parties que entram/saem de segmento), `jobs criados` (não muda — fallback ainda usa `state_updated_at`), state_version writes (deve manter mesmo padrão menos diff de membership).
-2. **R-1.6** — worker patch para atualizar watermark (`workers/analytics/src/segment-eval-worker.ts`). Pode ser paralelo, mas exige aprovação explícita (mexe em hot path do worker).
-3. **R-1.5** — predicate cron usa novo watermark (`segmentation_input_version > last_evaluated_segmentation_version`). DEPENDE de R-1.6 deployado (worker precisa estar atualizando o watermark antes do cron começar a usá-lo).
+1. **Monitorar R-1.6 +1h** — confirmar que watermark continua avançando sob tráfego real, drift global se mantém em zero, latência da RPC `update_segmentation_watermark` segue ~5–10ms. Se sistema estável até ~23:00 UTC, R-1.5 fica completamente desbloqueada para execução.
+2. **R-1.5** — predicate do cron fallback (`run_segment_eval_fallback`) passa a usar `segmentation_input_version > last_evaluated_segmentation_version` em vez de `state_updated_at >= now() - interval '15 minutes'`. Agora desbloqueada (worker R-1.6 está atualizando o watermark em produção). Manter feature flag `USE_LEGACY_FALLBACK_PREDICATE` para rollback de 1 minuto.
+3. **R-1.7** — telemetria `eval_drift_count` em `event_health_metrics` (ETL hourly + view `v_event_driven_health`). Bloqueada por R-1.6 (watermark precisa estar populado para drift fazer sentido) — agora desbloqueada também, mas executar depois de R-1.5 para fechar Fase 1 sequencialmente.
 
 ## Bloqueadores ativos
 
@@ -191,6 +191,26 @@ tarefa (criar/usar/deletar em horas, não semanas).
 
 **Custo evitado:** ~$28 USD + 12 semanas de overhead operacional.
 
+### D-2026-05-02-10 — Inverter ordem R-1.5 ↔ R-1.6 (worker antes do cron)
+
+**Contexto:** plano original tinha R-1.5 (predicate cron usa watermark) antes de
+R-1.6 (worker atualiza watermark). Ao revisar, percebemos que essa ordem deixa o
+sistema em estado degradado entre as duas tarefas: o cron começaria a filtrar por
+`segmentation_input_version > last_evaluated_segmentation_version`, mas como
+nenhum worker ainda atualizaria `last_evaluated_segmentation_version`, **todos** os
+parties pareceriam dirty para sempre — disparando reavaliação 100% do tempo até
+R-1.6 entrar.
+
+**Decisão:** executar R-1.6 antes de R-1.5. R-1.6 deploya worker que escreve no
+watermark; cron continua usando `state_updated_at` (predicate antigo) até R-1.5.
+
+**Justificativa:** com R-1.6 estável, o predicate antigo do cron continua
+funcionando exatamente como antes (zero side effect). Quando R-1.5 trocar o
+predicate, o watermark já estará populado e refletindo realidade. Nenhuma janela
+de degradação.
+
+**Custo:** zero. Apenas alteração de ordem; tarefas e contratos inalterados.
+
 ### D-2026-05-02-09 — Audit pré-R-1.4 confirma zero risco de regressão
 
 **Contexto:** R-1.4 muda comportamento de `apply_segment_membership_diff` (deixa
@@ -238,9 +258,9 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Início:** 2026-05-02
 **Fim previsto:** ~2 semanas (~16/05)
-**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx), R-1.4 (apply_segment_membership_diff sem state_version bump)
-**Tarefas em andamento:** PAUSE 1h pós-R-1.4 (observação de baseline)
-**Tarefas pendentes:** R-1.5, R-1.6, R-1.7
+**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx), R-1.4 (apply_segment_membership_diff sem state_version bump), R-1.6 (worker watermark per-party com CAS atômico)
+**Tarefas em andamento:** monitoramento R-1.6 +1h (até ~23:00 UTC)
+**Tarefas pendentes:** R-1.5, R-1.7
 
 **Notas:**
 - R-1.2 aplicada direto em produção (`pbfpwfkgjaqotbudihpy`) via D-2026-05-02-08
@@ -256,7 +276,13 @@ membership recalculation deixa de ser side effect (P4 implementado).
 - Backup: `apply_segment_membership_diff__pre_refactor_2026_05` (rollback em <1min via DROP+CREATE OR REPLACE)
 - Função nova: NÃO bumpa `state_version` (P4), MANTÉM `state_updated_at` (D-03), ADICIONA `segment_membership_updated_at`
 - 4 validações ✓ (2 funções presentes, no-bump-state_version=false, bumps-membership_at=true, backup-still-bumps=true)
-- Próximo: PAUSE 1h, depois R-1.6 (worker watermark) + R-1.5 (predicate cron, depende de R-1.6)
+- R-1.6 aplicada antes de R-1.5 (ordem invertida no plano original; ver D-2026-05-02-10): worker precisa atualizar watermark antes do cron começar a depender dele
+- Migration `r16_update_segmentation_watermark_rpc` (RPC `analytics.update_segmentation_watermark` SECURITY DEFINER, CAS atômico via WHERE clause na UPDATE)
+- Worker patch: helper `advanceSegmentationWatermark` exportado em `workers/analytics/src/segment-eval-worker.ts`. Lê `observed_version` no início de `processEvalJob`, chama RPC após `mark_job_result`, falha não-fatal (loga e segue)
+- 7 testes unitários novos cobrindo happy path, race condition, idempotência, falha RPC, resposta vazia, args passthrough, coerção bigint→number (`segmentationWatermark.test.ts`)
+- Cross-check independente via `pg_stat_statements` (Marcio, 2026-05-02 22:00 UTC): RPC executada 2x com formato prepared statement (= driver postgres.js do worker), avg 5.85ms, drift global = 0, 0 erros em 30min
+- Sanity 15min pós-deploy: 9 jobs processados em segment_eval_queue (3 parties distintas), 100% in_sync após RPC, latest_processed às 21:56:08 UTC
+- Próximo: monitorar +1h, depois R-1.5 (predicate cron usa watermark) + R-1.7 (telemetria drift)
 
 ## Lições aprendidas (acumulando)
 
