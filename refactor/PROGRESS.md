@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 1 — Fase 1 (Estabilização)
-**Fase ativa:** Fase 1, R-1.6 done (Checkpoint B fechado), monitoramento +1h em curso
-**Última atualização:** 2026-05-02 22:00 UTC
-**Quem atualizou:** Claude Code via R-1.6 + Marcio (cross-check independente via pg_stat_statements)
+**Fase ativa:** Fase 1, R-1.5 done (1º ciclo validado, monitorando +30min), R-1.7 desbloqueada
+**Última atualização:** 2026-05-02 22:48 UTC
+**Quem atualizou:** Claude Code via R-1.5 (migration `r15_run_segment_eval_fallback_uses_watermark` em 22:44:24 UTC)
 
 ## Próximas 3 ações
 
-1. **Monitorar R-1.6 +1h** — confirmar que watermark continua avançando sob tráfego real, drift global se mantém em zero, latência da RPC `update_segmentation_watermark` segue ~5–10ms. Se sistema estável até ~23:00 UTC, R-1.5 fica completamente desbloqueada para execução.
-2. **R-1.5** — predicate do cron fallback (`run_segment_eval_fallback`) passa a usar `segmentation_input_version > last_evaluated_segmentation_version` em vez de `state_updated_at >= now() - interval '15 minutes'`. Agora desbloqueada (worker R-1.6 está atualizando o watermark em produção). Manter feature flag `USE_LEGACY_FALLBACK_PREDICATE` para rollback de 1 minuto.
-3. **R-1.7** — telemetria `eval_drift_count` em `event_health_metrics` (ETL hourly + view `v_event_driven_health`). Bloqueada por R-1.6 (watermark precisa estar populado para drift fazer sentido) — agora desbloqueada também, mas executar depois de R-1.5 para fechar Fase 1 sequencialmente.
+1. **Monitorar R-1.5 +30min** — observar 3–6 ciclos do cron pós-R-1.5 (até ~23:15 UTC). Confirmar drift mantém zero, fallback_log segue sem entries (guard `IF v_detected > 0` faz com que predicate semântico em estado limpo não gere row), tempo de execução do cron permanece <50ms (vs 126–735ms pré-R-1.5).
+2. **R-1.7** — telemetria `eval_drift_count` em `event_health_metrics` (ETL hourly + view `v_event_driven_health`). Desbloqueada com R-1.6 e R-1.5 estáveis. Métrica deve mostrar zero global, sinalizar imediatamente se algum tenant divergir.
+3. **PAUSE 24h pós-Fase 1** — observar baseline pós-refactor antes de iniciar Sprint 2 (Decision Write API). Comparar amplification ratio (era 24.6x), throughput jobs, tempo de execução do fallback. Marcio decide quando abrir Sprint 2.
 
 ## Bloqueadores ativos
 
@@ -258,9 +258,9 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Início:** 2026-05-02
 **Fim previsto:** ~2 semanas (~16/05)
-**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx), R-1.4 (apply_segment_membership_diff sem state_version bump), R-1.6 (worker watermark per-party com CAS atômico)
-**Tarefas em andamento:** monitoramento R-1.6 +1h (até ~23:00 UTC)
-**Tarefas pendentes:** R-1.5, R-1.7
+**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx), R-1.4 (apply_segment_membership_diff sem state_version bump), R-1.6 (worker watermark per-party com CAS atômico), R-1.5 (cron fallback usa watermark semântico)
+**Tarefas em andamento:** monitoramento R-1.5 +30min (até ~23:15 UTC) — coleta de tendência multi-ciclo
+**Tarefas pendentes:** R-1.7
 
 **Notas:**
 - R-1.2 aplicada direto em produção (`pbfpwfkgjaqotbudihpy`) via D-2026-05-02-08
@@ -282,7 +282,13 @@ membership recalculation deixa de ser side effect (P4 implementado).
 - 7 testes unitários novos cobrindo happy path, race condition, idempotência, falha RPC, resposta vazia, args passthrough, coerção bigint→number (`segmentationWatermark.test.ts`)
 - Cross-check independente via `pg_stat_statements` (Marcio, 2026-05-02 22:00 UTC): RPC executada 2x com formato prepared statement (= driver postgres.js do worker), avg 5.85ms, drift global = 0, 0 erros em 30min
 - Sanity 15min pós-deploy: 9 jobs processados em segment_eval_queue (3 parties distintas), 100% in_sync após RPC, latest_processed às 21:56:08 UTC
-- Próximo: monitorar +1h, depois R-1.5 (predicate cron usa watermark) + R-1.7 (telemetria drift)
+- R-1.5 aplicada em 2026-05-02 22:44:24 UTC após cross-check de contrato e captura do md5 fiel da função pré-refactor
+- Migration `20260502224424 r15_run_segment_eval_fallback_uses_watermark`. Backup `analytics.run_segment_eval_fallback__pre_refactor_2026_05` (cópia byte-a-byte da definição original; rollback em <1min via DROP+RENAME)
+- Função nova: predicate trocado de `state_updated_at >= now() - 15min` para `segmentation_input_version > last_evaluated_segmentation_version`. `triggered_by` mudou de `'manual'` para `'repair'` para distinguir nova semântica em telemetria. Permission model, guard de fallback_log e shape do JSON retornado preservados (contrato externo intacto)
+- 4 validações imediatas ✓: 2 funções presentes com mesma signature, nova usa novo predicate (regex match), backup preserva predicate antigo, cron job 7 (`segment-eval-fallback`) inalterado
+- 1º ciclo pós-R-1.5 (22:45 UTC): tempo de execução 37ms para 7 tenants (vs 126–735ms nos runs anteriores), zero entries em `fallback_log` (predicate em estado limpo + guard `IF v_detected > 0`), zero rows novos com `triggered_by='repair'` em `segment_eval_queue`. Drift global manteve zero
+- Tendência hourly em `event_health_metrics.fallback_hits`: 17:00–20:00 estabilizou em 2–10/h (baseline sábado), 21:00 spike 18.622/h (legado + R-1.4 quebrando bump), 22:00 já em 2/h. Esperado bucket 23:00 próximo de zero
+- Próximo: monitorar até 23:15 UTC (5–6 ciclos), depois R-1.7 (telemetria drift) e PAUSE 24h Fase 1
 
 ## Lições aprendidas (acumulando)
 

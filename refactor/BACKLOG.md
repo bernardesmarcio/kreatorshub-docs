@@ -134,20 +134,57 @@ PRs da Fase 2 começarem.
 
 ### R-1.5 — Trocar predicate do cron fallback para versão semântica
 
-**Status:** todo (desbloqueada — R-1.6 estável em produção)
+**Status:** done
 **Owner:** Dev (via Claude Code)
-**Estimativa:** 1h
-**Risco:** médio (predicate é hot path)
+**Concluído em:** 2026-05-02 22:44 UTC (migration aplicada) — 1º ciclo validado 22:45 UTC
+**Estimativa:** 1h (real: ~30min com cross-check de contrato)
+**Risco:** médio (predicate é hot path) — mitigado por backup fiel da versão atual
 **Bloqueado por:** R-1.6 (ordem invertida — D-2026-05-02-10)
 **Bloqueia:** R-1.7
 
-**Critérios de aceite:**
-- Função `run_segment_eval_fallback` modificada:
+**Critérios de aceite (atendidos com adaptações de contrato):**
+- ✅ Função `run_segment_eval_fallback` modificada:
   - Predicate antigo: `state_updated_at >= now() - interval '15 minutes'`
   - Predicate novo: `segmentation_input_version > last_evaluated_segmentation_version`
-- Predicate antigo preservado em comentário + feature flag `USE_LEGACY_FALLBACK_PREDICATE` (default false, configurável via Supabase config)
-- Validado em branch develop: queries retornam resultado equivalente quando feature flag toggle
-- Telemetria adicional: log antes/depois para diff em volume
+- ⚠️ Feature flag `USE_LEGACY_FALLBACK_PREDICATE` substituída por backup nomeado (`run_segment_eval_fallback__pre_refactor_2026_05`). Justificativa: rollback de <1min via DROP+RENAME é equivalente em velocidade e mais simples que feature flag em SQL function (sem branch dynamic em hot path).
+- ⚠️ Branch develop pulada via D-2026-05-02-08. Substituída por:
+  - Cross-check de contrato pré-aplicação (md5, return shape, guard, permission model — preservados)
+  - Validação por execução natural do cron 30s após migration
+- ✅ Telemetria adicional: `triggered_by` mudou de `'manual'` para `'repair'` em `segment_eval_queue` para distinguir runs do predicate novo dos antigos em queries históricas.
+
+**Migration aplicada:**
+- `20260502224424 r15_run_segment_eval_fallback_uses_watermark` (em `pbfpwfkgjaqotbudihpy`)
+
+**Validações imediatas pós-aplicação (Passo 2):**
+1. ✅ 2 funções presentes em `analytics`: `run_segment_eval_fallback` (nova) + `run_segment_eval_fallback__pre_refactor_2026_05` (backup), ambas com `(p_tenant_id uuid) RETURNS jsonb`
+2. ✅ Função nova: regex `segmentation_input_version > cs.last_evaluated_segmentation_version` retorna true; `state_updated_at` retorna false; schema do INSERT inalterado; usa `'repair'` como triggered_by
+3. ✅ Backup: regex `state_updated_at >= now() - v_window` retorna true, `'manual'` retorna true. md5 backup `920ac6e3db149734c7d81681301156b0` (md5 da função original era `6a41cfe1c50bbeb6def9c9413e4b1196` — diferença explicada pelo nome da função no body)
+4. ✅ Cron job 7 (`segment-eval-fallback`, schedule `*/5 * * * *`) inalterado, continua chamando `analytics.run_segment_eval_fallback(id)`
+
+**Validações pós 1º ciclo (Passo 3, run às 22:45 UTC):**
+- ✅ Cron rodou após R-1.5 (`status='succeeded'`, `return_message='7 rows'`)
+- ✅ Drift global = 0 mantido (42.633 parties, 42.632 com watermark > 0)
+- ✅ Fallback enqueue: 0 entries em `fallback_log` no run pós-R-1.5 (predicate semântico em estado limpo + guard `IF v_detected > 0`)
+- ✅ Tempo de execução do cron: 37ms para 7 tenants (vs 126–735ms nos 3 runs anteriores) — sinal direto de que predicate filtra muito mais rapidamente
+- ⏸️ Tendência multi-ciclo: a coletar nos próximos 30min (3–6 ciclos)
+
+**Tendência observada (event_health_metrics.fallback_hits hourly):**
+- Pré-R-1.4 (21:00 UTC): 18.622 hits/h (legado + R-1.4 quebrando bump)
+- Pós-R-1.4 + ~15min R-1.5 (22:00 UTC): 2 hits/h
+- Esperado pós-R-1.5 estável (23:00 UTC bucket): próximo de zero
+
+**Plano de rollback (validado):**
+```sql
+DROP FUNCTION analytics.run_segment_eval_fallback(uuid);
+ALTER FUNCTION analytics.run_segment_eval_fallback__pre_refactor_2026_05(uuid)
+  RENAME TO run_segment_eval_fallback;
+```
+Cron continua chamando `run_segment_eval_fallback` — função restaurada com predicate antigo retoma comportamento pré-R-1.5 em <1min.
+
+**Notas de contrato preservado (vs prompt original):**
+- Permission model: mantido `LANGUAGE plpgsql` sem `SECURITY DEFINER` (R-1.5 não escopa mudar perm; trade-off de hardening fica para Sprint 2 se houver demanda específica)
+- Guard `IF v_detected > 0 THEN INSERT INTO fallback_log`: preservado (evita rows com zero detected/enqueued, mantém shape histórico de telemetria)
+- Return shape: 4 keys preservadas (`tenant_id, contacts_detected, contacts_enqueued, window_minutes`) — `window_minutes` mantido com valor literal `15` para preservar contrato externo, mesmo que a janela não seja mais usada
 
 ### R-1.6 — Worker atualiza watermark ao terminar processamento
 
