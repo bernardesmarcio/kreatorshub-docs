@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.27 — Refactor Plan v1.0 (segmentation pipeline) + link para docs/refactor/*
+*Versão 7.28 — Refactor Plan v1.1 (cleanup) + §22.3 whitelist canônica de dimensões*
 
 ---
 
@@ -1327,6 +1327,144 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 
 ---
 
+### §22.3 Whitelist de dimensões que disparam `segmentation_input_version`
+
+A coluna `segmentation_input_version` em `analytics.contact_state` (criada na Fase 1
+do refactor de Maio/2026 — ver `docs/refactor/PLAN.md`) é o gatilho semântico
+exclusivo de re-avaliação de segmentação.
+
+A função canônica `analytics.apply_contact_state_mutation()` (Fase 2) decide bumpar
+`segmentation_input_version` baseada na lista abaixo. **Mudar essa lista requer bump
+de `analytics_segmentation_contract_version` (constante registrada em código + tabela
+`core.platform_config`).**
+
+#### Dimensões que SEMPRE bumpam (whitelist)
+
+Identidade e role do contato:
+- `party_type` — customer vs lead (R12). Toda mudança de role afeta segmentação.
+
+Comportamento de compra (insumo direto de RFM e segmentos baseados em produto):
+- `frequency` — número de compras
+- `monetary` — valor total
+- `recency_days` — dias desde última compra
+- `bought_product_ids[]` — produtos comprados
+- `total_purchases`, `total_revenue`, `avg_order_value`, `distinct_products` — agregados de compra
+- `last_purchase_at`, `first_product_id`, `first_product_at` — primeiras/últimas compras
+
+Derivados RFM (usados como input por segmentos hoje — confirmado em `analytics.segments.depends_on_fields`):
+- `r_score`, `f_score`, `m_score`
+- `rfm_segment` (mapeamento texto)
+- `value_tier`
+- `lifecycle_stage`
+
+Tags, formulários, imports (insumos de segmentação manual):
+- `tag_ids[]`
+- `responded_form_ids[]`
+- `import_ids[]`
+- `acquisition_source`, `acquisition_campaign_id`
+
+Reativação (usado em segmentos hoje):
+- `reactivation_priority`
+
+Engajamento agregado (insumo de segmentos baseados em comportamento de email):
+- `last_email_opened_at`, `last_email_clicked_at`
+- `email_open_rate_30d`, `email_click_rate_30d`
+- `whatsapp_read_rate_30d`
+- `last_engagement_at`
+
+Identidade adicional (usado em segmentos baseados em perfil):
+- Quaisquer `crm.party_traits` cujo `field_definition` esteja referenciado em
+  `depends_on_fields` de algum segmento ativo (ex: `city`, `phone`, `profession` —
+  detecção dinâmica via JOIN; lista evolui com novos traits)
+
+#### Dimensões que NUNCA bumpam (blacklist)
+
+Predições de ML (cosméticos para UI; segmentos não devem depender):
+- `churn_score`
+- `purchase_propensity`
+- `ltv_predicted`
+- `next_purchase_days`
+- `next_best_product_id`
+- `engagement_score`
+
+Recomendações:
+- `best_channel`
+- `best_send_hour`
+- `current_ladder_position`
+
+Atribuição cosmética:
+- `last_attributed_campaign_id`
+- `total_attributed_revenue`
+- `first_touch_revenue`
+
+Membership (princípio P4 — projeção, não input):
+- `segment_ids[]`
+- `journey_ids[]`
+
+Timestamps internos:
+- `state_updated_at` (cache invalidation, não dirty trigger)
+- `scores_updated_at`
+- `features_version`
+- `state_version` (legado pré-refactor)
+
+#### Campos `BULK_ONLY` (R36) — fora do contrato `segmentation_input_version`
+
+Campos de domínios 1:N (oportunidades, futuros tickets) que aparecem em
+`depends_on_fields` mas NÃO vivem em `contact_state`. Avaliação ocorre via subquery
+no SQL path (`eval_condition_v2`), não via watermark per-party. Nunca bumpam
+`segmentation_input_version` por definição:
+
+- `has_opportunity`, `opportunity_status`, `opportunity_pipeline`, `opportunity_stage`
+- `opportunity_assigned_to`, `opportunity_lost_reason`
+- `opportunity_created_days`, `opportunity_closed_days`, `opportunity_won_days`, `opportunity_lost_days`
+
+Detecção em runtime: o worker `segment-eval-worker` reavalia esses segmentos via
+fluxo BULK_ONLY (refresh_segments handler) — não via fila per-party. R36 cobre.
+
+#### Como adicionar dimensão à whitelist
+
+1. Argumentar em ADR (Architecture Decision Record) por que a dimensão é insumo real
+   de segmentação (não derivado cosmético)
+2. Validar que algum segmento ativo realmente depende dessa dimensão (`depends_on_fields`)
+3. Migration adicionando entrada nesta seção do ARCHITECTURE.md
+4. Bumpar `analytics_segmentation_contract_version` (constante em código + tabela
+   `core.platform_config` para track)
+5. Validar que `apply_contact_state_mutation()` reconhece a dimensão nova
+
+#### Detecção runtime
+
+A whitelist vive como CONST em `workers/shared/src/segmentation/dimensions.ts`
+(será criada em R-2.1 — Decision Write API). Função canônica importa esta constante.
+Mudança de whitelist sem regenerar build do worker tem efeito apenas após deploy.
+Workers que invocam Decision API recebem `dirty_dimensions` como parâmetro
+explícito — não fazem detecção runtime. Lista de dimensions emitidas por cada producer
+está documentada em `DEPENDENCY_MAP.md` seção "Producers de contact_state".
+
+#### Validação de cobertura (snapshot 2026-05-02)
+
+Universo real medido em produção (`analytics.segments` ativos, `depends_on_fields`):
+- 78 segmentos ativos
+- 52 com `depends_on_fields` populado (≥ 1 entrada)
+- 26 com array vazio `{}` — sentinela `all_contacts`/`all_customers`/`all_leads` ou
+  segmentos pós D-SEG-10 que ainda não tiveram `depends_on_fields` re-derivado.
+  R-3.4 trata esse caso (skip filter de dependência para segmentos sentinela).
+- 21 dimensões distintas em uso (cross-check da whitelist acima):
+  `all_contacts`, `bought_product_ids`, `city`, `from_import`, `has_opportunity`,
+  `has_tag`, `m_score`, `not_responded_form`, `opportunity_pipeline`,
+  `opportunity_stage`, `opportunity_status`, `phone`, `product_first_purchase`,
+  `profession`, `r_score`, `reactivation_priority`, `recency_days`,
+  `responded_form`, `responded_form_ids`, `rfm_segment`, `tag_ids`.
+
+  Notas de validação:
+  - `has_opportunity` + 4 `opportunity_*` → categoria BULK_ONLY (acima).
+  - `from_import` → equivalente a `import_ids` (alias semântico em uso na UI legacy).
+  - `not_responded_form` / `responded_form` → cobertos pelo aliasing de
+    `normalizeAstV2ForUI` (D-SEG-10 v7.21).
+  - `product_first_purchase` → temporal scoped, fora do contact_state (resolver
+    `summary_exists`, BULK_ONLY também).
+
+---
+
 ## Refactor em andamento (Maio 2026)
 
 A plataforma está em refatoração estrutural do pipeline de segmentação. Detalhes em:
@@ -1439,6 +1577,36 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.28] — 2026-05-02
+### Refactor Plan v1.1 — Cleanup pós-validação
+
+**Cleanup dos documentos de refactor v1.0:**
+- `docs/REFACTOR_PLAN.md` (duplicado na raiz) já tinha sido movido em `git mv` no commit `8b2e6f7` para `docs/refactor/PLAN.md`. Verificado no working tree: apenas 1 cópia existe.
+- `docs/refactor/PLAN.md` §12: referência ARCHITECTURE.md v7.24 → v7.27.
+- `docs/refactor/BACKLOG.md`:
+  - R-1.0 nova (pré-requisito): definir whitelist antes da Fase 1.
+  - R-1.4: naming de backup padronizado (`__pre_refactor_2026_05`).
+  - R-3.4: critérios atualizados — `depends_on_fields` já existe e está populado em 52/78 segmentos (26 com array vazio recebem skip-filter).
+- `docs/refactor/PROGRESS.md`:
+  - D-2026-05-02-06: cadência ETL confirmada hourly (`5 * * * *`).
+  - D-2026-05-02-07: `depends_on_fields` como fonte canônica.
+
+**Nova seção §22.3 em ARCHITECTURE.md:**
+- Whitelist canônica de dimensões que disparam `segmentation_input_version`
+- Blacklist de dimensões que NÃO bumpam (predições, cosméticos, membership, timestamps internos)
+- Categoria nova "Campos BULK_ONLY (R36)" para opportunity_* (não vivem em `contact_state`)
+- Procedimento documentado de adição/remoção de dimensões + bump de `analytics_segmentation_contract_version`
+- Snapshot de validação 2026-05-02: 78 segmentos ativos, 52 com depends_on_fields populado, 21 dimensões distintas em uso.
+
+**Validações arquiteturais via Supabase MCP:**
+- 21 dimensões em uso por segmentos ativos hoje (medido em `depends_on_fields`)
+- `analytics.segments.depends_on_fields` populado em 52/78 segmentos ativos (26 com array vazio — sentinela ou pós D-SEG-10 sem re-derivar)
+- Cron `etl-event-health-metrics` confirmado em `5 * * * *` (hourly)
+
+**R-1.0 closes by this PR.** Próximo passo: iniciar Sprint 1 com R-1.1 (criar branch develop no Supabase) após aprovação explícita de Marcio. Sprint 1 unblocked.
+
+---
 
 ## [v7.27] — 2026-05-02
 ### Refactor Plan v1.0 — Segmentation Pipeline

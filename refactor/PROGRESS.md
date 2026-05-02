@@ -100,6 +100,45 @@ Estado pré-refactor. Valores que vamos comparar contra ao longo das fases.
 
 **Justificativa:** custo de switch para EN agora sem retorno imediato. Internacionalização possível futura, fora de escopo deste refactor.
 
+### D-2026-05-02-06 — Cadência ETL de event_health_metrics confirmada como hourly
+
+**Contexto:** durante validação Marcio + Claude, surgiu dúvida se cron
+`etl-event-health-metrics` estava em `*/5 * * * *` (a cada 5min) ou `5 * * * *`
+(hourly no minuto 5). Inspeção em `cron.job` confirmou: schedule é `5 * * * *` =
+hourly, exatamente como spec original do D-CRON-3 v7.24.
+
+**Decisão:** manter hourly. Nada muda na implementação atual.
+
+**Justificativa:** ETL pulse hourly é suficiente para tier classification (que usa
+rolling 7d). Cadência mais agressiva geraria overhead sem benefício de detecção
+real-time (handler `runEventDrivenHealthCheck` em journeys-worker já roda 5min e dá
+real-time check sobre métricas hourly).
+
+**Alternativa considerada:** mover ETL para 5min para detecção mais granular —
+rejeitada por overhead 12x sem ganho real (handler já cobre real-time).
+
+### D-2026-05-02-07 — depends_on_fields como fonte canônica de dependências de segmento
+
+**Contexto:** validação descobriu que `analytics.segments.depends_on_fields text[]`
+já existe e está populado em 52/78 segmentos ativos (78 com a coluna não-NULL, 26
+com array vazio `{}` — sentinelas ou pós D-SEG-10 sem re-derivar). Field não tinha
+sido referenciado no plano original.
+
+**Decisão:** usar `depends_on_fields` como fonte canônica para R-3.4 — não criar
+campo novo ou estrutura paralela.
+
+**Justificativa:** infra já existe e está populada para 67% dos segmentos
+ativos. Reaproveitar reduz escopo da Fase 3 e elimina migration de schema. Worker
+apenas precisa começar a respeitar o campo, com fail-open (skip-filter) para os
+casos vazios.
+
+**Validação adicional necessária:** confirmar que QUEM popula `depends_on_fields`
+hoje (provavelmente derivação de `rules_json_v2` em `extractDependsOnFields` no
+`src/lib/segmentation/segmentService.ts`) está completo e sincronizado para os 26
+segmentos com `{}`. Se houver gap, registrar como sub-tarefa R-3.4-followup.
+
+**Custo:** zero. Apenas usar o que já existe + fail-open conservador.
+
 ## Histórico de sprints
 
 ### Sprint 0 — Setup (em andamento)

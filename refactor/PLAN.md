@@ -319,7 +319,7 @@ Atrasos por mais de 2 sprints requerem revisão do plano com ADR. Não cancelame
 
 ## 12. Referências
 
-- Constituição: `docs/ARCHITECTURE.md` v7.24
+- Constituição: `docs/ARCHITECTURE.md` v7.27 (atualizar conforme bump)
 - Segurança: `docs/SECURITY.md` v1.5
 - Dependências: `docs/DEPENDENCY_MAP.md`
 - Diagnóstico que originou este plano: chat de 02/05/2026 (transcript em `transcripts/2026-05-02-refactor-decision/`)

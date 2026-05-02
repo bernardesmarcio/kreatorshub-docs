@@ -10,6 +10,28 @@
 
 ## Fase 1 — Estabilização
 
+### R-1.0 — Definir whitelist de dimensões em ARCHITECTURE.md (PRÉ-REQUISITO)
+
+**Status:** done (pelo cleanup PR v1.1 — v7.28)
+**Owner:** Claude (chat) + Marcio (review)
+**Estimativa:** 2h
+**Risco:** baixo
+**Bloqueia:** R-1.1 a R-2.16 (toda Fase 1 e 2)
+**Referência:** ARCHITECTURE.md §22.3 (criada em v7.28)
+
+**Critérios de aceite:**
+- Seção §22.3 publicada em ARCHITECTURE.md
+- Whitelist explicita TODAS as dimensões que bumpam `segmentation_input_version`
+- Blacklist explicita dimensões que NÃO bumpam (predições, cosméticos, membership, timestamps internos)
+- Categoria "Campos BULK_ONLY (R36)" cobrindo opportunity_* (fora do contrato)
+- Procedimento documentado para adicionar/remover dimensão futuramente (com bump de `analytics_segmentation_contract_version`)
+- Validação: cada dimensão referenciada por qualquer segmento ativo deve estar na whitelist OU ter justificativa explícita do contrário (snapshot 2026-05-02 validado: 21 dims em uso)
+
+**Por que pré-requisito:** sem whitelist explícita, R-2.1 (Decision Write API) tem
+critério de aceite ambíguo. Risco de cada writer migrado decidir whitelist sozinho =
+12 implementações divergentes. Whitelist tem que ser fonte única, escrita ANTES dos
+PRs da Fase 2 começarem.
+
 ### R-1.1 — Criar branch develop no Supabase + aplicar migrations base
 
 **Status:** todo
@@ -72,7 +94,7 @@
   - ADICIONA `segment_membership_updated_at = now()`
 - Testes existentes passando
 - Validado em branch develop com replay de 100 jobs reais
-- Plano de rollback: function preservada como `apply_segment_membership_diff_v1` para backup
+- Plano de rollback: function preservada como `apply_segment_membership_diff__pre_refactor_2026_05` para backup. Drop após 30 dias com Fase 1 estável (registrar em PROGRESS.md).
 
 ### R-1.5 — Trocar predicate do cron fallback para versão semântica
 
@@ -240,19 +262,42 @@ Lista detalhada — cada um vira PR isolado com testes:
 - `trigger_count = existing + 1`
 - Testes cobrindo: 10 events same party em janela = 1 row final
 
-### R-3.4 — Worker considera dirty_dimensions em depends_on_fields
+### R-3.4 — Worker filtra segmentos por interseção dirty_dimensions ∩ depends_on_fields
 
 **Status:** todo
 **Owner:** Dev (via Claude Code)
-**Estimativa:** 3h
+**Estimativa:** 2h (reduzido — infra de depends_on_fields JÁ existe)
 **Risco:** médio (mexe em hot path do worker)
 **Bloqueado por:** R-3.3
 
+**Pré-condições já satisfeitas (validado em 2026-05-02 via Supabase MCP):**
+- `analytics.segments.depends_on_fields text[]` existe e está populado em 52/78
+  segmentos ativos. Os 26 restantes têm array vazio `{}` (sentinela
+  `all_contacts`/`all_customers`/`all_leads` ou segmentos pós D-SEG-10 sem
+  re-derivação) — recebem skip-filter (sempre avalia).
+- Producers de `segment_eval_queue` já emitem `fields_changed text[]` (será renomeado
+  para `dirty_dimensions` em R-3.1).
+
 **Critérios de aceite:**
 - `workers/analytics/src/segment-rules-evaluator.ts` patch:
-  - Filtra segmentos: `dirty_dimensions ∩ depends_on_fields ≠ ∅`
-- Testes mostrando: mudança em `tag_ids` não dispara reavaliação de segmentos baseados apenas em RFM
+  - Antes de avaliar regras de cada segmento: validar `dirty_dimensions ∩
+    segment.depends_on_fields ≠ ∅`
+  - Se interseção vazia: skip avaliação, registrar em telemetria (`dependency_aware_skip_count`)
+- Casos especiais a tratar:
+  - `all_contacts` / `all_customers` / `all_leads` (segmentos sentinela): SEM filtro
+    de dependência — sempre avalia
+  - Segmentos com `depends_on_fields = '{}'` (vazio, ~26 atualmente): SEM filtro —
+    sempre avalia (fail-open conservador até R-3.4-followup re-derivar)
+  - Segmentos com `depends_on_fields = ['*']` (wildcard, se existir): SEM filtro —
+    sempre avalia
 - Telemetria: nova métrica `dependency_aware_skip_count` em `event_health_metrics`
+- Testes mostrando: mudança em `tag_ids` não dispara reavaliação de segmento RFM puro
+- Validação produção: queries comparando `event_driven_hits` antes/depois mostram
+  redução proporcional ao % de segmentos não tocados pela dimensão
+
+**Sub-tarefa potencial (R-3.4-followup):** se 26 segmentos com `{}` representarem
+gap real (não sentinelas), abrir tarefa para re-derivar `depends_on_fields` desses
+segmentos a partir do `rules_json_v2` antes de habilitar filter agressivo.
 
 ---
 
