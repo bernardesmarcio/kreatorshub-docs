@@ -78,18 +78,30 @@ PRs da Fase 2 começarem.
 
 ### R-1.3 — Backfill: zerar drift histórico
 
-**Status:** todo
+**Status:** done
 **Owner:** Dev (via Claude Code)
-**Estimativa:** 1h
+**Concluído em:** 2026-05-02 19:30 UTC
+**Estimativa:** 1h (real: ~15min — janela 100% quiescente)
 **Risco:** baixo
 **Bloqueado por:** R-1.2
 **Bloqueia:** R-1.4
 
-**Critérios de aceite:**
-- One-shot UPDATE: `UPDATE analytics.contact_state SET segmentation_input_version = state_version, last_evaluated_segmentation_version = state_version`
-- Em branch develop primeiro, validar no banco completo
-- Em produção: aplicar fora de janela de pico (final de semana ou madrugada)
-- Drift_idx pós-backfill = 0 rows
+**Critérios de aceite (atendidos):**
+- ✅ One-shot UPDATE: `UPDATE analytics.contact_state SET segmentation_input_version = state_version, last_evaluated_segmentation_version = state_version WHERE state_version > 0`
+- ⚠️ Branch develop pulada via D-2026-05-02-08 (cancelar branch). Aplicada direto em produção.
+- ✅ Em produção: aplicada em janela quiescente (0 pending, 0 claimed, 0 writes em 5min — sábado 2026-05-02 19:30 UTC)
+- ✅ Drift_idx pós-backfill = 0 rows (validado por tenant: 7/7 com drift=0)
+
+**Migrations aplicadas:**
+- `20260502193017 r13_backfill_segmentation_versioning` — UPDATE em massa
+- `20260502193133 r13_create_contact_state_drift_idx` — índice parcial (postergado de R-1.2)
+
+**Validações pós-backfill:**
+- 42.632 parties: `segmentation_input_version = state_version` e `last_evaluated_segmentation_version = state_version` em 100%
+- `max_seg_version = max_watermark = 35` (consistente com `max(state_version)` pré-R-1.3)
+- Distribuição por tenant: drift = 0 em todos os 7 tenants ativos (28.735 + 7.012 + 6.069 + 781 + 28 + 5 + 2 = 42.632)
+- Índice `contact_state_drift_idx` criado, 8192 bytes (mínimo, esperado pós-backfill)
+- Comment com referência a R-1.3 aplicado
 
 ### R-1.4 — apply_segment_membership_diff para de bumpar state_version
 

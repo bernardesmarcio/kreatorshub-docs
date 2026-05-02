@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 1 — Fase 1 (Estabilização)
-**Fase ativa:** Fase 1, R-1.2 done, R-1.3 desbloqueada
-**Última atualização:** 2026-05-02 19:14 UTC
-**Quem atualizou:** Claude Code via R-1.2 + Marcio aprovação
+**Fase ativa:** Fase 1, R-1.3 done, R-1.4 desbloqueada
+**Última atualização:** 2026-05-02 19:30 UTC
+**Quem atualizou:** Claude Code via R-1.3 + Marcio aprovação
 
 ## Próximas 3 ações
 
-1. **R-1.3** — backfill: `UPDATE analytics.contact_state SET segmentation_input_version = state_version, last_evaluated_segmentation_version = state_version`. One-shot, ~42.6k rows. Aplicar fora de janela de pico.
-2. **R-1.4** — `apply_segment_membership_diff` para de bumpar `state_version`. Backup como `apply_segment_membership_diff__pre_refactor_2026_05`.
-3. **PAUSE 1h após R-1.4** — observar baseline antes de R-1.5/1.6.
+1. **R-1.4** — `apply_segment_membership_diff` para de bumpar `state_version`. Backup como `apply_segment_membership_diff__pre_refactor_2026_05`. Aplicar e validar com replay de membership diff real.
+2. **PAUSE 1h após R-1.4** — observar baseline antes de R-1.5/1.6.
+3. **R-1.5** — trocar predicate do cron fallback de `state_updated_at >= now()-15min` para `segmentation_input_version > last_evaluated_segmentation_version`. Predicate antigo via feature flag.
 
 ## Bloqueadores ativos
 
@@ -210,16 +210,20 @@ tarefa (criar/usar/deletar em horas, não semanas).
 
 **Início:** 2026-05-02
 **Fim previsto:** ~2 semanas (~16/05)
-**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas)
+**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx)
 **Tarefas em andamento:** —
-**Tarefas pendentes:** R-1.3, R-1.4, R-1.5, R-1.6, R-1.7
+**Tarefas pendentes:** R-1.4, R-1.5, R-1.6, R-1.7
 
 **Notas:**
 - R-1.2 aplicada direto em produção (`pbfpwfkgjaqotbudihpy`) via D-2026-05-02-08
 - Migration version: `20260502191444 r12_add_segmentation_versioning_columns`
 - 3 colunas novas em `analytics.contact_state` com defaults zerados em 42.632 parties
 - 5 validações pós-migration ✓ (colunas, comments, defaults, smoke, list_migrations)
-- Próximo: R-1.3 (backfill `segmentation_input_version = state_version` + `last_evaluated_segmentation_version = state_version`)
+- R-1.3 aplicada em janela quiescente (0 pending, 0 claimed, 0 writes em 5min)
+- 2 migrations: `r13_backfill_segmentation_versioning` + `r13_create_contact_state_drift_idx`
+- 42.632 parties backfilled (`segmentation_input_version = last_evaluated_segmentation_version = state_version`)
+- Drift count = 0 em todos os 7 tenants ativos (validado via `contact_state_drift_idx`)
+- Próximo: R-1.4 (apply_segment_membership_diff stop bumping state_version)
 
 ## Lições aprendidas (acumulando)
 
