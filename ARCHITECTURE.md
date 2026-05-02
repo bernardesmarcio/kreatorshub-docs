@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.26 — Trigger enrichment via in-transaction COUNT (purchase_sequence_number) + R53*
+*Versão 7.27 — Refactor Plan v1.0 (segmentation pipeline) + link para docs/refactor/*
 
 ---
 
@@ -1327,6 +1327,30 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 
 ---
 
+## Refactor em andamento (Maio 2026)
+
+A plataforma está em refatoração estrutural do pipeline de segmentação. Detalhes em:
+- [docs/refactor/PLAN.md](./refactor/PLAN.md) — visão geral, fases, princípios
+- [docs/refactor/PROGRESS.md](./refactor/PROGRESS.md) — estado atual, decisões
+- [docs/refactor/BACKLOG.md](./refactor/BACKLOG.md) — tarefas atômicas
+
+**Princípios não-negociáveis durante refactor (P1-P10):**
+
+P1: Single writer per state column.
+P2: Decision Write API obrigatório.
+P3: Versão semântica por dimensão.
+P4: Membership é projeção, nunca input.
+P5: pg_cron é só housekeeping (R50).
+P6: Worker > cron sempre que houver tenant awareness.
+P7: Eventos são imutáveis e first-class.
+P8: Dependency-aware evaluation.
+P9: Coalescing real via UNIQUE constraint.
+P10: Observability é camada própria (R52).
+
+Toda PR durante o refactor deve referenciar tarefa do BACKLOG (R-X.Y) e respeitar P1-P10.
+
+---
+
 ## 23. Roadmap Futuro
 
 **Personalização e cache**
@@ -1415,6 +1439,30 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 ---
 
 # PARTE E — CHANGELOG
+
+## [v7.27] — 2026-05-02
+### Refactor Plan v1.0 — Segmentation Pipeline
+
+**Documentos de refactor publicados** em `docs/refactor/`:
+- `PLAN.md` — visão arquitetural, 10 princípios não-negociáveis (P1-P10), 8 fases sequenciais (~6 sprints), critérios de sucesso mensuráveis via D-CRON-3 telemetry, plano de migração com gates de estabilidade.
+- `PROGRESS.md` — savepoint operacional (estado, próximas 3 ações, bloqueadores, baseline metrics, decisões arquiteturais formalizadas D-2026-05-02-01..05, lições aprendidas L-001..L-003).
+- `BACKLOG.md` — ~30 tarefas atômicas com IDs estáveis (R-1.1 a R-8.4), critérios de aceite, dependências entre tarefas. Granularidade micro nas Fases 1-3, macro nas 4-8.
+
+**Mudança em ARCHITECTURE.md** (nova seção "Refactor em andamento (Maio 2026)" antes do §23 Roadmap):
+- Link para os 3 documentos do refactor.
+- Lista pública dos 10 princípios P1-P10.
+- Regra: toda PR durante o refactor deve referenciar tarefa do BACKLOG (R-X.Y) e respeitar P1-P10.
+
+**Sync workflow** atualizado (`.github/workflows/sync-architecture-docs.yml`):
+- Trigger paths inclui `docs/refactor/**`.
+- Constituição (ARCHITECTURE/SECURITY/DEPENDENCY_MAP) continua sincronizando para raiz de `kreatorshub-docs`.
+- Documentos de refactor sincronizam para `kreatorshub-docs/refactor/` (subpasta espelhando D-2026-05-02-04).
+
+**Status:** plano aprovado, Sprint 0 (setup) concluído, Sprint 1 inicia com R-1.1 (criar branch develop no Supabase) após aprovação de Marcio.
+
+**Não inicia tarefas R-X.Y neste commit.** Apenas documentação publicada.
+
+---
 
 ## [v7.26] — 2026-05-01
 ### Trigger enrichment — purchase_sequence_number
