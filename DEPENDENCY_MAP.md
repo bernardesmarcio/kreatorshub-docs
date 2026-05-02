@@ -541,7 +541,7 @@ Antes de implementar qualquer novo pipeline, responder:
 
 ## Platform Health Observability (D-CRON-3)
 
-> **R52** (v7.24): Camada de saúde (view) e camada de alerta (handler) leem APENAS `analytics.event_health_metrics`. Nunca tabelas operacionais (`fallback_log`, `segment_eval_queue`, `contact_events`).
+> **R52** (v7.25): Camada de saúde (view) e camada de alerta (handler) leem APENAS `analytics.event_health_metrics`. Nunca tabelas operacionais (`fallback_log`, `segment_eval_queue`, `contact_events`).
 > Antes de adicionar reader/writer aqui: verificar §17.1 do ARCHITECTURE.md e a migration `20260501100000_dcron3_observability.sql`.
 
 ### analytics.event_health_metrics — Telemetria normalizada (Camada A)
@@ -568,7 +568,7 @@ Antes de implementar qualquer novo pipeline, responder:
 - **Source:** `analytics.event_health_metrics` (rolling 7d P50/P95/P99 per-tenant excluindo a hora atual — evita auto-inflação).
 - **Readers:**
   - `workers/journeys/src/handlers/healthCheck.ts:runEventDrivenHealthCheck` — único reader em produção (5min cadence dentro do `runSchedulerLoop`/`runCombinedLoop`).
-  - Possíveis dashboards admin futuros (não implementados em v7.24).
+  - Possíveis dashboards admin futuros (não implementados em v7.25).
 - **Tier output:** `HEALTHY`, `INSUFFICIENT_DATA` (< 168 samples warmup), `WARN` (`hits_1h > p50 * 1.5`), `ERROR` (`hits_1h > p95`), `CRITICAL` (`error_sustained_1h AND hits_1h > p99`).
 - **Whitelist:** `LEFT JOIN core.platform_health_whitelist` exclui tenants nominalmente listados.
 
@@ -577,7 +577,7 @@ Antes de implementar qualquer novo pipeline, responder:
 - **Writers (apenas manual via migration):** INSERT nominal com `reason` (CHECK in `seed_test`, `demo_internal`, `paused_investigation`, `opcit`), `added_by`, `expires_at`, `notes`. Auditável.
 - **Readers:**
   - `analytics.v_event_driven_health` — filtro embutido via LEFT JOIN.
-- **Schema:** PK `tenant_id` com FK ON DELETE CASCADE → `core.tenants(id)`. RLS service-only. Começa vazia em v7.24.
+- **Schema:** PK `tenant_id` com FK ON DELETE CASCADE → `core.tenants(id)`. RLS service-only. Começa vazia em v7.25.
 
 ### analytics.emit_health_metric() — RPC de UPSERT (escrita única)
 

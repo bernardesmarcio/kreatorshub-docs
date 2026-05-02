@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.25 — D28 Fase 1: DROP customer_id em 6 tabelas zero-data*
+*Versão 7.26 — Trigger enrichment via in-transaction COUNT (purchase_sequence_number) + R53*
 
 ---
 
@@ -485,9 +485,9 @@ sem registro = violação arquitetural.
 | `purge-integrations-webhook-events` | `45 3 * * *` | DELETE TTL com guard `NOT EXISTS jobs` | `integrations.purge_old_webhook_events` | **A** | TTL puro. |
 | `expire-soft-bounce-suppressions` | `0 * * * *` | UPDATE TTL `expires_at <= NOW()` | `email.expire_soft_bounce_suppressions` | **A** | TTL puro. |
 | `create-contact-events-partition` | `0 2 25 * *` | DDL `CREATE TABLE PARTITION` idempotente | `analytics.create_contact_events_partition_if_needed` | **A** | DDL maintenance. |
-| `etl-event-health-metrics` | `5 * * * *` | Pulse ETL hourly: agrega `fallback_log` + `contact_events` + `segment_eval_queue` em `event_health_metrics` via `emit_health_metric` | `analytics.etl_event_health_metrics` | **A** | D-CRON-3 (v7.24). Banco-only, sem lógica de domínio. Substituível por workers em D-CRON-4 sem mudar view/handler (R52). |
-| `event-health-metrics-partition-create` | `30 2 25 * *` | DDL idempotente — cria partição mensal de `event_health_metrics` | `analytics.event_health_metrics_partition_create_if_needed` | **A** | D-CRON-3 (v7.24). Mesmo padrão de `create-contact-events-partition`. |
-| `event-health-metrics-purge-old` | `30 4 * * *` | DROP partition para retention 90d em `event_health_metrics` | `analytics.event_health_metrics_purge_old` | **A** | D-CRON-3 (v7.24). TTL puro via DROP (mais barato que DELETE). |
+| `etl-event-health-metrics` | `5 * * * *` | Pulse ETL hourly: agrega `fallback_log` + `contact_events` + `segment_eval_queue` em `event_health_metrics` via `emit_health_metric` | `analytics.etl_event_health_metrics` | **A** | D-CRON-3 (v7.25). Banco-only, sem lógica de domínio. Substituível por workers em D-CRON-4 sem mudar view/handler (R52). |
+| `event-health-metrics-partition-create` | `30 2 25 * *` | DDL idempotente — cria partição mensal de `event_health_metrics` | `analytics.event_health_metrics_partition_create_if_needed` | **A** | D-CRON-3 (v7.25). Mesmo padrão de `create-contact-events-partition`. |
+| `event-health-metrics-purge-old` | `30 4 * * *` | DROP partition para retention 90d em `event_health_metrics` | `analytics.event_health_metrics_purge_old` | **A** | D-CRON-3 (v7.25). TTL puro via DROP (mais barato que DELETE). |
 | `sweep-orphan-enrollments` | `*/10 * * * *` | Re-enqueue de enrollments órfãos LIMIT 100 | `journeys.sweep_orphan_enrollments` | **A** | Safety net pós D18 (fanout não-atômico). Sem lógica de domínio. **TODO:** alarmar quando `count > 0` indica bug em fanout. |
 | `rfm-rolling-refresh` | `0 * * * *` | Enqueue `refresh_features` para 1/24 dos tenants/hora com threshold 20h via `MOD(HASHTEXT(t.id), 24) = HOUR(NOW())` | `analytics.enqueue_job_internal` | **B** | Loop bloqueante de tenants no banco (viola §2.4). Lógica de sharding e threshold em SQL. **D-CRON-2** — migrar para worker. |
 | `segment-eval-fallback` | `*/5 * * * *` | Itera tenants ativos, detecta contatos com `state_updated_at < 15min` sem job pending, enqueue na `segment_eval_queue` | `analytics.run_segment_eval_fallback` | **B** | Safety net pro event-driven path. Loop bloqueante de tenants (viola §2.4). Mascara bugs do path event-driven sem alarme. **D-CRON-3** (instrumentar `analytics.fallback_log`) é pré-requisito de **D-CRON-4** (migrar para worker). |
@@ -806,7 +806,7 @@ Ver `workers/journeys-event/src/monitoring.sql` para queries completas:
 
 ## 17.1 Platform Health Observability (D-CRON-3)
 
-**Status:** ✅ Operacional (v7.24).
+**Status:** ✅ Operacional (v7.25).
 
 Camada própria de observability arquitetural — desacoplada do mecanismo observado
 (R52). Mudança no path observado (ex: `segment-eval-fallback` cron → worker em
@@ -854,9 +854,9 @@ D-CRON-4) NÃO obriga reescrever a view nem o handler de alerta.
 | `hits_1h > p50 * 1.5` | `WARN` |
 | caso contrário | `HEALTHY` |
 
-### Métricas coletadas (v7.24)
+### Métricas coletadas (v7.25)
 
-| metric_name | semântica | fonte v7.24 | fonte D-CRON-4 |
+| metric_name | semântica | fonte v7.25 | fonte D-CRON-4 |
 |---|---|---|---|
 | `fallback_hits` | contacts detectados pelo cron `segment-eval-fallback` | ETL hourly de `analytics.fallback_log` | worker emite direto (cron some) |
 | `event_driven_hits` | event-driven entries no segmento | ETL hourly de `analytics.contact_events` (event_type='segment_entered', source='system') | inalterado |
@@ -872,7 +872,7 @@ D-CRON-4) NÃO obriga reescrever a view nem o handler de alerta.
 3. **Re-alerta no mesmo tier ≥ ERROR só após 1h.** Evita alert fatigue.
 4. **Transição CRITICAL → ERROR não re-alerta** (tier melhor sem ser HEALTHY).
 5. **Recovery silencioso:** ERROR/CRITICAL → HEALTHY sustentado 30min apenas atualiza state + log info. Sem Sentry. Auditoria via `platform_alert_state.last_changed_at`.
-6. **Whitelist:** `core.platform_health_whitelist` (auditável, com `reason` CHECK constraint, `added_by`, `expires_at`). Começa vazia em v7.24. Adicionar tenant nominalmente via migration.
+6. **Whitelist:** `core.platform_health_whitelist` (auditável, com `reason` CHECK constraint, `added_by`, `expires_at`). Começa vazia em v7.25. Adicionar tenant nominalmente via migration.
 
 ### Pré-requisito de produção
 
@@ -1255,8 +1255,9 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R47 | **Email engagement via subquery, não snapshot.** Campos `campaign_opened`/`campaign_clicked` usam resolver `email_engagement` com EXISTS em `email.email_events`. Engagement data é per-campaign — nunca materializar em `contact_state`. Condition node usa pre-enrichment (`__email_engagement` injetado pelo conditionEngine). Padrão replicável para futuros campos relacionais (ex: `opened_journey_email_X`). | Sprint 19 |
 | R48 | **`analytics.segments.rules_json_v2.root.children` deve conter exclusivamente nós `kind: 'group'`.** Conditions soltas no nível root são deprecated (shape B legado). Adapter UI (`normalizeAstV2ForUI`) é safety net que normaliza shapes legacy em runtime no load — até Fase 2 (backfill SQL canonicalizando todos os segmentos) e Fase 4 (trigger BEFORE INSERT/UPDATE em `analytics.segments` validando o shape). Após Fase 4, R48 vira enforcement estrutural; antes disso, é convenção. | Hotfix v7.21 — 46/52 segmentos manuais ativos com shape B causaram builder vazio em produção; duas rotas de criação coexistiam, escrevendo formatos divergentes. |
 | R50 | **pg_cron é APENAS housekeeping.** Permitido: DELETE/UPDATE de TTL em filas/logs/audit; DDL maintenance (criar partição, REINDEX, VACUUM); pulse simples sem lógica de domínio (`SELECT some_fn()` que apenas dispara cleanup banco-only). **Proibido:** loop sobre tenants (`FROM core.tenants WHERE is_active`) — viola §2.4 Isolamento por tenant; lógica de negócio embutida (thresholds dinâmicos, sharding heurístico, condições de domínio); INSERT/UPDATE em tabelas de domínio (não-fila/log); fanout que cresce com volume. Lógica com schedule tenant-aware ou condições de negócio = worker no Railway. Cron novo requer entrada na tabela §11 + classificação A; cron categoria B/C/D requer auditoria arquitetural antes de aprovar. | Auditoria v7.22 — `rfm-rolling-refresh` e `segment-eval-fallback` foram criados sem registro arquitetural, com loop bloqueante de tenants no banco e mascarando bugs do event-driven path. Reclassificados como categoria B; D-CRON-2..4 abertos. |
-| R52 | **Observability de plataforma reside em camada própria desacoplada do mecanismo observado.** Telemetria (Camada A — `analytics.event_health_metrics`), view de saúde (Camada B — `analytics.v_event_driven_health`) e alerta (Camada C — handler em worker) são entidades separadas. View e handler leem APENAS a tabela de telemetria — NUNCA tabelas operacionais (`fallback_log`, `segment_eval_queue`, etc). Mudança no mecanismo observado (ex: substituir cron por worker em D-CRON-4) afeta APENAS quem POPULA a métrica, não quem consome. **Como identificar violação:** PR adicionando `JOIN analytics.fallback_log` ou similar dentro de `v_event_driven_health` ou do handler de alerta = violação. Caminho correto: novo emissor escreve em `event_health_metrics` via `analytics.emit_health_metric()`. | D-CRON-3 (v7.24) — primeira camada de observability arquitetural; precedente para futura observabilidade de outros paths (workers, integrações, journey throughput). |
+| R52 | **Observability de plataforma reside em camada própria desacoplada do mecanismo observado.** Telemetria (Camada A — `analytics.event_health_metrics`), view de saúde (Camada B — `analytics.v_event_driven_health`) e alerta (Camada C — handler em worker) são entidades separadas. View e handler leem APENAS a tabela de telemetria — NUNCA tabelas operacionais (`fallback_log`, `segment_eval_queue`, etc). Mudança no mecanismo observado (ex: substituir cron por worker em D-CRON-4) afeta APENAS quem POPULA a métrica, não quem consome. **Como identificar violação:** PR adicionando `JOIN analytics.fallback_log` ou similar dentro de `v_event_driven_health` ou do handler de alerta = violação. Caminho correto: novo emissor escreve em `event_health_metrics` via `analytics.emit_health_metric()`. | D-CRON-3 (v7.25) — primeira camada de observability arquitetural; precedente para futura observabilidade de outros paths (workers, integrações, journey throughput). |
 | R51 | **Campos de domínio separado fora de `contact_state` e `v_segment_unified` são avaliados como optimistic (`true`) no worker in-memory; a filtragem definitiva acontece no SQL path via subquery em `eval_condition_v2`.** Extensão operacional de R36: campos 1:N (oportunidades, tickets, etc.) NÃO devem ser denormalizados em `contact_state`. No fast-path do worker (planner/evaluator de jornadas e segmentação), quando o campo não tiver resolver disponível na avaliação in-memory, retornar `true` (optimistic) e deixar o SQL path do `eval_condition_v2` aplicar o filtro real via subquery indexada. Nunca adicionar coluna em `contact_state` para "facilitar" — isso reintroduz o drift entre snapshot stale e regra fresh que motivou R36. **Como identificar violação:** PR adicionando `has_*` ou `*_count` em `contact_state` para resolver gap de avaliação no worker = violação. Caminho correto: criar/ajustar resolver no SQL path. | Sprint de Performance v7.23 — `has_open_opportunity` resolvia false em CRM conditions porque o worker in-memory não conhecia oportunidades; fix correto foi optimistic no worker + subquery no SQL path, não materialização. |
+| R53 | **Trigger enrichment via COUNT in-transaction.** Triggers de jornada podem enriquecer `event_data` com campos derivados na mesma transação SQL (ex: `purchase_sequence_number`). O campo é instantâneo (zero pipeline delay) e determinístico para condition nodes. Usar `party_id` como chave de agregação (party-first). Best-effort sob concorrência (READ COMMITTED — dois inserts simultâneos do mesmo party podem ambos receber sequence=N). | Sprint 19 — purchase_sequence_number |
 
 ---
 
@@ -1285,7 +1286,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D25 | `refresh_tenant_distribution` + tela de monitoramento | Pendente |
 | D26 | trg_record_email_engagement — ✅ Trigger + 4 colunas em contact_state operacionais. | ✅ Done |
 | D27 | UI: novos blocos de condição no segment builder (product picker, time window, CRM condition) | Pendente |
-| D28 | D6 Fase 3 — `DROP COLUMN customer_id`. **Fase 1 ✅ (2026-04-08, v7.25):** 6 colunas zero-data dropadas — `analytics.customer_cluster_assignments`, `analytics.customer_cluster_subgroup_assignments`, `analytics.customer_lookalike_scores`, `core.eduzz_webhook_events`, `eduzz.webhook_events`, `crm.customer_badges`. **Restante (11 entradas):** 8 base tables — `commerce.transactions`, `commerce.archived_transactions`, `journeys.journey_enrollments`, `crm.opportunities`, `crm.customer_tags`, `analytics.lifecycle_events`, `analytics.segment_customers`, `eduzz.buyers`; 3 views — `analytics.v_segment_base`, `analytics.v_segment_leads_base`, `crm.vw_parties_unified`. 5 FKs ativas → `crm.customers` (bridge table, 16.4K rows 100% party_id). 35 funções com "customer" no nome — auditoria necessária antes da Fase 3. **Próximas fases:** Fase 2 (tabelas com party_id 100%: transactions, enrollments, opportunities), Fase 3 (audit das 35 funções + drop FKs → `crm.customers`), Fase 4 (DROP `crm.customers` + rebuild views). | Fase 1 ✅ · Fase 2–4 Pendente |
+| D28 | D6 Fase 3 — `DROP COLUMN customer_id`. **Fase 1 ✅ (2026-04-08, v7.24):** 6 colunas zero-data dropadas — `analytics.customer_cluster_assignments`, `analytics.customer_cluster_subgroup_assignments`, `analytics.customer_lookalike_scores`, `core.eduzz_webhook_events`, `eduzz.webhook_events`, `crm.customer_badges`. **Restante (11 entradas):** 8 base tables — `commerce.transactions`, `commerce.archived_transactions`, `journeys.journey_enrollments`, `crm.opportunities`, `crm.customer_tags`, `analytics.lifecycle_events`, `analytics.segment_customers`, `eduzz.buyers`; 3 views — `analytics.v_segment_base`, `analytics.v_segment_leads_base`, `crm.vw_parties_unified`. 5 FKs ativas → `crm.customers` (bridge table, 16.4K rows 100% party_id). 35 funções com "customer" no nome — auditoria necessária antes da Fase 3. **Próximas fases:** Fase 2 (tabelas com party_id 100%: transactions, enrollments, opportunities), Fase 3 (audit das 35 funções + drop FKs → `crm.customers`), Fase 4 (DROP `crm.customers` + rebuild views). | Fase 1 ✅ · Fase 2–4 Pendente |
 | D29 | Performance loading timeout — ✅ Resolvido (v7.23, Sprint de Performance). `crm.get_dashboard_data` 534ms→17ms (3 lead CTEs colapsados em 1 `COUNT FILTER`); `analytics.get_analytics_data` 4 scans→1 (CTE `base_txn`); `crm.list_parties` reescrito de subqueries correlacionadas para CTEs batch. Novas RPCs: `crm.get_parties_stats(p_tenant_id)` (stats globais separados, staleTime 5min) e `analytics.get_transactions_chart_data(p_tenant_id, p_granularity, p_start_date, p_end_date)` (agregação por período: 26K rows→37 buckets, 22ms). `segment_eval_queue` purgada de 533K erros. Polling -99.8%. Frontend: React Query Persist (IndexedDB, 24h, limpa no logout), connection heartbeat (4min, pausa em tab inativa), prefetch durante auth (dashboard, tags, features), loading progressivo (Campaigns, Segmentation, Forms, Analytics), AccessGate bypass em warm path, dynamic imports −924K bundle, vendor chunks (`@xyflow`, `@tiptap`, `zod`), `useTenantTags` (6 query keys→1), `usePartiesStats` (cache 5min), polling 1s→30s, fix `has_open_opportunity` optimistic no worker + SQL subquery (R51). Rollbacks em `docs/rollback/`. Sentry JAVASCRIPT-REACT-22, 21, 1S fechados. | ✅ Done |
 | D30 | Decompor blocos contact_info e address em traits individuais — hoje kind: 'skip', sem dados reais ainda | Pendente |
 | D31 | Integração Typeform — ✅ Parcial. Schema `typeform.*` implementado (6 tabelas), sync via pull-sync e historical-sync. Pendente: analytics de choice blocks, webhook receiver para ingestão contínua. | Parcial |
@@ -1320,7 +1321,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D-DATA-1-RFM-ACCENT | Acentuação inconsistente em `analytics.contact_state.rfm_segment` em produção: `Clientes Fiéis` (com agudo) coexiste com `Potenciais Fieis` (sem agudo). Outros labels OK. UI replica o estado do banco para preservar igualdade de string no SQL. Resolver junto com D-RFM-LABELS quando enum compartilhado for criado. | **P4** |
 | D-CRON-1 | **Documentar todos os pg_cron jobs em `ARCHITECTURE.md`.** Mandatório (independente de categoria A/B/C/D). Tabela em §11 com jobname, schedule, command resumido, função SQL invocada, categoria, owner. Cron novo daqui pra frente requer entrada nessa tabela antes de ser criado. | ✅ Done (v7.22) |
 | D-CRON-2 | **`rfm-rolling-refresh` migrar para worker no Railway.** Cron some, lógica de sharding (`MOD(HASHTEXT, 24)`) + threshold (20h staleness) vai pro código TS no `journeys-worker` ou novo `analytics-scheduler`. Risco: timing/SLA de RFM crítico — fazer com testes A/B em staging. Bloqueado por: revisar threshold 20h e estratégia de sharding em código antes de migrar. | **P3** |
-| D-CRON-3 | **`segment-eval-fallback` instrumentar.** ✅ **Resolvido (v7.24).** Implementação muito além do "alarme em fallback_log" original: 3-camada Platform Health Observability decoupled (Camada A `event_health_metrics` particionada mensal + RPC `emit_health_metric` + 3 crons categoria A; Camada B view `v_event_driven_health` com tier classification per-tenant baseado em rolling 7d P50/P95/P99; Camada C handler `runEventDrivenHealthCheck` em `journeys-worker` com dedup, recovery silencioso, integração Sentry via `workers/shared/src/sentry.ts` reutilizável). 19 testes unit/integration. R52 estabelece o decoupling como regra para futura observability arquitetural. Pré-requisito de produção: criar Sentry project `workers-railway` e setar `SENTRY_DSN_WORKERS`. Auto-noop sem DSN. | ✅ Done |
+| D-CRON-3 | **`segment-eval-fallback` instrumentar.** ✅ **Resolvido (v7.25).** Implementação muito além do "alarme em fallback_log" original: 3-camada Platform Health Observability decoupled (Camada A `event_health_metrics` particionada mensal + RPC `emit_health_metric` + 3 crons categoria A; Camada B view `v_event_driven_health` com tier classification per-tenant baseado em rolling 7d P50/P95/P99; Camada C handler `runEventDrivenHealthCheck` em `journeys-worker` com dedup, recovery silencioso, integração Sentry via `workers/shared/src/sentry.ts` reutilizável). 19 testes unit/integration. R52 estabelece o decoupling como regra para futura observability arquitetural. Pré-requisito de produção: criar Sentry project `workers-railway` e setar `SENTRY_DSN_WORKERS`. Auto-noop sem DSN. | ✅ Done |
 | D-CRON-4 | **`segment-eval-fallback` migrar para worker.** Após baseline de D-CRON-3 estabelecido, mover loop de tenants para Railway. Cron vira pulse simples ou desaparece se métrica de hits zerar. Bloqueado por: D-CRON-3 + D-SEG-7 (event-driven audit) fechado. | **P3** |
 | D-SEG-12-LOOKALIKE-DIRECT-WRITE | **`src/lib/analyticsStorage.ts:527 createSegmentFromLookalikes`** faz BULK INSERT direto no `analytics.segment_parties` da UI com `source: "customer"` hardcoded — bypassa todas as funções canonical. Para segmentos lookalike (todos os membros são customers por definição) é semanticamente correto, mas é mais um produtor fora do path canonical. Migrar para função SQL canonical (ex: `analytics.create_lookalike_segment_from_scores`) que reuse `apply_segment_membership_diff` para determinar `source` via `party_type` e mantenha audit trail. | **P3** |
 
@@ -1415,41 +1416,24 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 
 # PARTE E — CHANGELOG
 
-## [v7.25] — 2026-04-08
-### D28 Fase 1 — DROP customer_id em 6 tabelas zero-data
+## [v7.26] — 2026-05-01
+### Trigger enrichment — purchase_sequence_number
 
-**Contexto:** diagnóstico de 2026-03-20 listou 17 tabelas/views ainda com coluna `customer_id`. Re-auditoria em 2026-04-08 identificou que 6 dessas tabelas tinham a coluna mas com **zero linhas populadas** — seguro dropar sem backfill nem migração de leitores.
+**`trigger_purchase_journey_event()`** enriquecido com `purchase_sequence_number` no `event_data` do bloco `purchase`. Valor computado via `COUNT(*) + 1` em `commerce.transactions` filtrado por `(tenant_id, party_id, status='paid')` — mesma transação SQL, zero delay, zero dependência do analytics pipeline.
 
-**Tabelas afetadas (6 colunas dropadas):**
-- `analytics.customer_cluster_assignments`
-- `analytics.customer_cluster_subgroup_assignments`
-- `analytics.customer_lookalike_scores`
-- `core.eduzz_webhook_events`
-- `eduzz.webhook_events`
-- `crm.customer_badges`
+**Design:** campo numérico genérico, não boolean. Suporta todos os operadores do Rule Engine: `=`, `>`, `<`, `>=`, `between`. Exemplos: primeira compra (`= 1`), recompra (`> 1`), terceira compra (`= 3`), entre N e M (`between 2 e 5`).
 
-**Procedimento:**
-1. `SELECT COUNT(customer_id)` em cada tabela → todas retornaram 0.
-2. `ALTER TABLE … DROP COLUMN IF EXISTS customer_id` nas 6 tabelas.
-3. Re-query do `information_schema.columns` confirmou 0 ocorrências restantes nas 6.
+**Chave de agregação:** `party_id` (party-first, 100% cobertura em transactions pagas). Índice `idx_transactions_party_id` confirmado — 0.234ms por insert.
 
-**Inventário D28 restante (11 entradas):**
-- **Base tables (8):** `commerce.transactions` (35K rows, 100% `party_id`), `commerce.archived_transactions` (7.9K), `journeys.journey_enrollments` (17, 99.8% `party_id`), `crm.opportunities` (22, 100% `party_id`), `crm.customer_tags` (7), `analytics.lifecycle_events` (9.4K, 5 órfãos), `analytics.segment_customers` (112), `eduzz.buyers` (46).
-- **Views (3):** `analytics.v_segment_base`, `analytics.v_segment_leads_base`, `crm.vw_parties_unified`.
-- **FKs ativas:** 5 → `crm.customers` (bridge table, 16.4K rows 100% party_id).
-- **Funções:** 35 com "customer" no nome — auditoria obrigatória antes da Fase 3.
+**Frontend:** campo `trigger.purchase_sequence_number` registrado em `TRIGGER_FIELD_CATEGORIES` (type: number, label: "Numero da compra (sequencia)").
 
-**Mudanças nos docs:**
-- **D28** atualizada: Fase 1 ✅; restante e roadmap (Fase 2–4) detalhados.
+**Padrão replicável (R53):** Qualquer trigger recorrente pode enriquecer `event_data` com sequence_number via COUNT na mesma transação. Candidatos futuros: `pending_sequence_number` (transaction_pending), `abandonment_sequence_number` (cart_abandonment), `submission_sequence_number` (form_submitted).
 
-**Próximas fases (não executadas nesta sprint):**
-- **Fase 2:** tabelas com `party_id` 100% — `transactions`, `journey_enrollments`, `opportunities` ganham DROP de `customer_id` direto.
-- **Fase 3:** audit das 35 funções com "customer" + drop das 5 FKs → `crm.customers`.
-- **Fase 4:** DROP `crm.customers` + rebuild das 3 views (`v_segment_base`, `v_segment_leads_base`, `vw_parties_unified`).
+**Race condition:** READ COMMITTED permite que dois `paid` simultâneos do mesmo party vejam o mesmo COUNT — ambos recebem sequence=N. Aceito como best-effort (pagamento concorrente do mesmo party é raro).
 
 ---
 
-## [v7.24] — 2026-05-01
+## [v7.25] — 2026-05-01
 ### Platform Health Observability (D-CRON-3) + R52
 
 **Contexto:** D-CRON-3 evoluiu de "alarme simples em `fallback_log`" para a primeira camada de observability arquitetural da plataforma. Princípio guia: instrumentação não pode ficar acoplada ao mecanismo observado — quando D-CRON-4 substituir o cron `segment-eval-fallback` por worker, view e handler permanecem inalterados.
@@ -1487,6 +1471,40 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 **Pendências encadeadas:**
 - D-CRON-4 (migrar `segment-eval-fallback` cron para worker) agora desbloqueado — D-CRON-3 forneceu observability + métrica `fallback_hits` que o substituto deve emitir.
 - D-SEG-7 (event-driven audit) ganha visibility via `event_driven_hits` métrica.
+
+---
+
+## [v7.24] — 2026-04-08
+### D28 Fase 1 — DROP customer_id em 6 tabelas zero-data
+
+**Contexto:** diagnóstico de 2026-03-20 listou 17 tabelas/views ainda com coluna `customer_id`. Re-auditoria em 2026-04-08 identificou que 6 dessas tabelas tinham a coluna mas com **zero linhas populadas** — seguro dropar sem backfill nem migração de leitores.
+
+**Tabelas afetadas (6 colunas dropadas):**
+- `analytics.customer_cluster_assignments`
+- `analytics.customer_cluster_subgroup_assignments`
+- `analytics.customer_lookalike_scores`
+- `core.eduzz_webhook_events`
+- `eduzz.webhook_events`
+- `crm.customer_badges`
+
+**Procedimento:**
+1. `SELECT COUNT(customer_id)` em cada tabela → todas retornaram 0.
+2. `ALTER TABLE … DROP COLUMN IF EXISTS customer_id` nas 6 tabelas.
+3. Re-query do `information_schema.columns` confirmou 0 ocorrências restantes nas 6.
+
+**Inventário D28 restante (11 entradas):**
+- **Base tables (8):** `commerce.transactions` (35K rows, 100% `party_id`), `commerce.archived_transactions` (7.9K), `journeys.journey_enrollments` (17, 99.8% `party_id`), `crm.opportunities` (22, 100% `party_id`), `crm.customer_tags` (7), `analytics.lifecycle_events` (9.4K, 5 órfãos), `analytics.segment_customers` (112), `eduzz.buyers` (46).
+- **Views (3):** `analytics.v_segment_base`, `analytics.v_segment_leads_base`, `crm.vw_parties_unified`.
+- **FKs ativas:** 5 → `crm.customers` (bridge table, 16.4K rows 100% party_id).
+- **Funções:** 35 com "customer" no nome — auditoria obrigatória antes da Fase 3.
+
+**Mudanças nos docs:**
+- **D28** atualizada: Fase 1 ✅; restante e roadmap (Fase 2–4) detalhados.
+
+**Próximas fases (não executadas nesta sprint):**
+- **Fase 2:** tabelas com `party_id` 100% — `transactions`, `journey_enrollments`, `opportunities` ganham DROP de `customer_id` direto.
+- **Fase 3:** audit das 35 funções com "customer" + drop das 5 FKs → `crm.customers`.
+- **Fase 4:** DROP `crm.customers` + rebuild das 3 views (`v_segment_base`, `v_segment_leads_base`, `vw_parties_unified`).
 
 ---
 
@@ -1642,6 +1660,7 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 - **Wait Until Date/Time:** nó wait expandido com 2 modos — `duration` (minutos/horas/dias) e `until_date` (data absoluta + timezone). Quando data já passou, 3 comportamentos via `if_passed`: `execute` (continua imediatamente), `skip_to_next_wait` (pula nós intermediários, registra em `journey_executions`), `exit_journey` (encerra enrollment). `convertLocalToUTC()` via Intl API nativa (Node 18+), sem dependência externa. `findNextWaitOrExit()` com safety limit 50 iterações.
 - **Frontend:** EventEntryConfig expandido (6 event_types). WaitConfig com seletor de tipo, date/time picker, timezone selector (8 opções BR/US/EU), dropdown `if_passed`. ConditionConfig com Dialog popup + SegmentBuilderV2 compact.
 - **Frequency guard default:** alterado de 16h para **0 (desabilitado)**. Opt-in via `EMAIL_FREQUENCY_GUARD_HOURS` env var no Railway.
+- **semanticFieldRegistry fix:** 14 campos adicionados ao `workers/shared/src/segmentation/semanticFieldRegistry.ts` e `executionRegistry.ts` — campos financeiros (`total_revenue`, `frequency`, `monetary`) + 10 trigger fields (`trigger.amount`, `trigger.product_name`, `trigger.payment_type`, etc.). Sincronizado com `workers/analytics/src/segmentation/semanticFieldRegistry.ts` (8 campos financeiros). Fix identificado durante E2E testing — Condition Engine retornava `null` para campos não registrados.
 
 ## [v7.15] — 2026-03-26
 ### Sprint 17 — Automações v2, Etapa 3: Batch, Fairness & Performance
