@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.1a aplicada (Decision API em dry-run + process_purchase_analytics paralelo), aguardando tráfego natural para validar
-**Última atualização:** 2026-05-03 02:40 UTC
-**Quem atualizou:** Claude Code via R-2.1a (D-2026-05-03-01 — quebra R-2.1 em a/b)
+**Fase ativa:** Fase 2, R-2.1b cutover aplicado (process_purchase_analytics agora usa Decision API em enforce). Aguardando tráfego natural para validar.
+**Última atualização:** 2026-05-03 03:00 UTC
+**Quem atualizou:** Claude Code via R-2.1b cutover (Marcio já havia aplicado branch enforce na Decision API + constraint triggered_by em outra sessão)
 
 ## Próximas 3 ações
 
-1. **Validar R-2.1a com tráfego real** — aguardar mínimo 1h, ideal 4–6h, de purchases reais via webhook. Comparar `decision_api_dryrun_log` (producer='process_purchase_analytics') com `segment_eval_queue` (triggered_by='purchase') — esperado delta < 5%, 100% com `segmentation_relevant=true`, drift global mantido em 0.
-2. **R-2.1b** — promover Decision API para enforce em `process_purchase_analytics` após validação OK. Aplicar mutação real via `apply_contact_state_mutation(..., 'enforce')`, desativar path antigo nesse producer. Primeiro cutover.
-3. **R-2.3 a R-2.15** — replicar pattern dryrun-paralelo + cutover para 11 producers restantes (recordTagChange, refreshFeatures, refreshRfm, refreshReactivation, computeClusters, traitProducer, linkProducts, recordFormSubmitted, recordImportAdded, triggers party_type/auto_populate, frontend analyticsStorage).
+1. **Validar R-2.1b com tráfego real** — aguardar purchase real via webhook. Esperado: 1 row em `segment_eval_queue` com `triggered_by='process_purchase_analytics'`, `segmentation_input_version` bumpa, `state_version` NÃO bumpa (Decision API gerencia versões), drift global mantém 0. **Sem** row em `decision_api_dryrun_log` (não é mais dryrun).
+2. **R-2.3** — migrar próximo producer para pattern dry-run+cutover. Candidatos por simplicidade: `recordTagChange` (workers/historical-sync) ou triggers SQL `trigger_auto_populate_contact_state`.
+3. **R-2.4 a R-2.15** — replicar pattern para 10 producers restantes.
 
 ## Bloqueadores ativos
 
@@ -357,8 +357,22 @@ membership recalculation deixa de ser side effect (P4 implementado).
   - Path antigo (Steps 1–4) preservado byte-a-byte
 - 4/4 testes unit ✓ (whitelist sozinha, blacklist sozinha, mistura, enforce error)
 - 6/6 validações de integridade ✓ (chama Decision API, usa dryrun, tem exception isolation, preserva Step 2b, Step 4, acquisition tracking)
-- Aguardando tráfego natural (madrugada de domingo BRT, 0 purchases nos últimos 60min) para Checkpoint final
-- Próximo: Checkpoint validação após N≥1 chamadas reais; depois R-2.1b (cutover enforce)
+- Aguardando tráfego natural (madrugada de domingo BRT, 0 purchases nos últimos 60min) para Checkpoint final do dry-run
+
+**R-2.1b cutover aplicado em 2026-05-03 02:58 UTC:**
+- Marcio aplicou em outra sessão MCP:
+  - Branch ENFORCE em `apply_contact_state_mutation` (UPDATE bumpa `segmentation_input_version` se relevant + `state_updated_at` sempre + INSERT segment_eval_queue se relevant). NÃO bumpa `state_version` legacy (P3 — versão semântica separada)
+  - Migration `r21b_fix_triggered_by_constraint` — constraint check de `segment_eval_queue.triggered_by` estendida para aceitar nomes de producers (process_purchase_analytics, recordTagChange, etc) + `r21b_validation_test`
+  - Validação artificial passou
+- Migration `20260503025832 r21b_cutover_process_purchase_analytics` (aplicada por Claude Code):
+  - Trocou `'dryrun'` → `'enforce'` na chamada à Decision API
+  - Removeu bloco `BEGIN/EXCEPTION WHEN OTHERS` (em enforce, falha = abort transação; silenciar criaria mudança perdida)
+  - Removeu `state_version = ... + 1` do UPSERT branch UPDATE (Decision API gerencia versões)
+  - Removeu Step 3 `INSERT INTO segment_eval_queue` (Decision API enforce já enfileira com `triggered_by='process_purchase_analytics'`)
+  - Mantido: contact_events INSERT, contact_state UPSERT (todos campos de domínio + state_updated_at=now()), contact_product_stats UPSERT, tenant_distribution stale tracking
+  - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
+- 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
+- Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
 
 ## Lições aprendidas (acumulando)
 
