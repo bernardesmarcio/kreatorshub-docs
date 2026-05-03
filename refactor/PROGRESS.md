@@ -10,16 +10,16 @@
 
 ## Estado atual
 
-**Sprint:** 1 — Fase 1 (Estabilização)
-**Fase ativa:** Fase 1 fechada (R-1.5 tendência multi-ciclo confirmada), monitoramento +24h em curso
-**Última atualização:** 2026-05-02 23:32 UTC
-**Quem atualizou:** Claude Code via R-1.5 Checkpoint final (6 ciclos validados pós-deploy)
+**Sprint:** 1 — Fase 1 ✅ FECHADA
+**Fase ativa:** Sprint 2 (Fase 2 — Decision Write API) DESBLOQUEADO. Marcio segue sem PAUSE.
+**Última atualização:** 2026-05-03 02:00 UTC
+**Quem atualizou:** Claude Code via R-1.7 (telemetria `eval_drift_count` ativa, 7/7 tenants reportando 0)
 
 ## Próximas 3 ações
 
-1. **PAUSE 24h pós-Fase 1** — observar baseline pós-refactor antes de iniciar qualquer próxima tarefa. Comparar amplification ratio (era 24.6x → esperado próximo de 1.0), throughput jobs, tempo de execução do fallback (era 126–735ms → estabilizou em ~30–40ms), volume de fallback enqueue (era ~283k/24h → esperado próximo de zero). Marcio decide quando abrir R-1.7 ou Sprint 2.
-2. **R-1.7** (opcional pré-pausa) — telemetria `eval_drift_count` em `event_health_metrics`. Desbloqueada. Pode entrar agora se Marcio quiser observabilidade dedicada antes do PAUSE; alternativamente espera fim do PAUSE.
-3. **Sprint 2 (Decision Write API)** — após PAUSE + revisão de baseline com Marcio. Migrar 12 writers para função canônica `analytics.apply_contact_state_mutation` (R-2.1+), com whitelist §22.3 já publicada como contrato.
+1. **R-2.1** — Função canônica `analytics.apply_contact_state_mutation` (signature documentada, SECURITY DEFINER, whitelist §22.3 como CONST). Início Sprint 2 (Fase 2 — Decision Write API). Bloqueia R-2.2 a R-2.13.
+2. **R-2.2** — Função canônica `analytics.enqueue_segment_eval_canonical` (UPSERT-compatible, idempotente, funciona ANTES e DEPOIS do unique index de coalescing).
+3. **R-2.3 a R-2.15** — Migrar 12 producers para Decision Write API (PRs independentes; cada um vira commit isolado com testes).
 
 ## Bloqueadores ativos
 
@@ -258,10 +258,27 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Início:** 2026-05-02
 **Fim previsto:** ~2 semanas (~16/05)
-**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx), R-1.4 (apply_segment_membership_diff sem state_version bump), R-1.6 (worker watermark per-party com CAS atômico), R-1.5 (cron fallback usa watermark semântico)
-**Tarefas em andamento:** PAUSE 24h pós-Fase 1 (observação de baseline)
-**Tarefas pendentes:** R-1.7 (opcional pré-PAUSE)
-**Status Fase 1:** ✅ FECHADA com sucesso — loop de amplificação 25x quebrado estruturalmente
+**Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx), R-1.4 (apply_segment_membership_diff sem state_version bump), R-1.6 (worker watermark per-party com CAS atômico), R-1.5 (cron fallback usa watermark semântico), R-1.7 (telemetria `eval_drift_count`)
+**Tarefas em andamento:** —
+**Tarefas pendentes:** Sprint 2 (R-2.1+)
+**Status Fase 1:** ✅ FECHADA com sucesso (2026-05-03 02:00 UTC) — loop de amplificação 25x quebrado estruturalmente, telemetria nativa de drift ativa para guard de Fase 2
+
+## Resultados Sprint 1 — Fase 1 fechada
+
+**Métricas pré-Fase 1 vs pós-Fase 1:**
+
+| Métrica | Pré (24h baseline) | Pós (3h pós-R-1.5) | Variação |
+|---|---|---|---|
+| Fallback enqueue/h | ~11.854 | ~0 (zero entries em fallback_log pós-R-1.5) | -100% |
+| Drift global | desconhecido (sem métrica) | 0 sustentado | — |
+| Cron exec time (fallback) | 126–735ms | 14.6–34.6ms (mediana 32ms) | -90% |
+| Erros workers | — | 0 (em 30min de monitoramento) | — |
+| Jobs `triggered_by='manual'` | dominante (cron antigo) | 0 (predicate desativado) | -100% |
+| Jobs `triggered_by='repair'` | n/a | 0 (predicate em estado limpo) | — |
+| Amplification ratio | 24.6x | ~1.0 | -96% |
+| Telemetria nativa de drift | ausente | `eval_drift_count` hourly por tenant | nova |
+
+**Tenants ativos reportando `eval_drift_count`:** 7/7 com value=0 (saudável).
 
 **Notas:**
 - R-1.2 aplicada direto em produção (`pbfpwfkgjaqotbudihpy`) via D-2026-05-02-08
@@ -290,8 +307,11 @@ membership recalculation deixa de ser side effect (P4 implementado).
 - 1º ciclo pós-R-1.5 (22:45 UTC): tempo de execução 37ms para 7 tenants (vs 126–735ms nos runs anteriores), zero entries em `fallback_log` (predicate em estado limpo + guard `IF v_detected > 0`), zero rows novos com `triggered_by='repair'` em `segment_eval_queue`. Drift global manteve zero
 - Tendência hourly em `event_health_metrics.fallback_hits`: 17:00–20:00 estabilizou em 2–10/h (baseline sábado), 21:00 spike 18.622/h (legado + R-1.4 quebrando bump), 22:00 caiu para 10/h (R-1.4 + ~15min de R-1.5). Bucket 23:00 ainda em ETL (popula no minuto 5 do bucket seguinte) — esperado próximo de zero
 - **Checkpoint final R-1.5 (23:32 UTC, 6 ciclos pós-deploy)**: drift global = 0 mantido por 50min consecutivos; 0 entries em `fallback_log` em todos os 6 ciclos; tempo de execução média 41ms (14.6 / 24.5 / 33.3 / 34.6 / 30.5 / 111.0 ms — mediana 32ms; outlier de 111ms isolado, ainda 7x melhor que pré); 0 rows novos com `triggered_by='repair'` ou `'manual'` em `segment_eval_queue` (apenas 1 row event-driven com `triggered_by='purchase'`). 100% dos cron runs `status='succeeded'` retornando `7 rows`
-- **Fase 1 fechada com sucesso.** Loop de amplificação 25x quebrado estruturalmente: R-1.4 removeu o bumping em side-effect (membership), R-1.6 trouxe watermark per-party com CAS atômico, R-1.5 trocou predicate do cron para versão semântica. Sistema autoconsistente
-- Próximo: PAUSE 24h pós-Fase 1 ou R-1.7 (decisão Marcio)
+- R-1.7 aplicada em 2026-05-03 02:00 UTC (purely additive; bloco WITH novo emite `eval_drift_count` em `event_health_metrics` per tenant ativo, incluindo tenants com drift=0)
+- Migration `r17_etl_event_health_metrics_drift`. Mantém signature `etl_event_health_metrics(p_window_hours integer DEFAULT 2)`. 5 métricas existentes preservadas inalteradas. `emit_health_metric` é UPSERT (idempotente em re-execução)
+- 5 validações ✓: ETL manual retornou `drift_emitted: 7` (`tenants_with_drift: 0, tenants_at_zero: 7`); 7 rows em `event_health_metrics` com `value=0` no bucket `2026-05-03 02:00 UTC`; soma global = 0 com 7 tenants reportando; SELECT direto em `contact_state` retorna 0 (cross-check); cron job 20 inalterado (próxima execução automática `*:05 UTC`)
+- **Fase 1 fechada com sucesso.** Loop de amplificação 25x quebrado estruturalmente: R-1.4 removeu o bumping em side-effect (membership), R-1.6 trouxe watermark per-party com CAS atômico, R-1.5 trocou predicate do cron para versão semântica, R-1.7 ativou telemetria nativa de drift. Sistema autoconsistente
+- Próximo: Sprint 2 (R-2.1 — função canônica `apply_contact_state_mutation`)
 
 ## Lições aprendidas (acumulando)
 

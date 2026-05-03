@@ -8,7 +8,10 @@
 
 ---
 
-## Fase 1 — Estabilização
+## Fase 1 — Estabilização ✅ CONCLUÍDA (2026-05-03 02:00 UTC)
+
+> R-1.0 a R-1.7 done. Loop de amplificação 25x quebrado estruturalmente.
+> Telemetria nativa `eval_drift_count` ativa para guard de Fase 2.
 
 ### R-1.0 — Definir whitelist de dimensões em ARCHITECTURE.md (PRÉ-REQUISITO)
 
@@ -247,11 +250,47 @@ Cron continua chamando `run_segment_eval_fallback` — função restaurada com p
 
 ### R-1.7 — Telemetria de drift em event_health_metrics
 
-**Status:** todo (desbloqueada — R-1.6 estável)
+**Status:** done
 **Owner:** Dev (via Claude Code)
-**Estimativa:** 1h
-**Risco:** baixo
-**Bloqueado por:** R-1.5 (executar após para fechar Fase 1 sequencialmente)
+**Concluído em:** 2026-05-03 02:00 UTC
+**Estimativa:** 1h (real: ~20min — purely additive)
+**Risco:** baixo (zero efeito comportamental — só emite uma métrica nova)
+**Bloqueado por:** R-1.5 (done)
+**Bloqueia:** Sprint 2 (Fase 2 — Decision Write API)
+
+**Critérios de aceite (atendidos com escopo mínimo):**
+- ✅ Nova métrica `eval_drift_count` emitida em `event_health_metrics` por tenant ativo
+- ✅ ETL emite 1 row per tenant ativo (incluindo tenants com drift=0, para visualização contínua de saúde)
+- ✅ Bucket atual (`date_trunc('hour', now())`) usado como referência (drift é estado "agora", não aggregate de eventos passados)
+- ⚠️ View `v_event_driven_health` não atualizada — fora do escopo R-1.7 conforme Marcio (Fase 8 R-8.2 quando definirmos thresholds com base em dados reais)
+- ⚠️ Alarmes não criados — fora do escopo R-1.7 (Fase 8)
+
+**Migration aplicada:**
+- `r17_etl_event_health_metrics_drift` (em `pbfpwfkgjaqotbudihpy`)
+
+**Mudanças preservadas (contrato externo):**
+- `etl_event_health_metrics(p_window_hours integer DEFAULT 2)` mesma signature
+- 5 métricas existentes (`fallback_hits`, `event_driven_hits`, `eval_queue_throughput`, `eval_queue_error_rate`, `eval_queue_p95_latency_ms`) preservadas inalteradas
+- `emit_health_metric` é UPSERT (`ON CONFLICT (tenant_id, metric_name, bucket_hour) DO UPDATE`) — re-execução do ETL é idempotente
+- Cron job 20 (`etl-event-health-metrics`, schedule `5 * * * *`) inalterado
+
+**Validações pós-aplicação (Passo 3, 5/5 ✓):**
+1. ✅ ETL manual retornou `drift_emitted: 7`, `drift_breakdown: {tenants_with_drift: 0, tenants_at_zero: 7}`
+2. ✅ 7 rows em `event_health_metrics` com `metric_name='eval_drift_count'`, `value=0`, bucket `2026-05-03 02:00:00+00`
+3. ✅ `SUM(value) = 0`, `tenants_reporting = 7` no bucket atual
+4. ✅ Cross-check com SELECT direto em `contact_state`: `drift_via_query = 0` (bate com soma da métrica)
+5. ✅ Cron job 20 inalterado, continua chamando `analytics.etl_event_health_metrics(2)` — próxima execução automática às `*:05 UTC`
+
+**Tenant_ids reportando drift=0:**
+- `00000000-0000-0000-0000-000000000001`
+- `35047211-dc6c-46dc-9c05-61fc0edc9189`
+- `48ef8a5c-283b-4943-8552-53e8f8e92c3a` (Instituto Socrates)
+- `5c6db7d1-2e24-4000-af38-7825bda2d3d5`
+- `61d64a99-728e-43ff-9a67-ef9547600280`
+- `7659b701-66aa-436b-8706-4d634b020ffe`
+- `fe793fcd-7564-4d7c-b628-12a25e6d6656`
+
+**Plano de rollback (se necessário):** restaurar definição anterior via `CREATE OR REPLACE`. md5 original: `62dadeaa6b4dcd21da9f8f1919b6d0dd`.
 
 **Critérios de aceite:**
 - Nova métrica `eval_drift_count` em `event_health_metrics`
