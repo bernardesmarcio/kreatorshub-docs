@@ -302,22 +302,73 @@ Cron continua chamando `run_segment_eval_fallback` — função restaurada com p
 
 ## Fase 2 — Decision Write API
 
-### R-2.1 — Função analytics.apply_contact_state_mutation
+> **D-2026-05-03-01:** R-2.1 quebrada em a/b para reduzir risco de cutover.
+> R-2.1a (dry-run + 1 producer paralelo) → R-2.1b (enforce no producer migrado).
 
-**Status:** todo
+### R-2.1a — Decision API em dry-run + process_purchase_analytics paralelo
+
+**Status:** done (aplicação) / **aguardando validação com tráfego natural**
 **Owner:** Dev (via Claude Code)
-**Estimativa:** 4h
-**Risco:** médio (define contrato central)
-**Bloqueia:** R-2.2 a R-2.13
+**Concluído em:** 2026-05-03 02:40 UTC (aplicação) — Checkpoint final pendente
+**Estimativa:** 2-3h (real: ~30min com cross-check de definição real)
+**Risco:** baixo (modo dryrun não escreve em contact_state)
+**Bloqueado por:** R-1.7 (done)
+**Bloqueia:** R-2.1b
 
-**Critérios de aceite:**
-- Função criada com signature documentada
-- SECURITY DEFINER, search_path explícito
-- Whitelist de dimensões registrada como CONST no código + documentada em ARCHITECTURE.md
-- Decide bumpa `segmentation_input_version` se dimensão na whitelist
-- Sempre bumpa `state_updated_at`
-- Decide enfileira em `segment_eval_queue` baseado em prioridade
-- Testes unit cobrindo cada combinação de dimension + relevance
+**Critérios de aceite (atendidos):**
+- ✅ Função `analytics.apply_contact_state_mutation(uuid, uuid, text, text[], jsonb, smallint, text)` SECURITY DEFINER com modo `'dryrun'` | `'enforce'`
+- ✅ Helper `analytics.is_segmentation_relevant_dimension(text)` IMMUTABLE PARALLEL SAFE — whitelist canônica em SQL
+- ✅ Tabela `analytics.decision_api_dryrun_log` com TTL 7d via cron categoria A
+- ✅ `process_purchase_analytics` chama Decision API em dryrun **paralelamente** (bloco `BEGIN/EXCEPTION WHEN OTHERS`, não-fatal)
+- ✅ Path antigo de escrita preservado byte-a-byte (definição base = md5 `55fc1f5d0946955e0c18cb96621dd134`)
+- ✅ 4/4 testes unit SQL passing (whitelist, blacklist, mistura, enforce error)
+- ⏸️ Validação produção: aguardando tráfego natural (madrugada de domingo BRT — 0 purchases nos últimos 60min)
+
+**Migrations aplicadas:**
+- `20260503023813 r21a_apply_contact_state_mutation_dryrun`
+- `20260503023928 r21a_process_purchase_analytics_parallel_dryrun`
+
+**Validação imediata (4 testes unit):**
+- ✅ Test 1: `dimensions=[frequency, monetary]` → `segmentation_relevant=true, relevant_dims=[frequency, monetary]`
+- ✅ Test 2: `dimensions=[churn_score, engagement_score]` → `segmentation_relevant=false, relevant_dims=[]`
+- ✅ Test 3: `dimensions=[churn_score, frequency]` → `segmentation_relevant=true, relevant_dims=[frequency]` (filtra blacklist)
+- ✅ Test 4: `mode='enforce'` → RAISE EXCEPTION 'enforce mode not implemented in R-2.1a — wait for R-2.1b'
+
+**Validações de integridade (6/6):**
+- ✅ Função chama Decision API
+- ✅ Usa modo dryrun
+- ✅ Tem EXCEPTION WHEN OTHERS (não-fatal)
+- ✅ Preserva Step 2b (`contact_product_stats`)
+- ✅ Preserva Step 4 (`tenant_distribution` stale)
+- ✅ Preserva acquisition tracking (`first_touch_revenue`, `first_product_id/at`)
+
+**Critérios de validação produção (pendentes):**
+- N ≥ 1 purchase real chamando função em janela de observação
+- `dryrun_calls` cruza com `real_purchase_jobs` (delta < 5%)
+- 100% das chamadas com `segmentation_relevant=true` (parity com whitelist)
+- Drift global mantém zero
+- Zero erros de Decision API em logs Postgres
+
+**Notas de cross-check ao prompt original:**
+- Definição de `process_purchase_analytics` no prompt era simplificada e omitia: `products_sequence`, `first_touch_revenue`, `first_product_id/at`, `acquisition_source/utm/at`, Step 2b `contact_product_stats`, Step 4 `tenant_distribution`, transições de `lifecycle_stage` (cooling/at_risk/churned → active). Aplicação usou definição **real** capturada via MCP, preservando 100% do contrato existente.
+
+### R-2.1b — Promover Decision API para enforce em process_purchase_analytics
+
+**Status:** todo (bloqueada por validação R-2.1a)
+**Owner:** Dev (via Claude Code)
+**Estimativa:** 3-4h
+**Risco:** médio — primeiro cutover real de producer
+**Bloqueado por:** R-2.1a + N≥1h validação com tráfego natural
+
+**Escopo (alto nível, prompt detalhado virá):**
+- Implementar branch ENFORCE em `apply_contact_state_mutation` — UPDATE em `contact_state` aplicando dimensões whitelisted, bumpando `segmentation_input_version` apenas se relevant, sempre bumpando `state_updated_at`, enfileirando em `segment_eval_queue` com prioridade configurável
+- Migrar `process_purchase_analytics` para `mode='enforce'` (deletar bloco dryrun, deletar Steps 1–4 antigos, delegar tudo para Decision API)
+- Backup `process_purchase_analytics__pre_decision_api_2026_05` para rollback fiel
+- Validação: comparar contact_state mutations antes/depois, drift global mantido em 0
+
+### R-2.1 (legado — superseded by R-2.1a/b — manter referência)
+
+**Status:** superseded (D-2026-05-03-01)
 
 ### R-2.2 — Função analytics.enqueue_segment_eval_canonical
 

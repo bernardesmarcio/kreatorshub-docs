@@ -10,16 +10,16 @@
 
 ## Estado atual
 
-**Sprint:** 1 — Fase 1 ✅ FECHADA
-**Fase ativa:** Sprint 2 (Fase 2 — Decision Write API) DESBLOQUEADO. Marcio segue sem PAUSE.
-**Última atualização:** 2026-05-03 02:00 UTC
-**Quem atualizou:** Claude Code via R-1.7 (telemetria `eval_drift_count` ativa, 7/7 tenants reportando 0)
+**Sprint:** 2 — Fase 2 (Decision Write API)
+**Fase ativa:** Fase 2, R-2.1a aplicada (Decision API em dry-run + process_purchase_analytics paralelo), aguardando tráfego natural para validar
+**Última atualização:** 2026-05-03 02:40 UTC
+**Quem atualizou:** Claude Code via R-2.1a (D-2026-05-03-01 — quebra R-2.1 em a/b)
 
 ## Próximas 3 ações
 
-1. **R-2.1** — Função canônica `analytics.apply_contact_state_mutation` (signature documentada, SECURITY DEFINER, whitelist §22.3 como CONST). Início Sprint 2 (Fase 2 — Decision Write API). Bloqueia R-2.2 a R-2.13.
-2. **R-2.2** — Função canônica `analytics.enqueue_segment_eval_canonical` (UPSERT-compatible, idempotente, funciona ANTES e DEPOIS do unique index de coalescing).
-3. **R-2.3 a R-2.15** — Migrar 12 producers para Decision Write API (PRs independentes; cada um vira commit isolado com testes).
+1. **Validar R-2.1a com tráfego real** — aguardar mínimo 1h, ideal 4–6h, de purchases reais via webhook. Comparar `decision_api_dryrun_log` (producer='process_purchase_analytics') com `segment_eval_queue` (triggered_by='purchase') — esperado delta < 5%, 100% com `segmentation_relevant=true`, drift global mantido em 0.
+2. **R-2.1b** — promover Decision API para enforce em `process_purchase_analytics` após validação OK. Aplicar mutação real via `apply_contact_state_mutation(..., 'enforce')`, desativar path antigo nesse producer. Primeiro cutover.
+3. **R-2.3 a R-2.15** — replicar pattern dryrun-paralelo + cutover para 11 producers restantes (recordTagChange, refreshFeatures, refreshRfm, refreshReactivation, computeClusters, traitProducer, linkProducts, recordFormSubmitted, recordImportAdded, triggers party_type/auto_populate, frontend analyticsStorage).
 
 ## Bloqueadores ativos
 
@@ -191,6 +191,33 @@ tarefa (criar/usar/deletar em horas, não semanas).
 
 **Custo evitado:** ~$28 USD + 12 semanas de overhead operacional.
 
+### D-2026-05-03-01 — Quebrar R-2.1 em a/b para reduzir risco de cutover
+
+**Contexto:** R-2.1 monolítica criaria Decision API e migraria producers numa
+PR só. Risco "tudo ou nada" em hot path de ingestion (process_purchase_analytics
+é chamada via webhook de e-commerce em produção).
+
+**Decisão:** quebrar em três passos sequenciais:
+- **R-2.1a:** Decision API existe em modo `'dryrun'` (default) — registra
+  decisão em `decision_api_dryrun_log` sem escrever em `contact_state`. Modo
+  `'enforce'` levanta exceção (não implementado). 1 producer
+  (`process_purchase_analytics`) chama API em paralelo via bloco
+  `BEGIN/EXCEPTION WHEN OTHERS` (não-fatal).
+- **R-2.1b:** promover Decision API para `'enforce'` no producer migrado.
+  Path antigo de escrita em `contact_state` desativado para
+  `process_purchase_analytics`. Cutover validado.
+- **R-2.3 a R-2.15:** replicar pattern (dryrun → enforce) para outros 11
+  producers, 1 PR por producer.
+
+**Justificativa:**
+- Modo dryrun permite comparar "o que API faria" vs realidade sem risco
+- Cutover por producer = blast radius limitado (1 producer falha → 11 íntegros)
+- Decision API construída em camadas (whitelist como SQL fn IMMUTABLE,
+  helper function, log table com TTL 7d) facilita evolução incremental
+
+**Custo:** +1 dia no Sprint 2 vs originalmente planejado.
+**Benefício:** zero risco de quebrar ingestion durante validação.
+
 ### D-2026-05-02-10 — Inverter ordem R-1.5 ↔ R-1.6 (worker antes do cron)
 
 **Contexto:** plano original tinha R-1.5 (predicate cron usa watermark) antes de
@@ -312,6 +339,26 @@ membership recalculation deixa de ser side effect (P4 implementado).
 - 5 validações ✓: ETL manual retornou `drift_emitted: 7` (`tenants_with_drift: 0, tenants_at_zero: 7`); 7 rows em `event_health_metrics` com `value=0` no bucket `2026-05-03 02:00 UTC`; soma global = 0 com 7 tenants reportando; SELECT direto em `contact_state` retorna 0 (cross-check); cron job 20 inalterado (próxima execução automática `*:05 UTC`)
 - **Fase 1 fechada com sucesso.** Loop de amplificação 25x quebrado estruturalmente: R-1.4 removeu o bumping em side-effect (membership), R-1.6 trouxe watermark per-party com CAS atômico, R-1.5 trocou predicate do cron para versão semântica, R-1.7 ativou telemetria nativa de drift. Sistema autoconsistente
 - Próximo: Sprint 2 (R-2.1 — função canônica `apply_contact_state_mutation`)
+
+### Sprint 2 — Fase 2 Decision Write API (em andamento)
+
+**Início:** 2026-05-03 02:30 UTC (sem PAUSE pós-Fase 1, Marcio aprovou)
+**Fim previsto:** ~10 dias
+
+**R-2.1a aplicada em 2026-05-03 02:40 UTC:**
+- Migration `20260503023813 r21a_apply_contact_state_mutation_dryrun`:
+  - Função `analytics.apply_contact_state_mutation(uuid, uuid, text, text[], jsonb, smallint, text)` SECURITY DEFINER, modo `'dryrun'` (default) | `'enforce'` (RAISE EXCEPTION)
+  - Helper `analytics.is_segmentation_relevant_dimension(text)` IMMUTABLE PARALLEL SAFE — whitelist canônica em SQL (espelha §22.3)
+  - Tabela `analytics.decision_api_dryrun_log` com 2 índices (party + producer) e TTL 7d
+  - Função `analytics.purge_decision_api_dryrun_log()` SECURITY DEFINER + cron job 23 (`purge-decision-api-dryrun-log`, schedule `15 3 * * *`, categoria A R50)
+- Migration `20260503023928 r21a_process_purchase_analytics_parallel_dryrun`:
+  - Definição base = produção atual (md5 `55fc1f5d0946955e0c18cb96621dd134`) — não a versão simplificada do prompt original (que omitia `products_sequence`, `first_touch_revenue`, `acquisition_*`, Step 2b `contact_product_stats`, Step 4 `tenant_distribution`)
+  - Adicionado bloco `BEGIN/EXCEPTION WHEN OTHERS` no início chamando `apply_contact_state_mutation(..., 'dryrun')` (não-fatal, RAISE WARNING em falha)
+  - Path antigo (Steps 1–4) preservado byte-a-byte
+- 4/4 testes unit ✓ (whitelist sozinha, blacklist sozinha, mistura, enforce error)
+- 6/6 validações de integridade ✓ (chama Decision API, usa dryrun, tem exception isolation, preserva Step 2b, Step 4, acquisition tracking)
+- Aguardando tráfego natural (madrugada de domingo BRT, 0 purchases nos últimos 60min) para Checkpoint final
+- Próximo: Checkpoint validação após N≥1 chamadas reais; depois R-2.1b (cutover enforce)
 
 ## Lições aprendidas (acumulando)
 
