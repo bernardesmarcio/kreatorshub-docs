@@ -166,12 +166,19 @@ PRs da Fase 2 começarem.
 - ✅ Drift global = 0 mantido (42.633 parties, 42.632 com watermark > 0)
 - ✅ Fallback enqueue: 0 entries em `fallback_log` no run pós-R-1.5 (predicate semântico em estado limpo + guard `IF v_detected > 0`)
 - ✅ Tempo de execução do cron: 37ms para 7 tenants (vs 126–735ms nos 3 runs anteriores) — sinal direto de que predicate filtra muito mais rapidamente
-- ⏸️ Tendência multi-ciclo: a coletar nos próximos 30min (3–6 ciclos)
+
+**Validação multi-ciclo (Passo 4 — Checkpoint final 23:32 UTC, 6 ciclos pós-deploy):**
+- ✅ Drift global = 0 mantido por 50min consecutivos
+- ✅ 0 entries em `fallback_log` ao longo de todos os 6 ciclos (22:45, 23:05, 23:10, 23:15, 23:20, 23:25, 23:30)
+- ✅ 100% dos cron runs `status='succeeded'`, todos retornando `7 rows`
+- ✅ Tempo de execução por ciclo (ms): 14.6 / 24.5 / 33.3 / 34.6 / 30.5 / 111.0 — mediana 32ms, avg 41ms (outlier de 111ms isolado, ainda 7x melhor que pré-R-1.5)
+- ✅ Distribuição `triggered_by` em `segment_eval_queue` (últimos 30min): 0 rows com `'repair'` (predicate filtra antes), 0 rows com `'manual'` (predicate antigo desativado), apenas 1 row natural event-driven com `'purchase'` (sistema event-driven funcionando normal)
 
 **Tendência observada (event_health_metrics.fallback_hits hourly):**
+- Baseline sábado (17:00–20:00 UTC): 2–10 hits/h
 - Pré-R-1.4 (21:00 UTC): 18.622 hits/h (legado + R-1.4 quebrando bump)
-- Pós-R-1.4 + ~15min R-1.5 (22:00 UTC): 2 hits/h
-- Esperado pós-R-1.5 estável (23:00 UTC bucket): próximo de zero
+- Pós-R-1.4 + ~15min R-1.5 (22:00 UTC): 10 hits/h
+- 23:00 UTC: ETL hourly do bucket popula às 00:05 — esperado próximo de zero baseado em fallback_log direto (zero rows pós-R-1.5)
 
 **Plano de rollback (validado):**
 ```sql

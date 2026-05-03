@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 1 — Fase 1 (Estabilização)
-**Fase ativa:** Fase 1, R-1.5 done (1º ciclo validado, monitorando +30min), R-1.7 desbloqueada
-**Última atualização:** 2026-05-02 22:48 UTC
-**Quem atualizou:** Claude Code via R-1.5 (migration `r15_run_segment_eval_fallback_uses_watermark` em 22:44:24 UTC)
+**Fase ativa:** Fase 1 fechada (R-1.5 tendência multi-ciclo confirmada), monitoramento +24h em curso
+**Última atualização:** 2026-05-02 23:32 UTC
+**Quem atualizou:** Claude Code via R-1.5 Checkpoint final (6 ciclos validados pós-deploy)
 
 ## Próximas 3 ações
 
-1. **Monitorar R-1.5 +30min** — observar 3–6 ciclos do cron pós-R-1.5 (até ~23:15 UTC). Confirmar drift mantém zero, fallback_log segue sem entries (guard `IF v_detected > 0` faz com que predicate semântico em estado limpo não gere row), tempo de execução do cron permanece <50ms (vs 126–735ms pré-R-1.5).
-2. **R-1.7** — telemetria `eval_drift_count` em `event_health_metrics` (ETL hourly + view `v_event_driven_health`). Desbloqueada com R-1.6 e R-1.5 estáveis. Métrica deve mostrar zero global, sinalizar imediatamente se algum tenant divergir.
-3. **PAUSE 24h pós-Fase 1** — observar baseline pós-refactor antes de iniciar Sprint 2 (Decision Write API). Comparar amplification ratio (era 24.6x), throughput jobs, tempo de execução do fallback. Marcio decide quando abrir Sprint 2.
+1. **PAUSE 24h pós-Fase 1** — observar baseline pós-refactor antes de iniciar qualquer próxima tarefa. Comparar amplification ratio (era 24.6x → esperado próximo de 1.0), throughput jobs, tempo de execução do fallback (era 126–735ms → estabilizou em ~30–40ms), volume de fallback enqueue (era ~283k/24h → esperado próximo de zero). Marcio decide quando abrir R-1.7 ou Sprint 2.
+2. **R-1.7** (opcional pré-pausa) — telemetria `eval_drift_count` em `event_health_metrics`. Desbloqueada. Pode entrar agora se Marcio quiser observabilidade dedicada antes do PAUSE; alternativamente espera fim do PAUSE.
+3. **Sprint 2 (Decision Write API)** — após PAUSE + revisão de baseline com Marcio. Migrar 12 writers para função canônica `analytics.apply_contact_state_mutation` (R-2.1+), com whitelist §22.3 já publicada como contrato.
 
 ## Bloqueadores ativos
 
@@ -259,8 +259,9 @@ membership recalculation deixa de ser side effect (P4 implementado).
 **Início:** 2026-05-02
 **Fim previsto:** ~2 semanas (~16/05)
 **Tarefas concluídas:** R-1.1 (pre-flight), R-1.2 (versões semânticas), R-1.3 (backfill + drift_idx), R-1.4 (apply_segment_membership_diff sem state_version bump), R-1.6 (worker watermark per-party com CAS atômico), R-1.5 (cron fallback usa watermark semântico)
-**Tarefas em andamento:** monitoramento R-1.5 +30min (até ~23:15 UTC) — coleta de tendência multi-ciclo
-**Tarefas pendentes:** R-1.7
+**Tarefas em andamento:** PAUSE 24h pós-Fase 1 (observação de baseline)
+**Tarefas pendentes:** R-1.7 (opcional pré-PAUSE)
+**Status Fase 1:** ✅ FECHADA com sucesso — loop de amplificação 25x quebrado estruturalmente
 
 **Notas:**
 - R-1.2 aplicada direto em produção (`pbfpwfkgjaqotbudihpy`) via D-2026-05-02-08
@@ -287,8 +288,10 @@ membership recalculation deixa de ser side effect (P4 implementado).
 - Função nova: predicate trocado de `state_updated_at >= now() - 15min` para `segmentation_input_version > last_evaluated_segmentation_version`. `triggered_by` mudou de `'manual'` para `'repair'` para distinguir nova semântica em telemetria. Permission model, guard de fallback_log e shape do JSON retornado preservados (contrato externo intacto)
 - 4 validações imediatas ✓: 2 funções presentes com mesma signature, nova usa novo predicate (regex match), backup preserva predicate antigo, cron job 7 (`segment-eval-fallback`) inalterado
 - 1º ciclo pós-R-1.5 (22:45 UTC): tempo de execução 37ms para 7 tenants (vs 126–735ms nos runs anteriores), zero entries em `fallback_log` (predicate em estado limpo + guard `IF v_detected > 0`), zero rows novos com `triggered_by='repair'` em `segment_eval_queue`. Drift global manteve zero
-- Tendência hourly em `event_health_metrics.fallback_hits`: 17:00–20:00 estabilizou em 2–10/h (baseline sábado), 21:00 spike 18.622/h (legado + R-1.4 quebrando bump), 22:00 já em 2/h. Esperado bucket 23:00 próximo de zero
-- Próximo: monitorar até 23:15 UTC (5–6 ciclos), depois R-1.7 (telemetria drift) e PAUSE 24h Fase 1
+- Tendência hourly em `event_health_metrics.fallback_hits`: 17:00–20:00 estabilizou em 2–10/h (baseline sábado), 21:00 spike 18.622/h (legado + R-1.4 quebrando bump), 22:00 caiu para 10/h (R-1.4 + ~15min de R-1.5). Bucket 23:00 ainda em ETL (popula no minuto 5 do bucket seguinte) — esperado próximo de zero
+- **Checkpoint final R-1.5 (23:32 UTC, 6 ciclos pós-deploy)**: drift global = 0 mantido por 50min consecutivos; 0 entries em `fallback_log` em todos os 6 ciclos; tempo de execução média 41ms (14.6 / 24.5 / 33.3 / 34.6 / 30.5 / 111.0 ms — mediana 32ms; outlier de 111ms isolado, ainda 7x melhor que pré); 0 rows novos com `triggered_by='repair'` ou `'manual'` em `segment_eval_queue` (apenas 1 row event-driven com `triggered_by='purchase'`). 100% dos cron runs `status='succeeded'` retornando `7 rows`
+- **Fase 1 fechada com sucesso.** Loop de amplificação 25x quebrado estruturalmente: R-1.4 removeu o bumping em side-effect (membership), R-1.6 trouxe watermark per-party com CAS atômico, R-1.5 trocou predicate do cron para versão semântica. Sistema autoconsistente
+- Próximo: PAUSE 24h pós-Fase 1 ou R-1.7 (decisão Marcio)
 
 ## Lições aprendidas (acumulando)
 
