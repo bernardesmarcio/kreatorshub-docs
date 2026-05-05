@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.6 aplicado (refreshReactivation usa Decision API batch em 2 escopos). **Sprint 2 milestone — 3/3 producers bulk migrados.** 5 producers totais. Aguardando deploy + job manual de validação.
+**Fase ativa:** Fase 2, **MILESTONE 2026-05-05: Producers bulk completos (3/3)**. R-2.6 validado em produção (job 42s, 5.044 jobs `triggered_by='refreshReactivation'`, fields_changed=`{reactivation_priority}`, 0 errors). 5/12 producers migrados. Standby para R-2.7 (single-row).
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.6 cutover
+**Quem atualizou:** Claude Code via R-2.6 close + milestone Sprint 2 bulk
 
 ## Próximas 3 ações
 
-1. **Validar R-2.6 em produção** — job manual `refresh_reactivation` deve completar em <30s, gerar 2 batches em `segment_eval_queue` (cleaner pequeno + UPSERT principal) com `triggered_by='refreshReactivation'`, drift drenar em <5min, 0 errors.
-2. **R-3.2** — UNIQUE INDEX parcial coalescente em `segment_eval_queue (tenant_id, party_id) WHERE status='pending'` + UPSERT mesclando `fields_changed`. Resolve naturalmente o 2x jobs/party da orquestração refreshFeatures→refreshRfm (D-2026-05-05-05) e o 2x do próprio R-2.6 (cleaner + UPSERT no mesmo cron run).
-3. **R-2.7+** — producers single-row restantes (`linkProducts`, `traitProducer`, `computeClusters`, etc) — pattern R-2.3.
+1. **R-2.7** — `recordFormSubmitted` (workers/historical-sync/src/handlers/webhook/analytics-events.ts:104) — pattern R-2.3 (single-row).
+2. **R-2.8 a R-2.14** — producers single-row restantes: `recordImportAdded`, `traitProducer`, `linkProducts`, `computeClusters`, `computeClusterSubgroups`, `syncPartyType`, `autoPopulateContactState` — pattern R-2.3.
+3. **R-3.2** (paralelo possível) — UNIQUE INDEX parcial coalescente em `segment_eval_queue (tenant_id, party_id) WHERE status='pending'` + UPSERT mesclando `fields_changed`. Resolve 2x jobs/party de R-2.5 (orquestração refreshFeatures→refreshRfm, D-2026-05-05-05) e R-2.6 (cleaner + UPSERT no mesmo cron run).
 
 ## Bloqueadores ativos
 
@@ -555,6 +555,33 @@ nesse nível.
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
 
+**MILESTONE 2026-05-05: Producers bulk completos (3/3)**
+
+Sprint 2 atinge marco intermediário com a migração dos 3 producers bulk
+do worker analytics para o pattern Decision API batch. Os 3 producers
+juntos representam o maior volume de escrita em `contact_state` por
+ciclo (cron `rfm-rolling-refresh` hourly):
+
+| Producer | R-* | Volume típico | Atomicidade | Bug latente fechado |
+|---|---|---|---|---|
+| `refreshRfm` | R-2.4 | ~9k parties/cron, 5.5s avg/job | per-chunk (1000) | mudanças RFM nunca enfileiravam eval |
+| `refreshFeatures` | R-2.5 | ~10k parties/cron, 16s avg/job | per-chunk (500) | features de domínio (frequency/monetary/recency_days, base do RFM) não enfileiravam eval |
+| `refreshReactivation` | R-2.6 | ~5k parties/cron, 3.8-42s avg/job | per-chunk (1000) + cleaner | UPSERT scoring + cleaner setando NULL não enfileiravam eval |
+
+**Stats acumulativas pós-MILESTONE (2026-05-05):**
+- **5/12 producers migrados** para Decision Write API:
+  - `process_purchase_analytics` (SQL fn, R-2.1b)
+  - `recordTagChange` (single-row, R-2.3)
+  - `refreshRfm` (bulk, R-2.4)
+  - `refreshFeatures` (bulk, R-2.5)
+  - `refreshReactivation` (bulk, R-2.6)
+- **Decision API batch validada com 3 producers diferentes** — pattern provado, sem casos edge não-cobertos
+- **0 erros funcionais em ~24h de operação** dos producers migrados (process_purchase_analytics rodando em enforce desde 2026-05-03 02:58 UTC; bulks desde 2026-05-04/05)
+- **~95k jobs processados** no agregado pós-R-2.4 (refreshRfm 79.688 + refreshFeatures 10.304 + refreshReactivation 5.044 + tag changes/purchases incrementais)
+- Pattern bulk producer estabelecido com 2 variantes:
+  - **per-chunk com `sql.begin()` + Decision API batch** (R-2.4, R-2.5, R-2.6 escopo 1)
+  - **transação única com Decision API batch após UPDATE+RETURNING** (R-2.6 escopo 2 — cleaner)
+
 **R-2.6 aplicado em 2026-05-05:**
 - `workers/analytics/src/handlers/refreshReactivation.ts` migrado em **2 escopos** (mesmo handler tinha 2 write paths em dimensão whitelisted):
   - **Escopo 1 — UPSERT principal (linhas 245-274 pós-patch):** loop por chunk de 1000 (`UPSERT_CHUNK_SIZE`), envolto em `sql.begin()` com Decision API batch
@@ -568,7 +595,12 @@ nesse nível.
 - Sem mudança em: cálculo de scoring/percentRanks, `lifecycle_events` insert (try/catch best-effort), `tenant_processing_state` UPSERT, orquestração `refresh_segments` no fim
 - Validação local: typecheck ✓, build ✓, vitest 55/55 ✓
 - **Sprint 2 milestone — 3/3 producers bulk migrados:** refreshRfm (R-2.4), refreshFeatures (R-2.5), refreshReactivation (R-2.6) ✅
-- Próximo: validar em produção + R-2.7+ (producers single-row)
+- **Validação produção (commit `6fa8abe`, deploy 2026-05-05):**
+  - Job manual `refresh_reactivation` completou em **42s**, 0 errors
+  - **5.044 jobs** com `triggered_by='refreshReactivation'` enfileirados
+  - `fields_changed = '{reactivation_priority}'` (1 dimensão única, validado via MCP)
+  - Drift drenando normalmente conforme worker R-1.6 libera capacidade
+- Próximo: R-2.7+ (producers single-row)
 
 **R-2.5 aplicado em 2026-05-05:**
 - `workers/analytics/src/handlers/refreshFeatures.ts` (linhas 167-189) → migrado para Decision API batch (pattern R-2.4)
