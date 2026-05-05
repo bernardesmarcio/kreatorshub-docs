@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.7 aplicado (recordFormSubmitted usa Decision API single em enforce). 6/12 producers migrados (3 single-row + 3 bulk). Aguardando deploy + tráfego natural / teste manual.
+**Fase ativa:** Fase 2, R-2.8 aplicado (recordImportAdded usa Decision API single em enforce). 7/12 producers migrados (4 single-row + 3 bulk). R-2.7 e R-2.8 em validação assíncrona (volume baixo).
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.7 cutover
+**Quem atualizou:** Claude Code via R-2.8 cutover
 
 ## Próximas 3 ações
 
-1. **Validar R-2.7 em produção** — próxima form submission real (ou teste manual via webhook simulado) deve produzir job em `segment_eval_queue` com `triggered_by='recordFormSubmitted'` (não mais `'form_submitted'`). Volume baixo (~2/dia), pode levar até 24h pra tráfego natural.
-2. **R-2.8** — `recordImportAdded` (mesmo arquivo `analytics-events.ts:170`, pattern idêntico R-2.3/R-2.7).
-3. **R-2.9 a R-2.14** — producers single-row restantes (`traitProducer`, `linkProducts`, `computeClusters`, `computeClusterSubgroups`, `syncPartyType`, `autoPopulateContactState`).
+1. **R-2.9** — `traitProducer` (workers/analytics/src/segmentation/traitProducer.ts) — pattern R-2.3 ou bulk dependendo da estrutura.
+2. **R-2.10 a R-2.14** — producers single-row restantes: `linkProducts`, `computeClusters`, `computeClusterSubgroups`, `syncPartyType`, `autoPopulateContactState`.
+3. **Validar R-2.7 + R-2.8 em produção** (assíncrono) — tráfego natural produz jobs com `triggered_by='recordFormSubmitted'` / `'recordImportAdded'`. Volume muito baixo (~2/dia + 0/7d via legacy), pode demorar dias.
 
 ## Bloqueadores ativos
 
@@ -554,6 +554,25 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.8 aplicado em 2026-05-05:**
+- `workers/historical-sync/src/handlers/webhook/analytics-events.ts:169` → `recordImportAdded` migrado para Decision API single em enforce (pattern R-2.3/R-2.7)
+- Path antigo removido:
+  - `state_version = state_version + 1` no UPDATE de `import_ids`
+  - `INSERT INTO analytics.segment_eval_queue (...) VALUES (..., 'import_added', ..., 6)` direto
+- Path novo:
+  - UPDATE de domínio (`import_ids`, `state_updated_at = now()`) preservado
+  - `analytics.apply_contact_state_mutation(..., 'recordImportAdded', ARRAY['import_ids'], payload, 6, 'enforce')` chamado após o UPDATE
+  - **Priority=6 preservada** (background batch, vs interação ativa do `recordFormSubmitted`=5)
+  - Bloco envolvido em `sql.begin()` — atomicidade ampla (record_contact_event + UPDATE + Decision API)
+  - try/catch externo removido (D-2026-05-03-02)
+- `record_contact_event` (auditoria) preservado dentro da mesma transação
+- 1 dimensão real: `import_ids`. `acquisition_source`/`acquisition_campaign_id` estão na whitelist mas producer **não toca** essas colunas — não passados (mesmo princípio R-2.5)
+- `triggered_by`: `'import_added'` → `'recordImportAdded'` (constraint já aceita desde R-2.1b)
+- Validação local: `npm run typecheck` ✓, `npm run build` ✓ no worker historical-sync
+- **7/12 producers migrados:** process_purchase_analytics, recordTagChange, refreshRfm, refreshFeatures, refreshReactivation, recordFormSubmitted, recordImportAdded
+- Volume muito baixo (0 jobs/7d via legacy `'import_added'`) — validação produção via tráfego natural ou import manual
+- Próximo: R-2.9 (traitProducer)
 
 **R-2.7 aplicado em 2026-05-05:**
 - `workers/historical-sync/src/handlers/webhook/analytics-events.ts:105` → `recordFormSubmitted` migrado para Decision API single em enforce (pattern R-2.3)
