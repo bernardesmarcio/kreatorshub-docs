@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.4.1 fechado pós cross-check via MCP (path v2 já cobria operators; path legacy já patchado em d460945). Threshold slow_job ajustado 200ms → 1500ms (sinal/ruído). Aguardando push + deploy Railway. Standby para R-2.5.
+**Fase ativa:** Fase 2, R-2.5 aplicado (refreshFeatures usa Decision API batch). 4 producers migrados (process_purchase_analytics + recordTagChange + refreshRfm + refreshFeatures). Aguardando deploy Railway + cron rfm-rolling-refresh para validar R-2.5.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.4.1 inspeção final + threshold fix
+**Quem atualizou:** Claude Code via R-2.5 cutover
 
 ## Próximas 3 ações
 
-1. **Push commit 0a9c50e (threshold)** — disparar deploy worker analytics. Após deploy, warning slow_job vira top 5% outliers reais (de 100% ruído).
-2. **R-2.5** — `refreshFeatures` (mesmo gap latente, mesmo pattern bulk de R-2.4).
-3. **R-2.6** — `refreshReactivation` (mesmo gap latente, mesmo pattern bulk).
+1. **Validar R-2.5 com cron run real** — após deploy, próximo `rfm-rolling-refresh` (`0 * * * *`) deve enfileirar `refresh_features` → orquestração → `refresh_rfm`. Esperado: N jobs em `segment_eval_queue` com `triggered_by='refreshFeatures'`, drift global pico → 0 em <10min, avg_ms_processing < 2000ms, zero erros nos logs Railway.
+2. **R-2.6** — `refreshReactivation` (mesmo gap latente, mesmo pattern bulk).
+3. **R-2.7+** — producers restantes do roadmap (`linkProducts`, `traitProducer`, `computeClusters`, etc).
 
 ## Bloqueadores ativos
 
@@ -266,6 +266,37 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
 
+### D-2026-05-05-04 — refreshFeatures escreve state_updated_at redundante com Decision API
+
+**Contexto:** durante R-2.5 (migração `refreshFeatures` → Decision API batch),
+escolha consciente de **manter** `state_updated_at = EXCLUDED.state_updated_at`
+no UPSERT do producer (linhas 173, 187 do `refreshFeatures.ts`),
+mesmo a Decision API batch (`apply_contact_state_mutation_batch`)
+também bumpando esse campo internamente.
+
+**Por quê não removi agora:** preservar comportamento existente reduz blast
+radius do patch. Diff fica focado em "adicionar Decision API" sem mexer
+em escrita de domínio. Resultado final é o último timestamp gravado,
+sem race condition porque ambas as escritas estão na mesma transação
+(`sql.begin`).
+
+**Por que viola P1 (single writer per state column):** P1 é sobre dimensões
+de domínio. `state_updated_at` é metadado de cache invalidation, não
+dimensão segmentation-relevant. Mas o ideal canônico é que **só** a
+Decision API toque esse campo, mantendo consistência com R-2.3
+(`recordTagChange`) onde o producer só seta dimensões de domínio.
+
+**Decisão:** registrar como débito menor; **não** bloqueia roadmap.
+Remover `state_updated_at` do UPSERT em sprint futura quando todos
+producers bulk (R-2.4 refreshRfm já é canonical, R-2.5 refreshFeatures
+agora, R-2.6 refreshReactivation pendente) usarem Decision API
+exclusivamente para versões/metadados.
+
+**Custo evitado agora:** zero (mudança trivial, mas escolha consciente
+de minimizar diff).
+**Custo futuro:** ~30min de cleanup quando os 3 bulk producers estiverem
+migrados.
+
 ### D-2026-05-05-03 — Coexistência de 2 evaluators (legacy + v2)
 
 **Contexto:** durante R-2.4.1, mapeamento completo dos paths de avaliação
@@ -484,6 +515,19 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.5 aplicado em 2026-05-05:**
+- `workers/analytics/src/handlers/refreshFeatures.ts` (linhas 167-189) → migrado para Decision API batch (pattern R-2.4)
+- Atomicidade per-chunk via `sql.begin()` (chunks de 500, `CHUNK_SIZE`)
+- 10 dimensões reais passadas: `total_purchases, total_revenue, avg_order_value, distinct_products, recency_days, frequency, monetary, last_purchase_at, first_product_at, bought_product_ids` (whitelist §22.3 validada via MCP)
+- Excluídas: `days_since_first_purchase` (não está na whitelist), `state_updated_at` (metadado, não dimensão), `first_product_id` (na whitelist mas producer não toca essa coluna)
+- Priority=6 (mesmo de R-2.4)
+- **Bug latente fechado:** refreshFeatures atualiza features de domínio (frequency, monetary, recency_days — base do RFM) que nunca enfileiravam eval. Compensação histórica vinha do orquestrado `refresh_rfm` (também sem enqueue até R-2.4) → drift permanente.
+- Sem mudança em: cálculo de features, fix orphan transactions, time budget, logs, `tenant_processing_state`, orquestração `refresh_rfm` no fim
+- `state_updated_at` no UPSERT preservado (D-2026-05-05-04 — débito menor de redundância)
+- Validação local: typecheck ✓, build ✓, vitest 55/55 ✓
+- **2/3 producers bulk migrados** (refreshRfm + refreshFeatures done; refreshReactivation pendente em R-2.6)
+- Próximo: validar com cron run real + R-2.6 (refreshReactivation)
 
 **R-2.4.1 fechado em 2026-05-05 (cross-check via MCP):**
 - Inspeção completa pós-deploy revelou **2 evaluators paralelos** (D-2026-05-05-03):
