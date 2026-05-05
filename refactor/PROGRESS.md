@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.8 aplicado (recordImportAdded usa Decision API single em enforce). 7/12 producers migrados (4 single-row + 3 bulk). R-2.7 e R-2.8 em validação assíncrona (volume baixo).
+**Fase ativa:** Fase 2, R-2.9 aplicado (linkProducts usa Decision API batch). 8/12 producers migrados (4 single-row + 4 bulk). R-2.7/R-2.8/R-2.9 em validação assíncrona.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.8 cutover
+**Quem atualizou:** Claude Code via R-2.9 cutover
 
 ## Próximas 3 ações
 
-1. **R-2.9** — `traitProducer` (workers/analytics/src/segmentation/traitProducer.ts) — pattern R-2.3 ou bulk dependendo da estrutura.
-2. **R-2.10 a R-2.14** — producers single-row restantes: `linkProducts`, `computeClusters`, `computeClusterSubgroups`, `syncPartyType`, `autoPopulateContactState`.
-3. **Validar R-2.7 + R-2.8 em produção** (assíncrono) — tráfego natural produz jobs com `triggered_by='recordFormSubmitted'` / `'recordImportAdded'`. Volume muito baixo (~2/dia + 0/7d via legacy), pode demorar dias.
+1. **R-2.10** — `computeClusters` (workers/analytics/src/handlers/computeClusters.ts:692) — pattern bulk.
+2. **R-2.11** — `computeClusterSubgroups` (workers/analytics/src/handlers/computeClusterSubgroups.ts:808) — pattern bulk. Avaliar PR único com R-2.10 (proximidade conceitual).
+3. **R-2.12** — `traitProducer` (workers/analytics/src/segmentation/traitProducer.ts:730) — code path crítico de form ingestion, fields_changed dinâmico.
 
 ## Bloqueadores ativos
 
@@ -554,6 +554,26 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.9 aplicado em 2026-05-05:**
+- `workers/analytics/src/handlers/linkProducts.ts:175-209` → `linkProducts` migrado para Decision API batch
+- Pattern bulk em N parties via array `paidPartyIds[]` (UPDATE com `ANY` + INSERT com `unnest` no path antigo). Sem loop de chunks — um único bloco bulk.
+- Path antigo removido:
+  - `state_version = state_version + 1` no UPDATE
+  - `INSERT INTO analytics.segment_eval_queue (..., 'product_link', ARRAY['bought_product_ids'], 4) ON CONFLICT DO NOTHING` direto
+- Path novo:
+  - UPDATE de domínio (`bought_product_ids` recalculado idempotentemente, `state_updated_at = now()`) preservado
+  - `analytics.apply_contact_state_mutation_batch(..., 'linkProducts', ARRAY['bought_product_ids'], 4)` chamado após o UPDATE
+  - **Priority=4 preservada** (linkagem retroativa, mesma urgência de purchase, mais urgente que clusters=3)
+  - Bloco envolvido em `sql.begin()` — atomicidade UPDATE+Decision API
+  - Sem try/catch externo a tocar (handler já propagava erros nativamente)
+- 1 dimensão real: `bought_product_ids`
+- `triggered_by`: `'product_link'` → `'linkProducts'` (constraint já aceita desde R-2.1b)
+- `state_updated_at` no UPDATE preservado (D-2026-05-05-04 — débito menor)
+- Validação local: `npm run typecheck` ✓, `npm run build` ✓, `npx vitest run` 55/55 ✓
+- **8/12 producers migrados:** process_purchase_analytics, recordTagChange, refreshRfm, refreshFeatures, refreshReactivation, recordFormSubmitted, recordImportAdded, linkProducts
+- Volume 0/7d (admin-triggered) — validação produção via tráfego natural ou disparo manual de admin tool
+- Próximo: R-2.10 (computeClusters) + R-2.11 (computeClusterSubgroups) — possivelmente PR único
 
 **R-2.8 aplicado em 2026-05-05:**
 - `workers/historical-sync/src/handlers/webhook/analytics-events.ts:169` → `recordImportAdded` migrado para Decision API single em enforce (pattern R-2.3/R-2.7)
