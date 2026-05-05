@@ -472,8 +472,25 @@ Adicionalmente: threshold slow_job ajustado 200ms → 1500ms (commit
 `0a9c50e`) para restaurar signal-to-noise pós-Fase 1.
 - **R-2.12:** ✅ DONE em 2026-05-05 (R-2.6 do plano operacional) — `refreshReactivation.ts` migrado em **2 escopos**: (1) UPSERT principal de scoring (chunks de 1000) e (2) `cleanReactivatedCustomers` (UPDATE de cleaning), ambos com Decision API batch atômico via `sql.begin()`. 1 dimensão whitelist (`reactivation_priority`); `reactivation_score` é metadata interno (ranking) fora da whitelist. Priority=6, `triggered_by='refreshReactivation'` em ambos. Bug latente fechado em 2 frentes (UPSERT + cleaner não enfileiravam eval). **Sprint 2 milestone — 3/3 producers bulk migrados** (refreshRfm + refreshFeatures + refreshReactivation). **Validado em produção (commit `6fa8abe`):** job manual completou em 42s, 5.044 jobs `triggered_by='refreshReactivation'` enfileirados com `fields_changed='{reactivation_priority}'`, 0 errors.
 - **R-2.13:** ⛔ OUT-OF-SCOPE em 2026-05-05 (R-2.10 + R-2.11 do plano operacional) — `computeClusters.ts:691-704` + `computeClusterSubgroups.ts:807-820`. **Sem mudança de código.** Esses producers não escrevem em `contact_state`; apenas notificam journey engine via `segment_eval_queue` com `fields_changed = ['segment_ids']` (output, não input — fora da whitelist §22.3 por design). Migrar literalmente causaria regressão funcional (Decision API descartaria INSERT). Rename cosmético sem ganho. Decisão registrada em D-2026-05-05-06: `segment_eval_queue` tem 2 usos semânticos distintos (re-eval por mudança de input vs notificação cross-system). Refactor para canal dedicado fica como item futuro fora do escopo Sprint 2.
-- **R-2.14:** Triggers `trg_sync_party_type` + `trigger_auto_populate_contact_state`
-- **R-2.15:** Frontend `analyticsStorage.ts:527` (D-SEG-12)
+- **R-2.14:** ✅ DONE em 2026-05-05 (cross-check MCP) — Triggers `sync_party_type`/`sync_party_types_batch` + `trigger_auto_populate_contact_state`. **Migração histórica não-documentada** descoberta na closure da Sprint 2. Validado via `pg_get_functiondef` em 2026-05-05: ambas chamam `apply_contact_state_mutation`, removeram `state_version+1` (no caso de `auto_populate`, `state_version=1` no INSERT branch é inicialização, não bump — comentário explícito "REMOVIDO: state_version+1" no UPDATE), removeram INSERT direto em `segment_eval_queue`. D-2026-05-05-07 registrado.
+- **R-2.15:** Frontend `analyticsStorage.ts:527` (D-SEG-12) — *fora do escopo de Decision Write API: arquivo passa `triggered_by` em payload de RPC, não escreve direto na queue. Mantido na lista por compatibilidade com plano original.*
+
+### R-2.13.b — Producers SQL adicionais migrados (cross-check MCP)
+
+**Status:** ✅ DONE em 2026-05-05 — descoberta via cross-check MCP na closure da Sprint 2
+
+Funções SQL identificadas no inventário como pendentes mas que **já estavam
+migradas** silenciosamente (provavelmente via `apply_migration` em algum
+momento da sessão). Validadas via `pg_get_functiondef` em 2026-05-05:
+
+| Função | Schema | Decision API call |
+|---|---|---|
+| `sync_tag_ids_to_contact_state` | analytics | `'recordTagChange'`-like (chama API, não bumpa state_version, não INSERT direto) |
+| `record_email_engagement_event` | email | `'recordEmailEngagement'` (priority=3, enforce, dimensão `last_email_*_at`) |
+| `trg_product_name_mapped` | commerce | chama API |
+
+Decisão: marcar como done sem código novo. **Custo evitado:** ~3 prompts
+R-2.x duplicando migração já feita. Lição registrada em D-2026-05-05-07.
 
 **Cada um:**
 - Estimativa: 2-4h por PR

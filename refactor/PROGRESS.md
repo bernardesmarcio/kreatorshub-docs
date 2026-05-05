@@ -10,16 +10,16 @@
 
 ## Estado atual
 
-**Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.12 aplicado (traitProducer usa Decision API BULK_ONLY pattern). **TS-side completo: 10/12 migrados + 2 out-of-scope.** Restam apenas producers SQL (R-2.13+).
+**Sprint:** 2 — Fase 2 (Decision Write API) — 🎯 **FECHADA em 2026-05-05**
+**Fase ativa:** Sprint 3 desbloqueada. Cross-check via MCP confirmou que **todas as 6 funções SQL pendentes (R-2.13 a R-2.17) já estão migradas** — refactor histórico não-documentado. **Stats finais Sprint 2:** 9 producers TS migrados + 6 SQL migrados + 2 out-of-scope = 17 producers endereçados.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.12 cutover
+**Quem atualizou:** Claude Code via Sprint 2 closure (cross-check MCP)
 
 ## Próximas 3 ações
 
-1. **R-2.13** — `sync_tag_ids_to_contact_state` (SQL trigger function) — **primeiro producer SQL** da sprint. Técnica diferente: edita função PL/pgSQL via `apply_migration` (Supabase MCP), pattern baseado em R-2.1b. Volume potencialmente alto (tag changes via UI).
-2. **R-2.14** — `trigger_auto_populate_contact_state` (SQL trigger function) — init de party novo. Pattern R-2.13.
-3. **R-2.15** — `record_email_engagement_event` (SQL trigger function) — alto volume potencial (email engagement). Pattern R-2.13.
+1. **(decisão estratégica)** Iniciar Sprint 3 (Coalescing real — R-3.1/R-3.2: UNIQUE INDEX parcial em `segment_eval_queue (tenant_id, party_id) WHERE status='pending'` + UPSERT mesclando `fields_changed`). Resolve naturalmente o 2x-3x jobs/party de R-2.5/R-2.6 (D-2026-05-05-05) e expectativa do BULK_ONLY pattern.
+2. **(alternativa)** Pause de 24h em produção para validação completa Sprint 2 (volume baixo dos producers single-row pode demorar pra produzir checkpoint via tráfego natural).
+3. **(alternativa)** Outra prioridade — débito acumulado (D-2026-05-05-01 testabilidade workers) ou roadmap distinto.
 
 ## Bloqueadores ativos
 
@@ -265,6 +265,48 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-05-07 — Inventário textual pode divergir do estado real do banco
+
+**Contexto:** durante closure da Sprint 2 (2026-05-05), cross-check via MCP
+revelou que as 6 funções SQL listadas como "pendentes" no inventário
+(R-2.13–R-2.17 — `sync_tag_ids_to_contact_state`, `trigger_auto_populate_contact_state`,
+`record_email_engagement_event`, `trg_product_name_mapped`, `sync_party_type`,
+`sync_party_types_batch`) **já estavam migradas** silenciosamente para Decision API.
+
+A migração ocorreu via `apply_migration` no Supabase MCP em algum momento da
+sessão (provavelmente em paralelo aos commits TS), sem prompts R-2.13+ formais
+nem registro em PROGRESS.md ao acontecer. Documentação textual ficou defasada
+em relação ao estado real do banco.
+
+**Lição:** Inventário textual é **derivação** do estado real, não fonte de
+verdade. Cross-check via MCP é sempre necessário antes de assumir status.
+
+**Regra (incorporada como prática de R-rules):** Antes de criar qualquer R-2.x
+novo (ou tarefa que pressupõe estado de função SQL), consultar
+`pg_get_functiondef` da função candidata para confirmar status real.
+
+```sql
+-- Cross-check rápido pre-task:
+SELECT
+  proname,
+  pg_get_functiondef(oid) ILIKE '%apply_contact_state_mutation%' AS calls_decision_api,
+  pg_get_functiondef(oid) ILIKE '%state_version%+%1%' AS still_bumps_state_version_legacy,
+  pg_get_functiondef(oid) ILIKE '%INSERT INTO%segment_eval_queue%' AS still_inserts_queue_direct
+FROM pg_proc
+WHERE proname IN ('<funcoes_candidatas>');
+```
+
+**Ressalvas no regex:**
+- Regex `%state_version%+%1%` tem falso positivo se função usa
+  `state_version = 1` na inicialização (INSERT branch). Validar o
+  contexto via inspeção visual.
+- Regex `%INSERT INTO%segment_eval_queue%` precisa olhar contexto:
+  pode pegar INSERTs em outras tabelas (`contact_events`, etc).
+
+**Custo evitado:** ~2-3 prompts R-2.x (R-2.13–R-2.17) que duplicariam migração
+já feita; risco de bugs por reaplicar transformação em código já transformado.
+**Custo futuro:** rotina simples de cross-check antes de tarefas SQL.
 
 ### D-2026-05-05-06 — segment_eval_queue tem dois usos semânticos distintos
 
@@ -597,6 +639,41 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**🎯 SPRINT 2 FECHADA em 2026-05-05 — descoberta via cross-check MCP**
+
+Após R-2.12, cross-check completo via MCP em todas as 6 funções SQL "pendentes"
+revelou que **todas já estavam migradas** silenciosamente em algum momento desta
+sessão (provavelmente via `apply_migration` no Supabase MCP por outro caminho),
+sem prompts R-2.13+ formais.
+
+**Validação MCP em 2026-05-05** (cross-check de `pg_get_functiondef` em cada uma):
+
+| Função SQL | Decision API | state_version+1 | INSERT queue direto | Status |
+|---|---|---|---|---|
+| `sync_tag_ids_to_contact_state` | ✅ | ❌ | ❌ | ✅ migrada |
+| `trigger_auto_populate_contact_state` | ✅ | ❌ (`state_version=1` é init, não bump; comentário "REMOVIDO" no UPDATE) | ❌ | ✅ migrada |
+| `record_email_engagement_event` | ✅ (`apply_contact_state_mutation`, producer `'recordEmailEngagement'`, dimension `last_email_*_at`, priority=3, enforce) | ❌ | ❌ (INSERT direto era em `contact_events` audit, não `segment_eval_queue` — falso positivo do regex) | ✅ migrada |
+| `trg_product_name_mapped` | ✅ | ❌ | ❌ | ✅ migrada |
+| `sync_party_type` | ✅ | ❌ | ❌ | ✅ migrada |
+| `sync_party_types_batch` | ✅ | ❌ | ❌ | ✅ migrada |
+
+**R-2.13 a R-2.17 fechados sem código novo — apenas docs.**
+Migração histórica fora do plano operacional documentado em PROGRESS.md.
+
+**Stats finais Sprint 2 (refactor de Decision Write API):**
+- **9 producers TS migrados:** recordTagChange (R-2.3), refreshRfm (R-2.4), refreshFeatures (R-2.5), refreshReactivation (R-2.6), recordFormSubmitted (R-2.7), recordImportAdded (R-2.8), linkProducts (R-2.9), traitProducer (R-2.12) + chamada da `process_purchase_analytics` SQL fn (R-2.1b)
+- **6 producers SQL migrados:** sync_tag_ids_to_contact_state, trigger_auto_populate_contact_state, record_email_engagement_event, trg_product_name_mapped, sync_party_type, sync_party_types_batch (todos pré-existentes, validados via MCP em 2026-05-05)
+- **2 out-of-scope:** computeClusters, computeClusterSubgroups (D-2026-05-05-06 — usam `segment_eval_queue` como canal de notificação cross-system, não como re-eval por mudança de input)
+- **Total: 17 producers endereçados em ~3 dias de refactor.**
+
+ARCHITECTURE.md §22.3 atualizada — BULK_ONLY agora formaliza:
+- Opportunity (R36): `has_opportunity`, `opportunity_*`
+- Cluster (R-2.10/R-2.11): `cluster_id`, `cluster_subgroup_id`
+- Traits (R-2.12): `party_traits` (genérico), `party_trait_<key>` (granular via LIKE)
+
+**Sprint 3 desbloqueada:** Coalescing real (R-3.1/R-3.2 — UNIQUE INDEX parcial
++ UPSERT que mescla `fields_changed`).
 
 **R-2.12 aplicado em 2026-05-05:**
 - `workers/analytics/src/segmentation/traitProducer.ts:727-755` (function `processSubmission`) → migrado para Decision API single em enforce, **BULK_ONLY pattern**

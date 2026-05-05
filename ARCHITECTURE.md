@@ -1409,14 +1409,32 @@ Timestamps internos:
 
 #### Campos `BULK_ONLY` (R36) — fora do contrato `segmentation_input_version`
 
-Campos de domínios 1:N (oportunidades, futuros tickets) que aparecem em
+Campos de domínios 1:N (oportunidades, traits, clusters) que aparecem em
 `depends_on_fields` mas NÃO vivem em `contact_state`. Avaliação ocorre via subquery
 no SQL path (`eval_condition_v2`), não via watermark per-party. Nunca bumpam
-`segmentation_input_version` por definição:
+`segmentation_input_version` por definição.
 
+A função `analytics.is_bulk_only_dimension(text)` é a fonte canônica desta lista.
+Decision API (`apply_contact_state_mutation`) classifica dimensões em 3 grupos:
+whitelist (bumpa seg_version + enfileira) | bulk_only (bumpa apenas
+`state_updated_at` + enfileira) | blacklist (nada).
+
+Lista canônica:
+
+**Opportunity (R36):**
 - `has_opportunity`, `opportunity_status`, `opportunity_pipeline`, `opportunity_stage`
 - `opportunity_assigned_to`, `opportunity_lost_reason`
 - `opportunity_created_days`, `opportunity_closed_days`, `opportunity_won_days`, `opportunity_lost_days`
+
+**Cluster (R-2.10/R-2.11 — out-of-scope no refactor de Maio/2026):**
+- `cluster_id`
+- `cluster_subgroup_id`
+
+**Traits (R-2.12 — formalizado no refactor):**
+- `party_traits` (genérico — "qualquer trait mudou", usado quando producer toca >5 traits)
+- `party_trait_<key>` (granular — `LIKE 'party_trait_%'`, ex: `party_trait_idade`, `party_trait_cidade`).
+  Usado quando producer toca ≤5 traits específicos. Avaliação real ocorre por trait_key
+  via JOIN com `crm.party_trait_*` (5 tabelas tipadas).
 
 Detecção em runtime: o worker `segment-eval-worker` reavalia esses segmentos via
 fluxo BULK_ONLY (refresh_segments handler) — não via fila per-party. R36 cobre.
