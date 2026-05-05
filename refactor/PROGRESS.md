@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.5 aplicado (refreshFeatures usa Decision API batch). 4 producers migrados (process_purchase_analytics + recordTagChange + refreshRfm + refreshFeatures). Aguardando deploy Railway + cron rfm-rolling-refresh para validar R-2.5.
+**Fase ativa:** Fase 2, R-2.5 fechado (validado em produção: job manual 57.9s, 10.304 jobs com `triggered_by='refreshFeatures'`, 0 errors, drenando 10-12 jobs/s). 4 producers migrados. Standby para R-2.6.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.5 cutover
+**Quem atualizou:** Claude Code via R-2.5 close
 
 ## Próximas 3 ações
 
-1. **Validar R-2.5 com cron run real** — após deploy, próximo `rfm-rolling-refresh` (`0 * * * *`) deve enfileirar `refresh_features` → orquestração → `refresh_rfm`. Esperado: N jobs em `segment_eval_queue` com `triggered_by='refreshFeatures'`, drift global pico → 0 em <10min, avg_ms_processing < 2000ms, zero erros nos logs Railway.
-2. **R-2.6** — `refreshReactivation` (mesmo gap latente, mesmo pattern bulk).
-3. **R-2.7+** — producers restantes do roadmap (`linkProducts`, `traitProducer`, `computeClusters`, etc).
+1. **R-2.6** — `refreshReactivation` (último producer bulk pendente — mesmo gap latente, mesmo pattern bulk de R-2.4/R-2.5).
+2. **R-3.2** — UNIQUE INDEX parcial coalescente em `segment_eval_queue (tenant_id, party_id) WHERE status='pending'` + UPSERT que mescla `fields_changed`. Resolve naturalmente o 2x jobs/party causado pela orquestração refreshFeatures→refreshRfm (D-2026-05-05-05).
+3. **R-2.7+** — producers single-row restantes (`linkProducts`, `traitProducer`, `computeClusters`, etc) — pattern R-2.3.
 
 ## Bloqueadores ativos
 
@@ -265,6 +265,45 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-05-05 — refreshFeatures orquestra refresh_rfm gerando 2 jobs/party
+
+**Contexto:** validação produção R-2.5 (2026-05-05) revelou que cada
+cron `rfm-rolling-refresh` agora gera **2 batches** em `segment_eval_queue`
+para os mesmos parties:
+
+1. `triggered_by='refreshFeatures'` (10 dimensões — total_purchases,
+   total_revenue, avg_order_value, distinct_products, recency_days,
+   frequency, monetary, last_purchase_at, first_product_at,
+   bought_product_ids)
+2. `triggered_by='refreshRfm'` (6 dimensões — r_score, f_score, m_score,
+   rfm_segment, value_tier, lifecycle_stage)
+
+Razão: `refreshFeatures` orquestra `refresh_rfm` ao terminar (linhas
+299-308), e ambos são producers Decision API batch desde R-2.4 e R-2.5.
+Cada um enfileira corretamente sua mudança de dimensão.
+
+**Conclusão:** comportamento **correto**, não é regressão. Cada producer
+declara honestamente "essas dimensões mudaram". O custo é 2x jobs no
+hot path do worker R-1.6 (~10-12 jobs/s drenando, validado em produção
+com 10.304 jobs em batch único).
+
+**Decisão:** aceitar como custo transitório até R-3.2 (UNIQUE INDEX
+parcial coalescente em `segment_eval_queue (tenant_id, party_id)
+WHERE status='pending'` + UPSERT que mescla `fields_changed`).
+Coalescing natural vai resolver: 2 INSERTs sucessivos pro mesmo party
+viram 1 row com `fields_changed = features_dims ∪ rfm_dims`.
+
+**Custo evitado agora:** zero (pattern Decision API exige cada producer
+declarar suas dimensões; coalescing é responsabilidade da camada de
+queue, não do producer).
+**Custo futuro:** já planejado em R-3.2.
+
+**Validação produção R-2.5 (2026-05-05):**
+- Job manual `refresh_features` completou em 57.9s, 0 errors
+- 10.304 jobs `triggered_by='refreshFeatures'` criados, drenando
+  10-12 jobs/s via worker R-1.6
+- Watermarks alinhando normalmente
 
 ### D-2026-05-05-04 — refreshFeatures escreve state_updated_at redundante com Decision API
 
@@ -527,7 +566,13 @@ nesse nível.
 - `state_updated_at` no UPSERT preservado (D-2026-05-05-04 — débito menor de redundância)
 - Validação local: typecheck ✓, build ✓, vitest 55/55 ✓
 - **2/3 producers bulk migrados** (refreshRfm + refreshFeatures done; refreshReactivation pendente em R-2.6)
-- Próximo: validar com cron run real + R-2.6 (refreshReactivation)
+- **Validação produção (commit `befc80e`, deploy 2026-05-05):**
+  - Job manual `refresh_features` completou em **57.9s**, 0 errors
+  - **10.304 jobs** com `triggered_by='refreshFeatures'` enfileirados
+  - Drenando ~10-12 jobs/s via worker R-1.6
+  - Worker R-1.6 alinha watermarks normalmente
+  - Achado: cron run completo gera **2 batches** (refreshFeatures + refreshRfm) por orquestração — comportamento correto, custo transitório até R-3.2 (D-2026-05-05-05)
+- Próximo: R-2.6 (refreshReactivation)
 
 **R-2.4.1 fechado em 2026-05-05 (cross-check via MCP):**
 - Inspeção completa pós-deploy revelou **2 evaluators paralelos** (D-2026-05-05-03):
