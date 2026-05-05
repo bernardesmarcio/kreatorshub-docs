@@ -437,7 +437,7 @@ Lista detalhada — cada um vira PR isolado com testes:
 - **R-2.3:** ✅ DONE em R-2.1b — `process_purchase_analytics` SQL fn → usa Decision API
 - **R-2.4:** `apply_segment_membership_diff` → migração para API (já parcial em R-1.4)
 - **R-2.5:** ✅ DONE em 2026-05-04 — `recordTagChange` (workers/historical-sync/src/handlers/webhook/analytics-events.ts:24) migrado para Decision API enforce. triggered_by passou de `'tag_change'` → `'recordTagChange'`. UPDATE+Decision API agora atômicos via `sql.begin()`. Aguardando tag change real em produção para checkpoint.
-- **R-2.6:** `recordFormSubmitted` (idem:133)
+- **R-2.6:** ✅ DONE em 2026-05-05 (R-2.7 do plano operacional) — `recordFormSubmitted` (workers/historical-sync/src/handlers/webhook/analytics-events.ts:105) migrado para Decision API single em enforce. `triggered_by` passou de `'form_submitted'` → `'recordFormSubmitted'`. UPDATE+Decision API atômicos via `sql.begin()`. Removidos: `state_version+1` e INSERT direto em `segment_eval_queue`. Aguardando próxima form submission real para checkpoint.
 - **R-2.7:** `recordImportAdded` (idem:198)
 - **R-2.8:** `traitProducer.ts:730`
 - **R-2.9:** `linkProducts.ts:198`

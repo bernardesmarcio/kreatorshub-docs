@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, **MILESTONE 2026-05-05: Producers bulk completos (3/3)**. R-2.6 validado em produção (job 42s, 5.044 jobs `triggered_by='refreshReactivation'`, fields_changed=`{reactivation_priority}`, 0 errors). 5/12 producers migrados. Standby para R-2.7 (single-row).
+**Fase ativa:** Fase 2, R-2.7 aplicado (recordFormSubmitted usa Decision API single em enforce). 6/12 producers migrados (3 single-row + 3 bulk). Aguardando deploy + tráfego natural / teste manual.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.6 close + milestone Sprint 2 bulk
+**Quem atualizou:** Claude Code via R-2.7 cutover
 
 ## Próximas 3 ações
 
-1. **R-2.7** — `recordFormSubmitted` (workers/historical-sync/src/handlers/webhook/analytics-events.ts:104) — pattern R-2.3 (single-row).
-2. **R-2.8 a R-2.14** — producers single-row restantes: `recordImportAdded`, `traitProducer`, `linkProducts`, `computeClusters`, `computeClusterSubgroups`, `syncPartyType`, `autoPopulateContactState` — pattern R-2.3.
-3. **R-3.2** (paralelo possível) — UNIQUE INDEX parcial coalescente em `segment_eval_queue (tenant_id, party_id) WHERE status='pending'` + UPSERT mesclando `fields_changed`. Resolve 2x jobs/party de R-2.5 (orquestração refreshFeatures→refreshRfm, D-2026-05-05-05) e R-2.6 (cleaner + UPSERT no mesmo cron run).
+1. **Validar R-2.7 em produção** — próxima form submission real (ou teste manual via webhook simulado) deve produzir job em `segment_eval_queue` com `triggered_by='recordFormSubmitted'` (não mais `'form_submitted'`). Volume baixo (~2/dia), pode levar até 24h pra tráfego natural.
+2. **R-2.8** — `recordImportAdded` (mesmo arquivo `analytics-events.ts:170`, pattern idêntico R-2.3/R-2.7).
+3. **R-2.9 a R-2.14** — producers single-row restantes (`traitProducer`, `linkProducts`, `computeClusters`, `computeClusterSubgroups`, `syncPartyType`, `autoPopulateContactState`).
 
 ## Bloqueadores ativos
 
@@ -554,6 +554,24 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.7 aplicado em 2026-05-05:**
+- `workers/historical-sync/src/handlers/webhook/analytics-events.ts:105` → `recordFormSubmitted` migrado para Decision API single em enforce (pattern R-2.3)
+- Path antigo removido:
+  - `state_version = state_version + 1` no UPDATE de `responded_form_ids`
+  - `INSERT INTO analytics.segment_eval_queue (...) VALUES (..., 'form_submitted', ...)` direto
+- Path novo:
+  - UPDATE de domínio (`responded_form_ids`, `state_updated_at = now()`) preservado
+  - `analytics.apply_contact_state_mutation(..., 'recordFormSubmitted', ARRAY['responded_form_ids'], payload, 5, 'enforce')` chamado após o UPDATE
+  - Bloco envolvido em `sql.begin()` (postgres.js) — atomicidade UPDATE+Decision API (D-2026-05-03-02)
+  - try/catch externo removido — falha propaga ao caller (sem EXCEPTION isolation)
+- `record_contact_event` (auditoria) preservado dentro da mesma transação
+- `triggered_by`: `'form_submitted'` → `'recordFormSubmitted'` (constraint já aceita desde R-2.1b)
+- Validação local: `npm run typecheck` ✓, `npm run build` ✓ no worker historical-sync
+- Sem testes unit no worker (D-2026-05-05-01, n/a)
+- **6/12 producers migrados:** process_purchase_analytics, recordTagChange, refreshRfm, refreshFeatures, refreshReactivation, recordFormSubmitted
+- Volume baixo (~2/dia) — validação produção via tráfego natural ou webhook simulado
+- Próximo: R-2.8 (recordImportAdded)
 
 **MILESTONE 2026-05-05: Producers bulk completos (3/3)**
 
