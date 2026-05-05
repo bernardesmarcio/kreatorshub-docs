@@ -459,8 +459,17 @@ ausentes do switch case do evaluator. Comportamento anterior: warning
   zero regressão dos 49 prévios)
 - typecheck ✓, build ✓
 
-**Investigação derivada:** D-2026-05-05-03 (evaluator usa apenas
-`rules_json` legacy, ignora `rules_json_v2`). Fora do escopo da R-2.4.1.
+**Cross-check pós-deploy (2026-05-05):** mapeamento completo revelou
+2 evaluators paralelos (D-2026-05-05-03 — coexistência aceita como
+débito). Path v2 (SQL canonical via `refresh_segment_parties_unified`)
+já cobria os operators dos 3 segmentos nativamente. Path legacy
+(memória, hot path) era o único com gap, fechado por d460945. Validação
+em produção: 14 segmentos do Escola do Fluxo com `last_calculated_at`
+recente, membership consistente entre `segments` counts e
+`segment_parties`. **R-2.4.1 fechado sem trabalho novo.**
+
+Adicionalmente: threshold slow_job ajustado 200ms → 1500ms (commit
+`0a9c50e`) para restaurar signal-to-noise pós-Fase 1.
 - **R-2.12:** `refreshReactivation.ts:246,337`
 - **R-2.13:** `computeClusters.ts:692` + `computeClusterSubgroups.ts:808`
 - **R-2.14:** Triggers `trg_sync_party_type` + `trigger_auto_populate_contact_state`

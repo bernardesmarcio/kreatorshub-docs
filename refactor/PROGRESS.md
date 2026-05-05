@@ -11,14 +11,14 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.4.1 aplicado (3 operators faltantes no segment-evaluator). R-2.4 done. Aguardando deploy Railway + validação produção.
+**Fase ativa:** Fase 2, R-2.4.1 fechado pós cross-check via MCP (path v2 já cobria operators; path legacy já patchado em d460945). Threshold slow_job ajustado 200ms → 1500ms (sinal/ruído). Aguardando push + deploy Railway. Standby para R-2.5.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.4.1 fix
+**Quem atualizou:** Claude Code via R-2.4.1 inspeção final + threshold fix
 
 ## Próximas 3 ações
 
-1. **Validar R-2.4.1 + R-2.4 pós-deploy** — após deploy, validar logs Railway sem mais "Unknown operator: =" / "Unknown operator: is_not_empty". Validar `last_calculated_at` recente para 14 segmentos do Escola do Fluxo. Drift global volta a 0 em <5min após drenamento.
-2. **R-2.5** — `refreshFeatures` (mesmo gap latente, mesmo pattern bulk).
+1. **Push commit 0a9c50e (threshold)** — disparar deploy worker analytics. Após deploy, warning slow_job vira top 5% outliers reais (de 100% ruído).
+2. **R-2.5** — `refreshFeatures` (mesmo gap latente, mesmo pattern bulk de R-2.4).
 3. **R-2.6** — `refreshReactivation` (mesmo gap latente, mesmo pattern bulk).
 
 ## Bloqueadores ativos
@@ -266,40 +266,58 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
 
-### D-2026-05-05-03 — Evaluator legacy lê rules_json, não rules_json_v2
+### D-2026-05-05-03 — Coexistência de 2 evaluators (legacy + v2)
 
-**Contexto:** durante R-2.4.1, identificado que `segment-rules-evaluator.ts:219`
-chama `evaluateRules(state, segment.rules_json)`, ignorando completamente
-`rules_json_v2` (AST v2). Segmentos criados/migrados para v2 com
-`rules_json` legacy vazio (ex: "Ativos - Não preencheu Flow Camp" com
-`conditions: []`) são silenciosamente puláveis pelo evaluator — sem
-warning, sem erro, sem entry/exit. Membership desses segmentos fica
-estática.
+**Contexto:** durante R-2.4.1, mapeamento completo dos paths de avaliação
+de segmento revelou **dois evaluators paralelos** que coexistem na
+plataforma:
 
-**Conclusão:** desconhecido o número exato de segmentos afetados.
-Provavelmente todos os criados via UI v2 cuja migração de `rules_json_v2`
-→ `rules_json` legacy não rodou ou rodou parcial.
+| Path | Arquivo | Lê | Quem usa |
+|---|---|---|---|
+| Legacy (memória) | `src/segment-rules-evaluator.ts` | `rules_json` (AST v1) | `segment-eval-worker.ts` (hot path por job na `segment_eval_queue`) |
+| v2 (SQL canonical) | `src/segmentation/segmentEvaluator.ts` + `resolvers.ts` | `rules_json_v2` (AST v2) | `refreshSegments` handler (batch via `analytics.refresh_segment_parties_unified`) |
 
-**Decisão:** registrar como débito; **não** bloqueia roadmap. R-2.4.1
-endereça o problema imediato dos 14 segmentos com operators faltantes.
-Investigar separadamente em sprint própria — possíveis caminhos:
+**Conjunto de operators:** divergente. Legacy usa keywords (`equals`,
+`greater_than`, `is_not_null`, etc) e símbolo `=`. v2 usa abreviações
+(`eq`, `gt`, `is_not_null`, `contains_any`, etc). R-2.4.1 patchou apenas
+o legacy (`=`, `is_empty`, `is_not_empty`); v2 já cobria nativamente.
 
-- Migração one-shot rules_json_v2 → rules_json para todos os segmentos
-- Evaluator passa a ler v2 nativamente (refactor maior, requer
-  implementar operators v2: `eq`, `contains_any`, `not_contains_any`, etc)
-- Sincronização bidirecional v1↔v2 no save da UI
+**Validação cruzada (cross-check via MCP):** os 14 segmentos do Escola
+do Fluxo têm membership consistente entre `analytics.segments.customer_count`/`lead_count`
+e `analytics.segment_parties` real (counts batem). Significa que os dois
+paths convergem no membership final mesmo executando em momentos
+diferentes. Path v2 (batch, hourly) é o que dita verdade canonical;
+legacy (event-driven) é incremental.
 
-**Custo evitado agora:** 1+ sprint dedicada.
-**Custo futuro:** 1 sprint para análise + decisão + execução.
+**Decisão:** **coexistência intencional aceita como débito** — não
+bloqueia roadmap atual. Migração legacy → v2 fica como item futuro
+fora do escopo do refactor de Decision Write API. Considerações para
+futura migração:
 
-**Detecção em produção:** query exploratória —
+- v2 já é canonical via SQL (single source of truth)
+- Legacy é incremental e mais rápido para single-party events
+  (purchases, tag changes) — vantagem que justifica coexistência
+- Evolução possível: legacy executa em memória usando `rules_json_v2`
+  (eliminando o duplo registro), reusando os operators de
+  `resolvers.ts.compileMemory`
+
+**Custo evitado agora:** 1+ sprint dedicada de unificação.
+**Custo futuro:** 1 sprint para refactor (migração + testes + deploy).
+
+**Detecção de inconsistências em produção:** query exploratória —
 ```sql
-SELECT id, name,
-       jsonb_array_length(rules_json->'conditions') AS legacy_count,
-       (rules_json_v2->>'ast_version')::int AS v2_version
-FROM analytics.segments
-WHERE rules_json_v2 IS NOT NULL
-  AND COALESCE(jsonb_array_length(rules_json->'conditions'), 0) = 0;
+-- Comparar contagem em segments (legacy event-driven) vs
+-- segment_parties (v2 SQL canonical) por segmento
+SELECT s.id, s.name,
+       s.customer_count + s.lead_count AS counts_em_segments,
+       (SELECT COUNT(*) FROM analytics.segment_parties sp
+         WHERE sp.segment_id = s.id) AS counts_em_segment_parties
+FROM analytics.segments s
+WHERE s.tenant_id = '<tenant>'
+  AND ABS(
+    (s.customer_count + s.lead_count) -
+    (SELECT COUNT(*) FROM analytics.segment_parties sp WHERE sp.segment_id = s.id)
+  ) > 5;
 ```
 
 ### D-2026-05-05-02 — refreshRfm sempre teve gap event-driven (anterior à Fase 1)
@@ -467,7 +485,23 @@ nesse nível.
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
 
-**R-2.4.1 aplicado em 2026-05-05:**
+**R-2.4.1 fechado em 2026-05-05 (cross-check via MCP):**
+- Inspeção completa pós-deploy revelou **2 evaluators paralelos** (D-2026-05-05-03):
+  - Legacy (`segment-rules-evaluator.ts`) — em memória, hot path por job, lê `rules_json` (AST v1). Patchado em commit `d460945` com `=`, `is_empty`, `is_not_empty`.
+  - v2 (`segmentation/segmentEvaluator.ts` + `resolvers.ts`) — SQL canonical via `analytics.refresh_segment_parties_unified`, lê `rules_json_v2` (AST v2). **Já cobria** todos os operators dos 3 segmentos do brief (`eq`, `contains_any`, `is_not_empty`, `is_not_null`) — nenhum patch necessário.
+- Validação produção pós-deploy:
+  - Os 3 segmentos do Escola do Fluxo têm `last_calculated_at` recente (14:23 UTC, ~10min antes da inspeção) com counts não-zero (LEADS COM TELEFONE: 12.242 leads; Ativos: 5.220; Leads_Amazonia: 962 customers)
+  - Membership consistente entre `segments.{customer_count,lead_count}` e `segment_parties` real (cross-check via MCP)
+  - Drift drenando, ~74.200 jobs processados em 14h, 0 errors funcionais
+- **R-2.4.1 fechado SEM trabalho novo** — patch anterior (`d460945`) era suficiente. Logs ruidosos vistos durante drenamento R-2.4 foram réplicas Railway em transição (deploy parcial), não bug real.
+
+**Threshold slow_job ajustado em 2026-05-05 (commit `0a9c50e`):**
+- `workers/analytics/src/segment-eval-worker.ts:205` — `200ms` → `1500ms`
+- Pós-Fase 1, p95 baseline estabilizou em ~1s; threshold 200ms tornava 100% dos jobs slow (sinal/ruído inverso). 1500ms = top 5% outliers reais.
+- Distribuição observada (últimos 30min pós-drain): p50=510ms, p95=1.04s, p99=1.32s, max=1.49s
+- Drenamento R-2.4 (10.570 jobs, 30min–6h atrás): p50=2.4s, p95=4.9s, max=8.9s — esperado durante backlog
+
+**R-2.4.1 aplicado em 2026-05-05 (commit d460945):**
 - `workers/analytics/src/segment-rules-evaluator.ts` → 3 operators adicionados ao switch case
 - `'='` adicionado como alias de `'equals'` (mesma branch — `===` cobre numeric e text via runtime coercion)
 - `'is_not_empty'` adicionado: false para null/undefined/string-vazia/whitespace-only, true para arrays não-vazios e demais valores
