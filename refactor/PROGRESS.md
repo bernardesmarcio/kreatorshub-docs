@@ -11,13 +11,13 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.4 aplicado (refreshRfm agora usa Decision API batch). 3 producers migrados (process_purchase_analytics + recordTagChange + refreshRfm). Aguardando próximo cron run `rfm-rolling-refresh` (top da hora) para validar R-2.4.
+**Fase ativa:** Fase 2, R-2.4.1 aplicado (3 operators faltantes no segment-evaluator). R-2.4 done. Aguardando deploy Railway + validação produção.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.4 cutover
+**Quem atualizou:** Claude Code via R-2.4.1 fix
 
 ## Próximas 3 ações
 
-1. **Validar R-2.4 com cron run real** — aguardar próximo `rfm-rolling-refresh` (`0 * * * *`). Esperado: N jobs em `segment_eval_queue` com `triggered_by='refreshRfm'`, drift global volta a 0 em <5min, avg_ms_processing < 2000ms, zero erros nos logs Railway. **Bug latente fechado:** refreshRfm refresha 9.857 parties/6h, antes invisíveis à segmentação.
+1. **Validar R-2.4.1 + R-2.4 pós-deploy** — após deploy, validar logs Railway sem mais "Unknown operator: =" / "Unknown operator: is_not_empty". Validar `last_calculated_at` recente para 14 segmentos do Escola do Fluxo. Drift global volta a 0 em <5min após drenamento.
 2. **R-2.5** — `refreshFeatures` (mesmo gap latente, mesmo pattern bulk).
 3. **R-2.6** — `refreshReactivation` (mesmo gap latente, mesmo pattern bulk).
 
@@ -266,6 +266,42 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
 
+### D-2026-05-05-03 — Evaluator legacy lê rules_json, não rules_json_v2
+
+**Contexto:** durante R-2.4.1, identificado que `segment-rules-evaluator.ts:219`
+chama `evaluateRules(state, segment.rules_json)`, ignorando completamente
+`rules_json_v2` (AST v2). Segmentos criados/migrados para v2 com
+`rules_json` legacy vazio (ex: "Ativos - Não preencheu Flow Camp" com
+`conditions: []`) são silenciosamente puláveis pelo evaluator — sem
+warning, sem erro, sem entry/exit. Membership desses segmentos fica
+estática.
+
+**Conclusão:** desconhecido o número exato de segmentos afetados.
+Provavelmente todos os criados via UI v2 cuja migração de `rules_json_v2`
+→ `rules_json` legacy não rodou ou rodou parcial.
+
+**Decisão:** registrar como débito; **não** bloqueia roadmap. R-2.4.1
+endereça o problema imediato dos 14 segmentos com operators faltantes.
+Investigar separadamente em sprint própria — possíveis caminhos:
+
+- Migração one-shot rules_json_v2 → rules_json para todos os segmentos
+- Evaluator passa a ler v2 nativamente (refactor maior, requer
+  implementar operators v2: `eq`, `contains_any`, `not_contains_any`, etc)
+- Sincronização bidirecional v1↔v2 no save da UI
+
+**Custo evitado agora:** 1+ sprint dedicada.
+**Custo futuro:** 1 sprint para análise + decisão + execução.
+
+**Detecção em produção:** query exploratória —
+```sql
+SELECT id, name,
+       jsonb_array_length(rules_json->'conditions') AS legacy_count,
+       (rules_json_v2->>'ast_version')::int AS v2_version
+FROM analytics.segments
+WHERE rules_json_v2 IS NOT NULL
+  AND COALESCE(jsonb_array_length(rules_json->'conditions'), 0) = 0;
+```
+
 ### D-2026-05-05-02 — refreshRfm sempre teve gap event-driven (anterior à Fase 1)
 
 **Contexto:** durante R-2.4, identificado que `refreshRfm` (cron horário sobre
@@ -430,6 +466,18 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.4.1 aplicado em 2026-05-05:**
+- `workers/analytics/src/segment-rules-evaluator.ts` → 3 operators adicionados ao switch case
+- `'='` adicionado como alias de `'equals'` (mesma branch — `===` cobre numeric e text via runtime coercion)
+- `'is_not_empty'` adicionado: false para null/undefined/string-vazia/whitespace-only, true para arrays não-vazios e demais valores
+- `'is_empty'` adicionado por simetria (oposto exato)
+- Union type `Operator` atualizada
+- 6 testes novos em `segment-rules-evaluator.test.ts` (55/55 passing, 49 prévios sem regressão)
+- **Bug pré-existente exposto por R-2.4** (não causado por): com `refreshRfm` enfileirando eval pela primeira vez (D-2026-05-05-02), 14 segmentos do Escola do Fluxo expuseram operators não suportados (`=` em `m_score`, `is_not_empty` em `phone`)
+- Patch usa formato legacy (`rules_json`), pois evaluator lê `segment.rules_json` (linha 219), não `rules_json_v2`
+- Validação local: typecheck ✓, build ✓, vitest 55/55 ✓
+- Próximo: deploy + validação logs Railway sem warnings + R-2.5 (refreshFeatures)
 
 **R-2.4 aplicado em 2026-05-05:**
 - `workers/analytics/src/handlers/refreshRfm.ts` → migrado para Decision API batch mode

@@ -443,6 +443,24 @@ Lista detalhada — cada um vira PR isolado com testes:
 - **R-2.9:** `linkProducts.ts:198`
 - **R-2.10:** `refreshFeatures.ts:163,187`
 - **R-2.11:** ✅ DONE em 2026-05-05 (R-2.4 do plano operacional) — `refreshRfm.ts` migrado para `analytics.apply_contact_state_mutation_batch` (priority=6, dimensions=`r_score,f_score,m_score,rfm_segment,value_tier,lifecycle_stage`). Atomicidade UPSERT+Decision API por chunk via `sql.begin()`. Bug latente fechado: 9.857 parties/6h estavam invisíveis à segmentação (D-2026-05-05-02). Pattern bulk producer estabelecido para R-2.10 (refreshFeatures) e R-2.12 (refreshReactivation). Aguardando próximo cron run real para checkpoint.
+
+### R-2.4.1 — Adicionar operators faltantes no segment-evaluator
+
+**Status:** ✅ DONE em 2026-05-05
+**Contexto:** bug pré-existente exposto por R-2.4. 14 segmentos do tenant
+Escola do Fluxo usavam `=` (numeric/text) e `is_not_empty` (text), todos
+ausentes do switch case do evaluator. Comportamento anterior: warning
+"Unknown operator" + retorna false (segmento nunca evaluado).
+
+**Aplicado:**
+- `workers/analytics/src/segment-rules-evaluator.ts` — 3 operators
+  adicionados: `'='` (alias de `'equals'`), `'is_empty'`, `'is_not_empty'`
+- 6 testes novos em `segment-rules-evaluator.test.ts` (55/55 passing,
+  zero regressão dos 49 prévios)
+- typecheck ✓, build ✓
+
+**Investigação derivada:** D-2026-05-05-03 (evaluator usa apenas
+`rules_json` legacy, ignora `rules_json_v2`). Fora do escopo da R-2.4.1.
 - **R-2.12:** `refreshReactivation.ts:246,337`
 - **R-2.13:** `computeClusters.ts:692` + `computeClusterSubgroups.ts:808`
 - **R-2.14:** Triggers `trg_sync_party_type` + `trigger_auto_populate_contact_state`
