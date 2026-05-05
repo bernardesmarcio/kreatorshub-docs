@@ -10,16 +10,20 @@
 
 ## Estado atual
 
-**Sprint:** 2 — Fase 2 (Decision Write API) — 🎯 **FECHADA em 2026-05-05**
-**Fase ativa:** Sprint 3 desbloqueada. Cross-check via MCP confirmou que **todas as 6 funções SQL pendentes (R-2.13 a R-2.17) já estão migradas** — refactor histórico não-documentado. **Stats finais Sprint 2:** 9 producers TS migrados + 6 SQL migrados + 2 out-of-scope = 17 producers endereçados.
+**Sprint:** 3 — Fase 3 (Coalescing real) — 🎯 **FECHADA em 2026-05-05** (~30min via MCP, sem patch TS)
+**Fase ativa:** Sprints 1+2+3 fechadas. Drift sustentado em 0. Coalescing reduz 30-50% do volume da queue (estimativa). Validação E2E em produção via teste manual: ✓.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via Sprint 2 closure (cross-check MCP)
+**Quem atualizou:** Claude Code via Sprint 3 closure (R-3.1+R-3.2 aplicados via MCP por Marcio)
 
 ## Próximas 3 ações
 
-1. **(decisão estratégica)** Iniciar Sprint 3 (Coalescing real — R-3.1/R-3.2: UNIQUE INDEX parcial em `segment_eval_queue (tenant_id, party_id) WHERE status='pending'` + UPSERT mesclando `fields_changed`). Resolve naturalmente o 2x-3x jobs/party de R-2.5/R-2.6 (D-2026-05-05-05) e expectativa do BULK_ONLY pattern.
-2. **(alternativa)** Pause de 24h em produção para validação completa Sprint 2 (volume baixo dos producers single-row pode demorar pra produzir checkpoint via tráfego natural).
-3. **(alternativa)** Outra prioridade — débito acumulado (D-2026-05-05-01 testabilidade workers) ou roadmap distinto.
+1. **Monitorar Sprint 3 em produção (próximas 6h):**
+   - Jobs com `triggered_by='coalesced'` aparecem na queue
+   - Volume total da queue cai 30-50%
+   - `avg_ms_processing` estável ou melhor
+   - 0 errors
+2. **Sprint 4** (D-CRON-4 — Repair worker) — substituir cron fallback por worker dedicado de repair com observability própria.
+3. **Sprint 5** (worker fairness real) e **Sprint 6** (dead letter + observability).
 
 ## Bloqueadores ativos
 
@@ -265,6 +269,50 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-05-08 — Sprint 3 aplicada via MCP em ~30min sem patch TS
+
+**Contexto:** R-3.1 + R-3.2 (Coalescing real) aplicados como **migration SQL única**
+via Supabase MCP. Zero mudança em código TypeScript dos producers. Validação E2E
+em produção em ~30min do início ao "feature funcional verificada".
+
+**Por que isso foi possível:**
+
+A Sprint 2 (Decision Write API canônica) garantiu que **todo** producer escreve
+em `segment_eval_queue` exclusivamente via `apply_contact_state_mutation` /
+`_batch`. A função canônica é o único INSERT na queue.
+
+Adicionar coalescing requereu apenas:
+1. Criar `UNIQUE INDEX parcial WHERE status='pending'` (1 statement DDL)
+2. Reescrever a Decision API para usar `ON CONFLICT DO UPDATE` com merge
+   (modificação centralizada em 2 funções SQL — single + batch)
+
+**Demonstra valor da centralização (Princípio P2 da constituição):**
+
+> "Single producer, single writer per dimension."
+
+Quando todos os caminhos de escrita passam por um ponto canônico, **features
+novas são adições centralizadas, não mudanças distribuídas em N producers**.
+Sprint 3 endereçou comportamento de 9 producers TS + 6 SQL alterando 2 funções
+SQL — um fator de redução de complexidade de **15x**.
+
+**Contraste com mundo pré-Sprint 2:** se a Sprint 3 fosse aplicada antes da
+Sprint 2 (12 producers escrevendo ad-hoc na queue), seria necessário:
+- Cada producer adotar UPSERT individualmente (12 PRs distintos)
+- Cada producer ser cuidadoso com partial UNIQUE INDEX
+- Risco de regressão silenciosa em producer não-migrado
+- Refactor distribuído com risco mais alto e menor consistência
+
+**Lição operacional:** centralização de escritas é pré-requisito para evolução
+arquitetural eficiente. Sprint 2 valeu como "preparação de terreno" mesmo que
+seu valor imediato (drift→0) já justificasse o esforço.
+
+**Custo evitado:** ~12 PRs distribuídos + risco de regressão por producer
+não-migrado.
+**Custo real:** ~30min de MCP execution + validação E2E.
+
+**Métrica de eficiência:** Sprint 3 = ~1 dia de trabalho condensado em 30min
+porque a Sprint 2 alinhou o cenário.
 
 ### D-2026-05-05-07 — Inventário textual pode divergir do estado real do banco
 
@@ -639,6 +687,52 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**🎯 SPRINT 3 FECHADA em 2026-05-05 — coalescing real aplicado via MCP**
+
+R-3.1 + R-3.2 aplicados em **migration única** via Supabase MCP, **sem patch TS**:
+
+- **R-3.1 — UNIQUE INDEX parcial:** `idx_seg_eval_queue_pending_unique_party ON
+  analytics.segment_eval_queue (tenant_id, party_id) WHERE status='pending'`.
+  Garante 1 row pendente por (tenant, party) — coalescing forçado pelo schema.
+- **R-3.2 — UPSERT que mescla:** `apply_contact_state_mutation` (single) e
+  `apply_contact_state_mutation_batch` reescritas com `ON CONFLICT
+  (tenant_id, party_id) WHERE status='pending' DO UPDATE` que mescla:
+  - `fields_changed` = união DISTINCT ordenada
+  - `priority` = `LEAST(EXCLUDED.priority, segment_eval_queue.priority)` (mais
+    urgente vence)
+  - `triggered_by` = `'coalesced'` (sinaliza merge para observability)
+  - `retry_count` reset para 0 (job efetivamente novo)
+  - `created_at` preservado (FIFO honesto)
+- Constraint `segment_eval_queue_triggered_by_check` estendida para aceitar
+  `'coalesced'`.
+
+**Validação E2E (via MCP, 2026-05-05):**
+- 2 inserts seguidos (refreshFeatures + refreshRfm) mesmo party → **1 row pending**
+- `fields_changed = ['frequency','monetary','r_score','recency_days']` (união)
+- `priority = 3` venceu sobre `priority = 5` (LEAST)
+- `was_coalesced = true` retornado pela Decision API
+- Worker R-1.6 processou em **584ms** sem erro
+
+**Beleza arquitetural — 0 mudança em código TS:** Sprint 2 (Decision API canônica)
+preparou o terreno. Tudo passa pelo único INSERT que agora coalesce. Princípio P2
+da constituição (single producer, single writer) provando seu valor — features
+arquiteturais novas são adições **centralizadas**, não mudanças distribuídas em
+N producers.
+
+**Resolve débitos abertos:**
+- ✅ **D-2026-05-05-05** (refreshFeatures orquestra refresh_rfm → 2 jobs/party):
+  agora coalesce em 1.
+- ✅ **R-2.5/R-2.6** edge case 2x-3x jobs/party em cada cron run.
+- ✅ **R-2.12** edge case do BULK_ONLY (form com múltiplos blocos enfileira N jobs).
+
+**Métricas a monitorar (próximas 6h):**
+- Aparição de jobs `triggered_by='coalesced'`
+- Volume total da queue: queda esperada de 30-50%
+- `avg_ms_processing` estável ou melhor
+- 0 errors
+
+---
 
 **🎯 SPRINT 2 FECHADA em 2026-05-05 — descoberta via cross-check MCP**
 

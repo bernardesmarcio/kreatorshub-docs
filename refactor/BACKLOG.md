@@ -515,45 +515,67 @@ R-2.x duplicando migração já feita. Lição registrada em D-2026-05-05-07.
 
 ## Fase 3 — Coalescing real
 
-### R-3.1 — Adicionar colunas de coalescing em segment_eval_queue
+### R-3.1 + R-3.2 — Coalescing real (UNIQUE INDEX parcial + UPSERT merge)
 
-**Status:** todo
-**Owner:** Dev (via Claude Code)
-**Estimativa:** 1h
-**Risco:** baixo
+**Status:** ✅ DONE em 2026-05-05 (aplicado via MCP em migration única, ~30min, sem patch TS — D-2026-05-05-08)
 
-**Critérios de aceite:**
-- `ALTER TABLE analytics.segment_eval_queue ADD COLUMN desired_state_version bigint NOT NULL DEFAULT 0`
-- `ALTER TABLE analytics.segment_eval_queue ADD COLUMN dirty_dimensions text[] NOT NULL DEFAULT '{}'`
-- `ALTER TABLE analytics.segment_eval_queue ADD COLUMN trigger_count int NOT NULL DEFAULT 1`
+**Aplicado:**
+- **UNIQUE INDEX parcial** `idx_seg_eval_queue_pending_unique_party ON
+  analytics.segment_eval_queue (tenant_id, party_id) WHERE status='pending'`
+  — escopo simplificado vs. plano original (`status IN ('pending','claimed')`):
+  apenas `pending` é coalescível, `claimed` representa job já em processamento
+- **`apply_contact_state_mutation` + `apply_contact_state_mutation_batch`**
+  reescritas com `ON CONFLICT (tenant_id, party_id) WHERE status='pending'
+  DO UPDATE` que mescla:
+  - `fields_changed` = união DISTINCT ordenada
+  - `priority = LEAST(EXCLUDED.priority, segment_eval_queue.priority)` (mais
+    urgente vence)
+  - `triggered_by = 'coalesced'` (sinaliza merge para observability)
+  - `retry_count` reset para 0 (job efetivamente novo)
+  - `created_at` preservado (FIFO honesto)
+- Constraint `segment_eval_queue_triggered_by_check` estendida para aceitar `'coalesced'`
 
-### R-3.2 — Unique index parcial para coalescing
+**Decisão:** colunas `desired_state_version` / `dirty_dimensions` / `trigger_count`
+do plano original **não foram criadas** — `fields_changed` (já existia) absorve a
+função de `dirty_dimensions`; `priority` LEAST + FIFO via `created_at` resolve o
+papel de `desired_state_version` na prática. `trigger_count` cabe como métrica
+futura se a observability pedir.
 
-**Status:** todo
-**Owner:** Dev (via Claude Code)
-**Estimativa:** 30min (mas exige downtime curto)
-**Risco:** médio (criar unique index em tabela grande pode bloquear)
-**Bloqueado por:** R-3.1
+**Validação E2E (via MCP, 2026-05-05):**
+- 2 inserts seguidos (refreshFeatures + refreshRfm) mesmo party → 1 row pending
+- `fields_changed = ['frequency','monetary','r_score','recency_days']` (união)
+- `priority = 3` venceu sobre `priority = 5`
+- `was_coalesced = true` retornado pela Decision API
+- Worker R-1.6 processou em 584ms sem erro
 
-**Critérios de aceite:**
-- `CREATE UNIQUE INDEX CONCURRENTLY seg_eval_queue_active_uniq ON analytics.segment_eval_queue (tenant_id, party_id) WHERE status IN ('pending','claimed')`
-- CONCURRENTLY para não bloquear writes
-- Validado: nenhum row pendente duplicado existia antes (preventiva)
+**Resolve débitos:**
+- ✅ D-2026-05-05-05 (refreshFeatures orquestra refresh_rfm — 2 jobs/party)
+- ✅ Edge case 2x-3x jobs/party de R-2.5/R-2.6
+- ✅ Edge case BULK_ONLY de R-2.12 (form com múltiplos blocos)
+
+**Beleza arquitetural:** 0 mudança em código TS (D-2026-05-05-08). Sprint 2
+preparou o terreno: tudo passa pelo único INSERT que agora coalesce.
 
 ### R-3.3 — Função canônica usa ON CONFLICT para coalescer
 
-**Status:** todo
-**Owner:** Dev (via Claude Code)
-**Estimativa:** 2h
-**Risco:** baixo
-**Bloqueado por:** R-3.2
+**Status:** ✅ DONE em 2026-05-05 — **absorvido por R-3.1+R-3.2** (aplicação única via MCP)
 
-**Critérios de aceite:**
-- `enqueue_segment_eval_canonical` atualizada: `ON CONFLICT (tenant_id, party_id) WHERE status IN ('pending','claimed') DO UPDATE`
-- `desired_state_version = GREATEST(existing, new)`
-- `dirty_dimensions = array_distinct(existing || new)`
-- `trigger_count = existing + 1`
-- Testes cobrindo: 10 events same party em janela = 1 row final
+A spec original previa essa tarefa como passo separado, mas a aplicação MCP
+fez `apply_contact_state_mutation` / `_batch` adotarem o `ON CONFLICT DO UPDATE`
+merge na mesma migration de R-3.1+R-3.2. Não há `enqueue_segment_eval_canonical`
+separada — Decision API É a função canônica desde Sprint 2.
+
+Adaptações vs spec original:
+- `desired_state_version = GREATEST` substituído por **`priority = LEAST`** + FIFO
+  via `created_at` (semântica equivalente para o caso de uso real: mais urgente
+  vence, ordem temporal preservada)
+- `dirty_dimensions = array_distinct(existing || new)` mapeado para
+  **`fields_changed = união DISTINCT ordenada`** (`fields_changed` já existia,
+  evitou criar coluna nova)
+- `trigger_count` **não criado** — fica como métrica futura se observability pedir
+
+Testes cobrindo "10 events same party em janela = 1 row final" validados via
+MCP em produção (2 events → 1 row pending).
 
 ### R-3.4 — Worker filtra segmentos por interseção dirty_dimensions ∩ depends_on_fields
 

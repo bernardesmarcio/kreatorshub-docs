@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.29 — Sprint 2 do refactor fechada (Decision Write API canônica)*
+*Versão 7.30 — Sprint 3 do refactor fechada (Coalescing real via UNIQUE INDEX + UPSERT merge)*
 
 ---
 
@@ -1604,16 +1604,105 @@ Detalhes da whitelist regular vs blacklist vs BULK_ONLY: §22.3.
 | Producers fora do contrato Decision API | 12 (todos) | 2 (out-of-scope D-2026-05-05-06) | computeClusters/Subgroups por design (notificação cross-system). |
 | Triggers SQL com `state_version+1` legacy | 6 funções | **0** | Cross-check MCP em 2026-05-05. |
 
-### Próximo: Sprint 3
+### Próximo: Sprint 3 ✅ FECHADA
 
-Coalescing real (R-3.1/R-3.2):
-- **R-3.1:** UNIQUE INDEX parcial em `analytics.segment_eval_queue (tenant_id, party_id) WHERE status='pending'`
-- **R-3.2:** UPSERT que mescla `fields_changed` em vez de criar nova row
+Ver §22.5 abaixo.
 
-Resolve naturalmente:
-- 2x jobs/party da orquestração refreshFeatures→refreshRfm (D-2026-05-05-05)
-- 2x jobs/party do refreshReactivation (UPSERT scoring + cleaner no mesmo cron run)
-- BULK_ONLY pattern do traitProducer (form com múltiplos blocos enfileira N jobs)
+---
+
+## §22.5 Sprint 3 do refactor — Coalescing real
+
+**Status:** ✅ FECHADA em **2026-05-05** (~30min via MCP, sem patch TS).
+**Documentação operacional viva:** `docs/refactor/PROGRESS.md` + `docs/refactor/BACKLOG.md`.
+
+### Objetivo
+
+Garantir que múltiplos enqueues para o mesmo `(tenant_id, party_id)` em janela
+de tempo curta produzam **1 única row pending** com `fields_changed` mesclado,
+em vez de N rows duplicadas que o worker processaria sequencialmente.
+
+Antes: cada producer chamava Decision API → INSERT na queue → worker processava
+N jobs idênticos para o mesmo party. Após R-2.5/R-2.6, observou-se 2x-3x jobs
+por cron run (D-2026-05-05-05).
+
+### Implementação
+
+Aplicação única via Supabase MCP (D-2026-05-05-08):
+
+**1. UNIQUE INDEX parcial:**
+```sql
+CREATE UNIQUE INDEX idx_seg_eval_queue_pending_unique_party
+  ON analytics.segment_eval_queue (tenant_id, party_id)
+  WHERE status = 'pending';
+```
+Garante 1 row pending por (tenant, party). `claimed` é excluído do escopo —
+representa job em processamento, não coalescível.
+
+**2. Decision API com `ON CONFLICT DO UPDATE`:**
+`apply_contact_state_mutation` (single) e `apply_contact_state_mutation_batch`
+reescritas para detectar conflito no UNIQUE INDEX e mesclar.
+
+### Merge semantics
+
+| Coluna | Lógica | Justificativa |
+|---|---|---|
+| `fields_changed` | união DISTINCT ordenada | Worker filtra segmentos por interseção `fields_changed ∩ depends_on_fields` — união cobre todas as dimensões que merecem re-eval |
+| `priority` | `LEAST(EXCLUDED, existente)` | Mais urgente vence (priority menor = mais urgente no schema atual). Trait change priority=3 vence sobre form_submit priority=5. |
+| `triggered_by` | `'coalesced'` | Sinaliza para observability que essa row passou por merge. Constraint estendida para aceitar valor. |
+| `retry_count` | reset para 0 | Job efetivamente novo após merge — falhas anteriores não devem contar |
+| `created_at` | preservado | FIFO honesto — ordem temporal do primeiro insert preservada |
+| `updated_at` | `now()` | Auditoria do último merge |
+
+### Filtragem natural pelo worker
+
+Worker R-1.6 (`segment-eval-worker`) já filtra segmentos via interseção
+`fields_changed ∩ depends_on_fields` (linha 215 de `segment-rules-evaluator.ts`,
+princípio P8 dependency-aware evaluation). Após merge, o array mesclado é
+processado em uma única passagem — segmentos que dependem de qualquer dimensão
+no array são re-avaliados, segmentos que não dependem são pulados.
+
+**Sem mudança no worker.** A filtragem que já existia agora opera sobre o array
+mesclado naturalmente.
+
+### Validação E2E (via MCP, 2026-05-05)
+
+- 2 inserts seguidos (`refreshFeatures` + `refreshRfm`) mesmo party → **1 row pending**
+- `fields_changed = ['frequency','monetary','r_score','recency_days']` (união)
+- `priority = 3` venceu sobre `priority = 5`
+- `was_coalesced = true` retornado pela Decision API
+- Worker R-1.6 processou em **584ms** sem erro
+
+### Beleza arquitetural — 0 mudança em código TS
+
+Sprint 2 (Decision Write API canônica) preparou o terreno: tudo passa pelo
+**único INSERT** que agora coalesce. Princípio **P2** da constituição
+(*single producer, single writer per dimension*) materializado: features
+arquiteturais novas são adições **centralizadas**, não mudanças distribuídas
+em N producers.
+
+Sprint 3 endereçou comportamento de 9 producers TS + 6 SQL alterando 2 funções
+SQL — fator de redução de complexidade de **~15x** vs. cenário pré-Sprint 2.
+
+### Débitos resolvidos
+
+- ✅ **D-2026-05-05-05** — refreshFeatures orquestra refresh_rfm gerando 2 jobs/party
+- ✅ Edge case 2x-3x jobs/party de R-2.5/R-2.6 (orquestração + cleaner)
+- ✅ Edge case BULK_ONLY de R-2.12 (form com múltiplos blocos enfileira N jobs)
+
+### Métricas a monitorar (próximas 6h pós-deploy)
+
+- Aparição de jobs com `triggered_by='coalesced'` na queue
+- Volume total da queue: queda esperada de **30-50%**
+- `avg_ms_processing` estável ou melhor (menos jobs duplicados = menos contenção)
+- 0 errors funcionais
+
+### Próximo: Sprint 4
+
+- **D-CRON-4** — Repair worker substituir cron fallback (worker dedicado de
+  repair com observability própria)
+- **Sprint 5** — worker fairness real (anti-starvation per tenant)
+- **Sprint 6** — dead letter + observability completa (telemetria estruturada,
+  alertas, dashboards)
 
 ---
 
