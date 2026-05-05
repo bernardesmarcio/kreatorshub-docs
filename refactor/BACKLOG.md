@@ -470,7 +470,7 @@ recente, membership consistente entre `segments` counts e
 
 Adicionalmente: threshold slow_job ajustado 200ms → 1500ms (commit
 `0a9c50e`) para restaurar signal-to-noise pós-Fase 1.
-- **R-2.12:** `refreshReactivation.ts:246,337`
+- **R-2.12:** ✅ DONE em 2026-05-05 (R-2.6 do plano operacional) — `refreshReactivation.ts` migrado em **2 escopos**: (1) UPSERT principal de scoring (chunks de 1000) e (2) `cleanReactivatedCustomers` (UPDATE de cleaning), ambos com Decision API batch atômico via `sql.begin()`. 1 dimensão whitelist (`reactivation_priority`); `reactivation_score` é metadata interno (ranking) fora da whitelist. Priority=6, `triggered_by='refreshReactivation'` em ambos. Bug latente fechado em 2 frentes (UPSERT + cleaner não enfileiravam eval). **Sprint 2 milestone — 3/3 producers bulk migrados** (refreshRfm + refreshFeatures + refreshReactivation).
 - **R-2.13:** `computeClusters.ts:692` + `computeClusterSubgroups.ts:808`
 - **R-2.14:** Triggers `trg_sync_party_type` + `trigger_auto_populate_contact_state`
 - **R-2.15:** Frontend `analyticsStorage.ts:527` (D-SEG-12)

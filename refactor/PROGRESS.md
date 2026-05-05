@@ -11,14 +11,14 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.5 fechado (validado em produção: job manual 57.9s, 10.304 jobs com `triggered_by='refreshFeatures'`, 0 errors, drenando 10-12 jobs/s). 4 producers migrados. Standby para R-2.6.
+**Fase ativa:** Fase 2, R-2.6 aplicado (refreshReactivation usa Decision API batch em 2 escopos). **Sprint 2 milestone — 3/3 producers bulk migrados.** 5 producers totais. Aguardando deploy + job manual de validação.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.5 close
+**Quem atualizou:** Claude Code via R-2.6 cutover
 
 ## Próximas 3 ações
 
-1. **R-2.6** — `refreshReactivation` (último producer bulk pendente — mesmo gap latente, mesmo pattern bulk de R-2.4/R-2.5).
-2. **R-3.2** — UNIQUE INDEX parcial coalescente em `segment_eval_queue (tenant_id, party_id) WHERE status='pending'` + UPSERT que mescla `fields_changed`. Resolve naturalmente o 2x jobs/party causado pela orquestração refreshFeatures→refreshRfm (D-2026-05-05-05).
+1. **Validar R-2.6 em produção** — job manual `refresh_reactivation` deve completar em <30s, gerar 2 batches em `segment_eval_queue` (cleaner pequeno + UPSERT principal) com `triggered_by='refreshReactivation'`, drift drenar em <5min, 0 errors.
+2. **R-3.2** — UNIQUE INDEX parcial coalescente em `segment_eval_queue (tenant_id, party_id) WHERE status='pending'` + UPSERT mesclando `fields_changed`. Resolve naturalmente o 2x jobs/party da orquestração refreshFeatures→refreshRfm (D-2026-05-05-05) e o 2x do próprio R-2.6 (cleaner + UPSERT no mesmo cron run).
 3. **R-2.7+** — producers single-row restantes (`linkProducts`, `traitProducer`, `computeClusters`, etc) — pattern R-2.3.
 
 ## Bloqueadores ativos
@@ -554,6 +554,21 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.6 aplicado em 2026-05-05:**
+- `workers/analytics/src/handlers/refreshReactivation.ts` migrado em **2 escopos** (mesmo handler tinha 2 write paths em dimensão whitelisted):
+  - **Escopo 1 — UPSERT principal (linhas 245-274 pós-patch):** loop por chunk de 1000 (`UPSERT_CHUNK_SIZE`), envolto em `sql.begin()` com Decision API batch
+  - **Escopo 2 — `cleanReactivatedCustomers` (linha 333+):** UPDATE de cleaning (parties que voltaram a comprar e saem de segmentos `reactivation_priority IS NOT NULL`) também envolto em `sql.begin()` com Decision API batch sobre os IDs do `RETURNING party_id`. try/catch externo preservado mantém comportamento "non-blocking" do cleaner
+- **1 dimensão real**: `reactivation_priority` (whitelist §22.3). `reactivation_score` é metadata de ranking interno, não whitelist
+- Priority=6
+- `triggered_by='refreshReactivation'` em ambos escopos (mesmo handler, mesmo conceito; diferenciação por payload se necessária no futuro)
+- **Bug latente fechado em 2 frentes:**
+  - UPSERT de scoring nunca enfileirava eval
+  - Cleaner setando `reactivation_priority=NULL` também não enfileirava — drift silencioso em segmentos que filtram por `reactivation_priority IS NOT NULL`
+- Sem mudança em: cálculo de scoring/percentRanks, `lifecycle_events` insert (try/catch best-effort), `tenant_processing_state` UPSERT, orquestração `refresh_segments` no fim
+- Validação local: typecheck ✓, build ✓, vitest 55/55 ✓
+- **Sprint 2 milestone — 3/3 producers bulk migrados:** refreshRfm (R-2.4), refreshFeatures (R-2.5), refreshReactivation (R-2.6) ✅
+- Próximo: validar em produção + R-2.7+ (producers single-row)
 
 **R-2.5 aplicado em 2026-05-05:**
 - `workers/analytics/src/handlers/refreshFeatures.ts` (linhas 167-189) → migrado para Decision API batch (pattern R-2.4)
