@@ -442,7 +442,7 @@ Lista detalhada — cada um vira PR isolado com testes:
 - **R-2.8:** `traitProducer.ts:730`
 - **R-2.9:** `linkProducts.ts:198`
 - **R-2.10:** `refreshFeatures.ts:163,187`
-- **R-2.11:** `refreshRfm.ts:237`
+- **R-2.11:** ✅ DONE em 2026-05-05 (R-2.4 do plano operacional) — `refreshRfm.ts` migrado para `analytics.apply_contact_state_mutation_batch` (priority=6, dimensions=`r_score,f_score,m_score,rfm_segment,value_tier,lifecycle_stage`). Atomicidade UPSERT+Decision API por chunk via `sql.begin()`. Bug latente fechado: 9.857 parties/6h estavam invisíveis à segmentação (D-2026-05-05-02). Pattern bulk producer estabelecido para R-2.10 (refreshFeatures) e R-2.12 (refreshReactivation). Aguardando próximo cron run real para checkpoint.
 - **R-2.12:** `refreshReactivation.ts:246,337`
 - **R-2.13:** `computeClusters.ts:692` + `computeClusterSubgroups.ts:808`
 - **R-2.14:** Triggers `trg_sync_party_type` + `trigger_auto_populate_contact_state`

@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.3 aplicado (recordTagChange agora usa Decision API em enforce). 2 producers migrados (process_purchase_analytics + recordTagChange). Aguardando tráfego natural para validar R-2.3.
-**Última atualização:** 2026-05-04
-**Quem atualizou:** Claude Code via R-2.3 cutover
+**Fase ativa:** Fase 2, R-2.4 aplicado (refreshRfm agora usa Decision API batch). 3 producers migrados (process_purchase_analytics + recordTagChange + refreshRfm). Aguardando próximo cron run `rfm-rolling-refresh` (top da hora) para validar R-2.4.
+**Última atualização:** 2026-05-05
+**Quem atualizou:** Claude Code via R-2.4 cutover
 
 ## Próximas 3 ações
 
-1. **Validar R-2.3 com tráfego real** — aguardar tag change real (UI ou webhook). Esperado: 1 row em `segment_eval_queue` com `triggered_by='recordTagChange'` (não mais `'tag_change'`), `segmentation_input_version` bumpa, `state_version` NÃO bumpa, drift global mantém 0.
-2. **R-2.4** — próximo producer. Candidato: `recordFormSubmitted` (mesmo arquivo, pattern idêntico) ou `refreshRfm`.
-3. **R-2.5 a R-2.15** — replicar pattern para producers restantes.
+1. **Validar R-2.4 com cron run real** — aguardar próximo `rfm-rolling-refresh` (`0 * * * *`). Esperado: N jobs em `segment_eval_queue` com `triggered_by='refreshRfm'`, drift global volta a 0 em <5min, avg_ms_processing < 2000ms, zero erros nos logs Railway. **Bug latente fechado:** refreshRfm refresha 9.857 parties/6h, antes invisíveis à segmentação.
+2. **R-2.5** — `refreshFeatures` (mesmo gap latente, mesmo pattern bulk).
+3. **R-2.6** — `refreshReactivation` (mesmo gap latente, mesmo pattern bulk).
 
 ## Bloqueadores ativos
 
@@ -266,6 +266,37 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
 
+### D-2026-05-05-02 — refreshRfm sempre teve gap event-driven (anterior à Fase 1)
+
+**Contexto:** durante R-2.4, identificado que `refreshRfm` (cron horário sobre
+9.857 parties/6h) **nunca** enfileirou eval de segmentação. UPSERT atual em
+`contact_state` toca apenas `r_score, f_score, m_score, rfm_segment, value_tier,
+lifecycle_stage, scores_updated_at` — nunca `state_updated_at` nem
+`segmentation_input_version`. Logo:
+
+- Cron antigo (predicate `state_updated_at`, pré-R-1.5): também não pegava
+  mudanças de RFM, porque o UPSERT não bumpa `state_updated_at`.
+- Cron novo (predicate semântico `segmentation_input_version > watermark`,
+  pós-R-1.5): igualmente não pega — `segmentation_input_version` não muda.
+
+**Conclusão:** mudanças de RFM nunca dispararam re-eval de segmentação na
+plataforma. Compensação histórica vinha de outros producers (purchase
+ingestion via `process_purchase_analytics`) ou de fallback agressivo do cron
+de eval (que também foi corrigido em R-1.5).
+
+**Decisão:** R-2.4 fecha esse gap pela primeira vez. Não bloqueia roadmap;
+fica registrado como contexto histórico para auditoria de comportamento de
+segmentação pré-Fase 2.
+
+**Custo:** zero (R-2.4 já endereça).
+
+**Lição operacional:** producers bulk batch precisam ser cobertos por audit
+explícito de "enfileira eval?" durante design, não pós-incidente. A whitelist
+de dimensões §22.3 indica O QUE deve disparar re-eval; o cross-check de
+PRODUCERS x dimensões whitelisted ainda não existe como validação automática.
+Candidato a teste de integração na sprint dedicada de testabilidade
+(D-2026-05-05-01).
+
 ### D-2026-05-05-01 — workers/historical-sync sem suíte de testes
 
 **Contexto:** durante R-2.3 (migração `recordTagChange` → Decision API enforce),
@@ -399,6 +430,17 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.4 aplicado em 2026-05-05:**
+- `workers/analytics/src/handlers/refreshRfm.ts` → migrado para Decision API batch mode
+- Pattern bulk producer estabelecido (replicar em R-2.5 `refreshFeatures` e R-2.6 `refreshReactivation`)
+- Path antigo (UPSERT bulk em `analytics.contact_state` com `r_score, f_score, m_score, rfm_segment, value_tier, lifecycle_stage, scores_updated_at`) preservado byte-a-byte
+- Path novo: após cada chunk de UPSERT (1000 parties), chamada a `analytics.apply_contact_state_mutation_batch(tenant_id, party_ids, 'refreshRfm', ARRAY['r_score','f_score','m_score','rfm_segment','value_tier','lifecycle_stage'], 6)`
+- Atomicidade por chunk via `sql.begin()` — UPSERT chunk + Decision API chunk atômicos. Falha em chunk N: chunks 1..N-1 ficam atômicos completos; chunks N+1..fim não rodam; rerun do cron pega o que falhou
+- **Bug latente fechado:** refreshRfm não enfileirava `segment_eval_queue` (D-2026-05-05-02). 9.857 parties/6h refreshadas eram invisíveis à segmentação no R-1.5 (cron predicate semântico). Antes do R-1.5 (cron predicate `state_updated_at`), também não pegava porque UPSERT atual não toca em `state_updated_at`. Primeira vez na história que mudanças de RFM disparam re-eval de segmentação.
+- Sem mudança em: `lifecycle_events` INSERT (best-effort, fora da transação), `journeys.enqueue_segment_checks()`, `tenant_processing_state` UPSERT, orquestração de `refresh_reactivation`, logs
+- Validação local: `npx vitest run` 49 passed (3 arquivos), `npm run typecheck` ✓, `npm run build` ✓
+- Próximo: validar com cron run real + R-2.5 (`refreshFeatures`)
 
 **R-2.3 aplicado em 2026-05-04:**
 - `workers/historical-sync/src/handlers/webhook/analytics-events.ts` → `recordTagChange` migrado para Decision API em enforce
