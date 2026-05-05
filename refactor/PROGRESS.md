@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.1b cutover aplicado (process_purchase_analytics agora usa Decision API em enforce). Aguardando tráfego natural para validar.
-**Última atualização:** 2026-05-03 03:00 UTC
-**Quem atualizou:** Claude Code via R-2.1b cutover (Marcio já havia aplicado branch enforce na Decision API + constraint triggered_by em outra sessão)
+**Fase ativa:** Fase 2, R-2.3 aplicado (recordTagChange agora usa Decision API em enforce). 2 producers migrados (process_purchase_analytics + recordTagChange). Aguardando tráfego natural para validar R-2.3.
+**Última atualização:** 2026-05-04
+**Quem atualizou:** Claude Code via R-2.3 cutover
 
 ## Próximas 3 ações
 
-1. **Validar R-2.1b com tráfego real** — aguardar purchase real via webhook. Esperado: 1 row em `segment_eval_queue` com `triggered_by='process_purchase_analytics'`, `segmentation_input_version` bumpa, `state_version` NÃO bumpa (Decision API gerencia versões), drift global mantém 0. **Sem** row em `decision_api_dryrun_log` (não é mais dryrun).
-2. **R-2.3** — migrar próximo producer para pattern dry-run+cutover. Candidatos por simplicidade: `recordTagChange` (workers/historical-sync) ou triggers SQL `trigger_auto_populate_contact_state`.
-3. **R-2.4 a R-2.15** — replicar pattern para 10 producers restantes.
+1. **Validar R-2.3 com tráfego real** — aguardar tag change real (UI ou webhook). Esperado: 1 row em `segment_eval_queue` com `triggered_by='recordTagChange'` (não mais `'tag_change'`), `segmentation_input_version` bumpa, `state_version` NÃO bumpa, drift global mantém 0.
+2. **R-2.4** — próximo producer. Candidato: `recordFormSubmitted` (mesmo arquivo, pattern idêntico) ou `refreshRfm`.
+3. **R-2.5 a R-2.15** — replicar pattern para producers restantes.
 
 ## Bloqueadores ativos
 
@@ -266,6 +266,32 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
 
+### D-2026-05-05-01 — workers/historical-sync sem suíte de testes
+
+**Contexto:** durante R-2.3 (migração `recordTagChange` → Decision API enforce),
+constatado que `workers/historical-sync` não tem `scripts.test` no `package.json`
+nem arquivos `.test.ts`/`.spec.ts`. Critério 5 do brief R-2.3 ("testes unit
+existentes passam") ficou n/a. Validação reduzida a `typecheck` + `build` +
+observação em produção.
+
+**Decisão:** registrar como débito futuro; **não** bloqueia R-2.4+.
+
+**Justificativa:** criar suíte agora atrasa Sprint 2 (10 producers ainda a
+migrar com pattern já validado). Pattern producer→Decision API é mecânico e
+auditável via SQL pós-deploy (`segment_eval_queue.triggered_by`, drift). O risco
+de regressão silenciosa é baixo enquanto a observabilidade pós-deploy continuar
+nesse nível.
+
+**Plano:** sprint dedicada de testabilidade pós-Fase 2. Mínimo desejado:
+- Vitest configurado em `workers/historical-sync` (e nos demais workers)
+- Mocks de `sql` via `pg-mem` ou injeção de `Sql` por dependência
+- Cobertura inicial dos producers Decision API (assert chamada com `'enforce'`,
+  payload correto, ordem UPDATE→Decision API, atomicidade `sql.begin`)
+- `npm run test` + `typecheck` + `build` no CI/CD do worker
+
+**Custo evitado agora:** ~1 dia de scaffold de testes × 4 workers = 4 dias.
+**Custo futuro:** 1 sprint dedicada (~1 semana) com retorno permanente.
+
 ## Histórico de sprints
 
 ### Sprint 0 — Setup (CONCLUÍDO 2026-05-02)
@@ -373,6 +399,21 @@ membership recalculation deixa de ser side effect (P4 implementado).
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.3 aplicado em 2026-05-04:**
+- `workers/historical-sync/src/handlers/webhook/analytics-events.ts` → `recordTagChange` migrado para Decision API em enforce
+- Path antigo removido:
+  - `state_version = state_version + 1` no UPDATE de `tag_ids` (ambos os branches added/removed)
+  - `INSERT INTO analytics.segment_eval_queue (...) VALUES (..., 'tag_change', ...)` direto
+- Path novo:
+  - UPDATE de domínio (`tag_ids`, `state_updated_at = now()`) preservado
+  - `analytics.apply_contact_state_mutation(..., 'recordTagChange', ARRAY['tag_ids'], payload, 5, 'enforce')` chamado após o UPDATE
+  - Bloco envolvido em `sql.begin()` (postgres.js) — atomicidade UPDATE+Decision API (D-2026-05-03-02)
+  - try/catch externo removido — falha propaga ao caller (sem EXCEPTION isolation)
+- `triggered_by` muda de `'tag_change'` → `'recordTagChange'` (constraint já aceita desde R-2.1b)
+- Validação local: `npm run typecheck` ✓, `npm run build` ✓ no worker historical-sync
+- Sem testes unit no worker (n/a critério 5 do brief)
+- Próximo: validar com tag change real + R-2.4 (`recordFormSubmitted` é o próximo natural — mesmo arquivo, pattern idêntico)
 
 ## Lições aprendidas (acumulando)
 
