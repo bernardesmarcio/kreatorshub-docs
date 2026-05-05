@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.10 + R-2.11 fechados como **out-of-scope** (computeClusters/computeClusterSubgroups não são producers de contact_state — usam segment_eval_queue como canal de notificação cross-system para journey engine; D-2026-05-05-06). 9/12 producers TS migrados + 2 fora de escopo.
+**Fase ativa:** Fase 2, R-2.12 aplicado (traitProducer usa Decision API BULK_ONLY pattern). **TS-side completo: 10/12 migrados + 2 out-of-scope.** Restam apenas producers SQL (R-2.13+).
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.10/R-2.11 closure decision
+**Quem atualizou:** Claude Code via R-2.12 cutover
 
 ## Próximas 3 ações
 
-1. **R-2.12** — `traitProducer` (workers/analytics/src/segmentation/traitProducer.ts:730) — TS hot path crítico de form ingestion, fields_changed dinâmico. Último producer TS (não-SQL) a migrar.
-2. **R-2.13** — `sync_tag_ids_to_contact_state` (SQL trigger function) — **primeiro producer SQL** da sprint. Técnica diferente: edita função PL/pgSQL via `apply_migration` (Supabase MCP), pattern baseado em R-2.1b.
-3. **R-2.14** — `trigger_auto_populate_contact_state` (SQL trigger function) — pattern R-2.13.
+1. **R-2.13** — `sync_tag_ids_to_contact_state` (SQL trigger function) — **primeiro producer SQL** da sprint. Técnica diferente: edita função PL/pgSQL via `apply_migration` (Supabase MCP), pattern baseado em R-2.1b. Volume potencialmente alto (tag changes via UI).
+2. **R-2.14** — `trigger_auto_populate_contact_state` (SQL trigger function) — init de party novo. Pattern R-2.13.
+3. **R-2.15** — `record_email_engagement_event` (SQL trigger function) — alto volume potencial (email engagement). Pattern R-2.13.
 
 ## Bloqueadores ativos
 
@@ -597,6 +597,23 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.12 aplicado em 2026-05-05:**
+- `workers/analytics/src/segmentation/traitProducer.ts:727-755` (function `processSubmission`) → migrado para Decision API single em enforce, **BULK_ONLY pattern**
+- Path antigo removido:
+  - `INSERT INTO analytics.segment_eval_queue (..., 'form_submission', $4::text[], 3, 'pending', now()) ON CONFLICT DO NOTHING` direto
+- Path novo:
+  - `analytics.apply_contact_state_mutation(..., 'traitProducer', dimensionsChanged, payload, 3, 'enforce')` chamado **dentro do `db.begin` existente** (linha 631) — sem `sql.begin` aninhado
+  - **Estratégia granular vs genérico:** se `fieldsChangedArr.length <= 5` → granular `['party_trait_<key>']` por trait; caso contrário → genérico `['party_traits']`. Evita poluir telemetria com arrays grandes.
+  - **BULK_ONLY:** Decision API entende `party_traits` e `party_trait_*` via `analytics.is_bulk_only_dimension`. Comportamento: bumpa `state_updated_at` + enfileira eval, **NÃO** bumpa `seg_version` (correto — traits vivem em `crm.party_trait_*`, não em `contact_state`)
+  - Priority **3 preservada** (intencional: trait change pode disparar regra de segmentação imediata; mais urgente que `recordFormSubmitted=5` que marca submission inteira). Princípio: sem evidência clara de bug, não mudar prioridade durante refactor.
+- `triggered_by`: `'form_submission'` → `'traitProducer'` (constraint já aceita)
+- Payload inclui `submission_id` para observability/debug
+- Producer **não toca** `contact_state`: traits vivem em `crm.party_trait_text/number/timestamp/boolean/multi_value`, identity em `crm.party_profile`. Nada a remover de `state_version` (não bumpava).
+- Test atualizado em `traitProducer.test.ts:244-256` (Block 11 test 13): valida chamada Decision API + array granular `['party_trait_full_name', 'party_trait_age']` em vez do INSERT antigo
+- Validação local: typecheck ✓, build ✓, vitest **55/55** ✓
+- **TS-side completo:** 10/12 producers TS migrados + 2 out-of-scope. Restam apenas SQL triggers (R-2.13+).
+- Volume baixo (~46 traits/7d) — validação produção via tráfego natural ou simulação de form submission via UI
 
 **R-2.10 + R-2.11 fechados como OUT-OF-SCOPE em 2026-05-05:**
 - `workers/analytics/src/handlers/computeClusters.ts:691-704`
