@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.28 — Refactor Plan v1.1 (cleanup) + §22.3 whitelist canônica de dimensões*
+*Versão 7.29 — Sprint 2 do refactor fechada (Decision Write API canônica)*
 
 ---
 
@@ -1504,6 +1504,116 @@ P9: Coalescing real via UNIQUE constraint.
 P10: Observability é camada própria (R52).
 
 Toda PR durante o refactor deve referenciar tarefa do BACKLOG (R-X.Y) e respeitar P1-P10.
+
+---
+
+## §22.4 Sprint 2 do refactor — Decision Write API canônica
+
+**Status:** ✅ FECHADA em **2026-05-05** (~3 dias de execução).
+**Documentação operacional viva:** `docs/refactor/PROGRESS.md` + `docs/refactor/BACKLOG.md`.
+
+### Objetivo da Sprint 2
+
+Centralizar a escrita em `analytics.contact_state` e o enqueue em
+`analytics.segment_eval_queue` numa única função canônica
+(`analytics.apply_contact_state_mutation` / `_batch`) — a **Decision Write API**.
+
+Antes da Sprint 2, cada producer tinha que:
+1. Bumpar `state_version` (legacy) manualmente
+2. Decidir sozinho se enfileirava `segment_eval_queue`
+3. Construir o INSERT direto com `triggered_by` arbitrário
+
+Pós-Sprint 2, producers só escrevem suas dimensões de domínio + chamam a Decision API
+com `(tenant_id, party_id, producer, dimensions_changed[], payload, priority, mode)`.
+A API decide via **whitelist §22.3** se a mudança é segmentation-relevant, bumpa
+`segmentation_input_version` quando aplicável, e enfileira atomicamente.
+
+### 17 producers endereçados
+
+**9 producers TypeScript migrados:**
+
+| R-* | Producer | Tipo | Localização |
+|---|---|---|---|
+| R-2.1b | `process_purchase_analytics` | SQL fn | `analytics.process_purchase_analytics` |
+| R-2.3 | `recordTagChange` | TS single-row | `historical-sync/.../analytics-events.ts:24` |
+| R-2.4 | `refreshRfm` | TS bulk per-chunk | `analytics/handlers/refreshRfm.ts:241` |
+| R-2.5 | `refreshFeatures` | TS bulk per-chunk | `analytics/handlers/refreshFeatures.ts:175` |
+| R-2.6 | `refreshReactivation` | TS bulk + cleaner (2 escopos) | `analytics/handlers/refreshReactivation.ts:252,361` |
+| R-2.7 | `recordFormSubmitted` | TS single-row | `historical-sync/.../analytics-events.ts:105` |
+| R-2.8 | `recordImportAdded` | TS single-row | `historical-sync/.../analytics-events.ts:169` |
+| R-2.9 | `linkProducts` | TS bulk via array | `analytics/handlers/linkProducts.ts:175` |
+| R-2.12 | `traitProducer` | TS single-row BULK_ONLY | `analytics/segmentation/traitProducer.ts:727` |
+
+**6 producers SQL migrados** (descobertos via cross-check MCP — D-2026-05-05-07):
+
+| Função | Schema |
+|---|---|
+| `sync_tag_ids_to_contact_state` | analytics |
+| `trigger_auto_populate_contact_state` | analytics |
+| `record_email_engagement_event` | email |
+| `trg_product_name_mapped` | commerce |
+| `sync_party_type` | analytics |
+| `sync_party_types_batch` | analytics |
+
+**2 fora de escopo** (D-2026-05-05-06):
+- `computeClusters`, `computeClusterSubgroups` — usam `segment_eval_queue` como
+  canal de notificação cross-system para journey engine, não como re-eval por
+  mudança de input. `segment_ids` é output, não input.
+
+### Pattern BULK_ONLY (R36) formalizado
+
+Dimensões em `depends_on_fields` mas que **não vivem em `contact_state`**.
+Decision API classifica via `analytics.is_bulk_only_dimension(text)`:
+bumpa `state_updated_at` + enfileira eval, **não** bumpa `segmentation_input_version`.
+Avaliação real ocorre via SQL path (`eval_condition_v2`), não watermark per-party.
+
+Categorias BULK_ONLY canônicas:
+
+- **Cluster** (R-2.10/R-2.11): `cluster_id`, `cluster_subgroup_id`
+- **Opportunity** (R36 original): `has_opportunity`, `opportunity_status`,
+  `opportunity_pipeline`, `opportunity_stage`, `opportunity_assigned_to`,
+  `opportunity_lost_reason`, `opportunity_created_days`, `opportunity_closed_days`,
+  `opportunity_won_days`, `opportunity_lost_days`
+- **Traits** (R-2.12 — formalizado nesta sprint): `party_traits` (genérico,
+  usado quando producer toca >5 traits no mesmo evento), `party_trait_<key>`
+  (granular via `LIKE 'party_trait_%'`, usado quando ≤5 traits específicos)
+
+Detalhes da whitelist regular vs blacklist vs BULK_ONLY: §22.3.
+
+### Decisões arquiteturais registradas (D-records)
+
+| ID | Tema | Resumo |
+|---|---|---|
+| D-2026-05-03-01 | Arquitetura de migração | R-2.1 quebrada em a/b — dryrun em paralelo antes do cutover. Reduz blast radius de "tudo ou nada" no hot path de ingestion. |
+| D-2026-05-03-02 | Atomicidade > resiliência local | Producers migrados não têm `EXCEPTION WHEN OTHERS` ou try/catch externo silenciador. Falha aborta transação. Justificativa: mudança parcial silenciada é pior que abort retornado ao caller. |
+| D-2026-05-05-01 | Testabilidade workers/historical-sync | Worker não tem `scripts.test` nem suíte. Validação reduzida a `typecheck + build + observação produção`. Sprint dedicada de testabilidade pós-refactor (Vitest + mock SQL via DI). |
+| D-2026-05-05-02 | refreshRfm gap event-driven pré-Fase 1 | Antes do refactor, refreshRfm refresha ~9k parties/6h em dimensões whitelist mas **nunca** enfileirava eval. Cron antigo (predicate `state_updated_at`) também não pegava (UPSERT não tocava esse campo). Mudanças de RFM eram invisíveis à segmentação na história da plataforma. R-2.4 fechou esse gap. |
+| D-2026-05-05-03 | Coexistência de 2 evaluators | `segment-rules-evaluator.ts` (memória, hot path por job) lê `rules_json` (AST v1) — patchado em R-2.4.1. `segmentation/segmentEvaluator.ts` + `resolvers.ts` (SQL canonical via `refresh_segment_parties_unified`) lê `rules_json_v2`. Coexistência aceita como débito; migração legacy → v2 fica fora do escopo de Decision Write API. |
+| D-2026-05-05-04 | `state_updated_at` redundante em refreshFeatures | UPSERT mantém `state_updated_at = now()` mesmo a Decision API batch também bumpando. Inócuo (mesma transação, último timestamp vence). Remover quando todos producers bulk forem 100% canonical. |
+| D-2026-05-05-05 | refreshFeatures orquestra refresh_rfm | Cada cron run gera 2 batches em queue (refreshFeatures + refreshRfm) para os mesmos parties. Comportamento correto (cada producer declara dimensões reais). Custo transitório até R-3.2 (UNIQUE INDEX coalescente + UPSERT mesclando `fields_changed`). |
+| D-2026-05-05-06 | BULK_ONLY pattern para cluster/traits/opportunity | `segment_eval_queue` tem 2 usos semânticos: (1) re-eval por mudança de input (whitelist) → Decision API; (2) notificação cross-system (segment_ids = output) → fora de escopo. Refactor para canal dedicado fica como item futuro. |
+| D-2026-05-05-07 | Cross-check MCP > inventário textual | Inventário em PROGRESS.md ≠ estado real do banco. Antes de criar R-2.x novo, consultar `pg_get_functiondef` da função candidata. Cross-check final da Sprint 2 revelou 6 funções SQL já migradas silenciosamente (R-2.13–R-2.17 fechados sem código novo). |
+
+### Métricas pré/pós Sprint 2 (combinadas com Fase 1)
+
+| Métrica | Pré-refactor (2026-05-02) | Pós-Sprint 2 (2026-05-05) | Comentário |
+|---|---|---|---|
+| Amplification ratio (enqueues / mudanças reais) | 24.6x | **~1.0x** | Fase 1 (R-1.5/R-1.7) baixou predicate cron + Sprint 2 eliminou writes ad-hoc duplicados. |
+| Drift global (`seg_input_version > last_evaluated`) | crescente, mascarado por cron fallback | **sustentado em 0** | Validado em produção pós-R-2.4/R-2.5/R-2.6 com ~95k jobs drenados. |
+| Single-source-of-truth para writes em `contact_state` | ❌ — 12 producers escreviam ad-hoc, cada um decidia versão e enqueue | ✅ — todos producers passam por Decision API; whitelist §22.3 dita o que é segmentation-relevant | Princípio P1 (single producer per state column) materializado para metadados de versão. |
+| Producers fora do contrato Decision API | 12 (todos) | 2 (out-of-scope D-2026-05-05-06) | computeClusters/Subgroups por design (notificação cross-system). |
+| Triggers SQL com `state_version+1` legacy | 6 funções | **0** | Cross-check MCP em 2026-05-05. |
+
+### Próximo: Sprint 3
+
+Coalescing real (R-3.1/R-3.2):
+- **R-3.1:** UNIQUE INDEX parcial em `analytics.segment_eval_queue (tenant_id, party_id) WHERE status='pending'`
+- **R-3.2:** UPSERT que mescla `fields_changed` em vez de criar nova row
+
+Resolve naturalmente:
+- 2x jobs/party da orquestração refreshFeatures→refreshRfm (D-2026-05-05-05)
+- 2x jobs/party do refreshReactivation (UPSERT scoring + cleaner no mesmo cron run)
+- BULK_ONLY pattern do traitProducer (form com múltiplos blocos enfileira N jobs)
 
 ---
 
