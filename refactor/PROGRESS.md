@@ -11,15 +11,15 @@
 ## Estado atual
 
 **Sprint:** 2 — Fase 2 (Decision Write API)
-**Fase ativa:** Fase 2, R-2.9 aplicado (linkProducts usa Decision API batch). 8/12 producers migrados (4 single-row + 4 bulk). R-2.7/R-2.8/R-2.9 em validação assíncrona.
+**Fase ativa:** Fase 2, R-2.10 + R-2.11 fechados como **out-of-scope** (computeClusters/computeClusterSubgroups não são producers de contact_state — usam segment_eval_queue como canal de notificação cross-system para journey engine; D-2026-05-05-06). 9/12 producers TS migrados + 2 fora de escopo.
 **Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via R-2.9 cutover
+**Quem atualizou:** Claude Code via R-2.10/R-2.11 closure decision
 
 ## Próximas 3 ações
 
-1. **R-2.10** — `computeClusters` (workers/analytics/src/handlers/computeClusters.ts:692) — pattern bulk.
-2. **R-2.11** — `computeClusterSubgroups` (workers/analytics/src/handlers/computeClusterSubgroups.ts:808) — pattern bulk. Avaliar PR único com R-2.10 (proximidade conceitual).
-3. **R-2.12** — `traitProducer` (workers/analytics/src/segmentation/traitProducer.ts:730) — code path crítico de form ingestion, fields_changed dinâmico.
+1. **R-2.12** — `traitProducer` (workers/analytics/src/segmentation/traitProducer.ts:730) — TS hot path crítico de form ingestion, fields_changed dinâmico. Último producer TS (não-SQL) a migrar.
+2. **R-2.13** — `sync_tag_ids_to_contact_state` (SQL trigger function) — **primeiro producer SQL** da sprint. Técnica diferente: edita função PL/pgSQL via `apply_migration` (Supabase MCP), pattern baseado em R-2.1b.
+3. **R-2.14** — `trigger_auto_populate_contact_state` (SQL trigger function) — pattern R-2.13.
 
 ## Bloqueadores ativos
 
@@ -265,6 +265,49 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-05-06 — segment_eval_queue tem dois usos semânticos distintos
+
+**Contexto:** durante inspeção de R-2.10 (`computeClusters`) e R-2.11
+(`computeClusterSubgroups`), identificado que esses producers **não escrevem
+em `contact_state`** — apenas inserem em `analytics.segment_eval_queue` com
+`fields_changed = ARRAY['segment_ids']` para notificar o journey engine que
+membership de cluster mudou. Comentário no código é explícito:
+`// Notify journey engine that cluster membership changed`.
+
+**Whitelist §22.3** (`is_segmentation_relevant_dimension`) **não inclui
+`segment_ids`** — por design, pois `segment_ids` é **output** da segmentação
+(projeção de membership), não **input**. Adicionar à whitelist criaria loop
+circular e violaria P4 ("membership é projeção, não input").
+
+**Conclusão semântica:** `segment_eval_queue` tem dois usos distintos hoje:
+
+1. **Re-avaliação por mudança de input** — producers de dimensões whitelisted
+   enfileiram para que o worker re-avalie membership contra os segmentos
+   afetados. **Decision Write API se aplica** (R-2.1b a R-2.9).
+2. **Notificação cross-system** — producers de cluster (computeClusters,
+   computeClusterSubgroups) enfileiram para que o journey engine reaja a
+   mudanças de cluster. **Decision Write API NÃO se aplica** — distorceria
+   a whitelist (segment_ids fora por design).
+
+**Decisão:** R-2.10 + R-2.11 **fechados como out-of-scope** sem alteração
+de código. Não migrar via Decision API porque:
+
+- computeClusters/Subgroups não são producers de `contact_state` no sentido
+  da constituição P2 (single producer por dimensão).
+- Migração literal causaria regressão funcional (Decision API descartaria
+  o INSERT em queue por `segment_ids` ser não-relevante).
+- Rename apenas (`compute_clusters` → `computeClusters`) é cosmético, sem
+  ganho funcional. Constraint `triggered_by` já aceita ambos.
+
+**Refactor futuro (fora do escopo Sprint 2):** criar canal dedicado para
+journey notifications (event bus, dedicated queue, ou listener via LISTEN/NOTIFY)
+que separa "mudança de input de segmentação" de "notificação cross-system".
+Quando isso acontecer, computeClusters/Subgroups passam a usar o novo canal
+em vez de `segment_eval_queue`.
+
+**Custo evitado agora:** zero modificação cosmética + risco de regressão.
+**Custo futuro:** sprint dedicada de refactor de canais de notificação.
 
 ### D-2026-05-05-05 — refreshFeatures orquestra refresh_rfm gerando 2 jobs/party
 
@@ -554,6 +597,25 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**R-2.10 + R-2.11 fechados como OUT-OF-SCOPE em 2026-05-05:**
+- `workers/analytics/src/handlers/computeClusters.ts:691-704`
+- `workers/analytics/src/handlers/computeClusterSubgroups.ts:807-820`
+- **Sem mudança de código.** Inspeção revelou que esses producers usam
+  `segment_eval_queue` como canal de notificação cross-system (cluster→journey),
+  não como re-avaliação de segmentos por mudança de input.
+- Não escrevem em `contact_state`. Apenas inserem em queue com
+  `fields_changed = ARRAY['segment_ids']`, que é **output** da segmentação,
+  não input — fora da whitelist §22.3 por design.
+- Migrar literalmente pela Decision API causaria regressão (descarte do INSERT
+  por `segment_ids` ser não-relevante). Rename cosmético sem ganho funcional.
+- Decisão registrada em D-2026-05-05-06 (segment_eval_queue tem dois usos
+  semânticos distintos; refactor para canal dedicado fica como item futuro
+  fora do escopo Sprint 2).
+- **Status:** 9/12 producers TS migrados (R-2.1b, R-2.3, R-2.4-2.9) + 2
+  fora de escopo (R-2.10, R-2.11). Restam: R-2.12 traitProducer (TS) +
+  5 producers SQL (R-2.13-R-2.17).
+- Próximo: R-2.12 (traitProducer) — último producer TS
 
 **R-2.9 aplicado em 2026-05-05:**
 - `workers/analytics/src/handlers/linkProducts.ts:175-209` → `linkProducts` migrado para Decision API batch
