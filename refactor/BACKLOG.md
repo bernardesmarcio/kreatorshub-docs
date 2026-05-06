@@ -2,11 +2,54 @@
 
 **Documento companheiro:** [PLAN.md](./PLAN.md), [PROGRESS.md](./PROGRESS.md)
 
-> Lista canônica de tarefas. Cada uma com ID estável, critérios de aceite, owner, status.
-> Granularidade: micro nas Fases 1-3 (próximas), macro nas Fases 4-8 (refinaremos quando entrar).
-> Status: `todo` / `in_progress` / `done` / `blocked` / `cancelled`
+> 🏁 **REFACTOR COMPLETO em 2026-05-06.** 6/6 sprints fechadas. Conteúdo
+> abaixo dividido em (1) **Pendentes pós-refactor** — items priorizados para
+> trabalho futuro, e (2) **Items concluídos (apêndice)** — histórico para
+> referência. Detalhes de cada sprint em `PROGRESS.md`. Playbooks
+> operacionais em `docs/ARCHITECTURE.md` §22.10 (adicionar producer)
+> e §22.11 (troubleshooting).
 
 ---
+
+# Pendente pós-refactor
+
+## Alta prioridade
+
+### D-2026-05-06-13 — Sprint 7: Incremental refresh (cron rolling-refresh filtra por state_updated_at)
+
+**Status:** todo
+**Estimativa:** 1 sprint dedicada
+**Risco:** médio (mexe em hot path de cron)
+**Justificativa:** antes de 5M+ contatos. Rolling-refresh hoje recalcula features/RFM/reactivation para todas as parties qualificadas a cada hora. Em escala, vai dominar throughput. Filtro por `state_updated_at > last_run_at` reduz drasticamente o working set (só processa parties com mudança real desde último run).
+
+**Critérios de aceite (preliminares):**
+- `analytics.tenant_processing_state` ganha colunas `last_features_at`, `last_rfm_at`, `last_reactivation_at` (já tem) usadas como watermark
+- Workers de refresh filtram parties via `WHERE state_updated_at > last_<type>_at`
+- Cron run vazio (sem mudanças) retorna em <1s sem trabalho
+- Validação: 1 hora de produção com 0 mudanças → 0 jobs enfileirados
+
+## Prioridade normal
+
+- **Decisão de produto:** observability stack externa (Datadog / Grafana / Metabase) — desbloqueada pós-Sprint 6 (views portáveis prontas). Escopo a definir.
+- **Cleanup TOTAL_SHARDS / MY_SHARD env vars** (D-2026-05-05-11) — ~30min, remover dead code do `segment-eval-worker.ts` quando 30 dias sem warning.
+- **Suíte de testes para workers/historical-sync** (D-2026-05-05-01) — 1 sprint dedicada de testabilidade (Vitest + mock SQL via DI).
+- **Unificar evaluators legacy ↔ v2** (D-2026-05-05-03) — 1 sprint dedicada. Migração `rules_json_v2` → `rules_json` para todos os segmentos OU evaluator passa a ler v2 nativamente.
+- **Cleanup `state_updated_at` redundante** em `refreshFeatures` UPSERT (D-2026-05-05-04) — ~30min.
+- **Canal dedicado para journey notifications** — separar dos 2 usos semânticos do `segment_eval_queue` (D-2026-05-05-06). Investigar event bus / dedicated queue.
+- **Encryption credenciais via Supabase Vault** (B-09) — segurança.
+
+## Backlog futuro
+
+- Dashboard system admin (DOCS-2 — sucessor desta task DOCS-1).
+- Monitoramento adicional dos health alerts em janela 7-30 dias para calibrar thresholds (`oldest_pending`, `errors`, `dlq_new_24h`).
+
+---
+
+# Items concluídos (apêndice — histórico do refactor)
+
+> Mantido para referência cronológica. Detalhes técnicos completos em
+> `PROGRESS.md`. Versão consolidada da arquitetura em `docs/ARCHITECTURE.md`
+> §22.4 a §22.9.
 
 ## Fase 1 — Estabilização ✅ CONCLUÍDA (2026-05-03 02:00 UTC)
 

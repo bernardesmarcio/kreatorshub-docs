@@ -31,6 +31,24 @@
 
 Nenhum.
 
+## Métricas finais consolidadas (pré → pós refactor)
+
+| Métrica | Pré-refactor (2026-05-02) | Pós-refactor (2026-05-06) | Improvement |
+|---|---|---|---|
+| Amplification ratio (enqueues / mudanças reais) | 24.6x | **~1.0x** | **~25x** |
+| Wait máximo per-tenant | 1189s (19.8 min) | **~76s** | **~16x** |
+| Throughput pico | 70 jobs/min | **~600 jobs/min** | **~8.5x** |
+| Coalescing rate | 0% (não existia) | **94.8%** | feature nova |
+| Errors funcionais (7d) | desconhecido legacy | **0** | — |
+| Drift sustentado | crescente (1.58M hits/7d via fallback) | **0 transitório** | — |
+| Producers fora do contrato canônico | 12 ad-hoc | **2 out-of-scope** | semantic boundary |
+| Triggers SQL com `state_version+1` legacy | 6 funções | **0** | — |
+
+**Pattern de fechamento das sprints:** ver D-2026-05-05-12 abaixo. Resumo:
+sprints 3, 4 e 6 fechadas via MCP em <1h cada (0 patch TS), porque
+sprint 2 (centralização canônica) preparou o terreno. ROI da centralização
+visível imediatamente — D-2026-05-05-08.
+
 ## Métricas de baseline (medidas em 2026-05-02)
 
 Estado pré-refactor. Valores que vamos comparar contra ao longo das fases.
@@ -271,6 +289,28 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-06-13 — Sprint 7 (Incremental refresh) priorizada antes de 5M+ contatos
+
+**Contexto:** pós-refactor v8.0, cron `rfm-rolling-refresh` é o consumidor
+dominante de throughput da queue (validado nas Sprints 4-5: 30k+ jobs por
+cron run). Hoje recalcula features/RFM/reactivation para todas as parties
+qualificadas a cada hora, independentemente de terem mudado.
+
+**Em escala (5M+ contatos previstos):** rolling-refresh vai dominar o
+consumo de capacity dos workers, mascarando o ganho de coalescing (94.8%
+hoje) e potencialmente exigindo mais réplicas Railway para manter SLA.
+
+**Decisão:** registrar como Sprint 7 do roadmap (alta prioridade no backlog
+pós-refactor). Filtro por `state_updated_at > last_<type>_at` como watermark
+incremental.
+
+**Custos estimados:**
+- 1 sprint dedicada (~3 dias)
+- Risco médio (mexe em hot path de cron, requer migration cuidadosa)
+
+**Referência:** ver `docs/refactor/BACKLOG.md` → "Pendente pós-refactor →
+Alta prioridade".
 
 ### D-2026-05-05-12 — Refactor de pipeline de segmentação CONCLUÍDO em ~5 dias
 
@@ -736,7 +776,12 @@ nesse nível.
 **Custo evitado agora:** ~1 dia de scaffold de testes × 4 workers = 4 dias.
 **Custo futuro:** 1 sprint dedicada (~1 semana) com retorno permanente.
 
-## Histórico de sprints
+## Histórico de Sprints (apêndice — encerrado em 2026-05-06)
+
+> Conteúdo abaixo é referência histórica detalhada de cada sprint. Para o estado
+> consolidado pós-refactor, ver "Estado atual" + "Métricas finais consolidadas"
+> no topo deste arquivo. Para playbooks operacionais (adicionar producer,
+> troubleshooting), ver `docs/ARCHITECTURE.md` §22.10 e §22.11.
 
 ### Sprint 0 — Setup (CONCLUÍDO 2026-05-02)
 

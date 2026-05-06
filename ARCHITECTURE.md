@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 8.0 — 🏁 REFACTOR COMPLETO (6/6 sprints, 2026-05-02 a 2026-05-06)*
+*Versão 8.1 — Playbooks operacionais (§22.10 Adding Producer + §22.11 Troubleshooting)*
 
 ---
 
@@ -2046,6 +2046,328 @@ centralização tem payback rápido.
 | **D-2026-05-05-06** — `segment_eval_queue` 2 usos semânticos (canal dedicado para journey notifications) | Refactor médio | 1 sprint dedicada |
 | **D-2026-05-05-11** — Cleanup `TOTAL_SHARDS`/`MY_SHARD` envs deprecated | Cleanup pequeno | ~30min |
 | Decisão de produto: observability stack externa (Datadog / Grafana / Metabase) | Produto | escopo a definir |
+
+---
+
+## §22.10 — Playbook: Adicionar um Novo Producer
+
+Producer = qualquer código que detecta mudança no mundo real (compra,
+tag, form, import, trait, cluster) e precisa que segmentos sejam
+re-avaliados.
+
+### Decisão 1: o producer muta `contact_state`?
+
+**Sim** (ex: producer atualiza `frequency`, `monetary`, `tag_ids`):
+→ MUST chamar `apply_contact_state_mutation` (P2 enforced)
+→ NÃO pode bumpar `segmentation_input_version` manualmente
+→ NÃO pode INSERT direto em `segment_eval_queue`
+
+**Não** (ex: producer só sinaliza mudança em outra tabela como
+`cluster_assignments`, `party_traits`, `opportunities`):
+→ É BULK_ONLY pattern (R36)
+→ Decision API enfileira eval mas não bumpa seg_version
+→ Dimensão deve estar registrada em `analytics.is_bulk_only_dimension()`
+
+### Decisão 2: TS handler ou SQL trigger?
+
+| Critério | TS handler | SQL trigger |
+|---|---|---|
+| Lógica de domínio complexa | ✅ | ❌ |
+| Reage a INSERT/UPDATE em tabela | ❌ | ✅ |
+| Volume alto (10k+/dia) | ✅ (workers escalam) | ⚠️ (trigger síncrono) |
+| Lógica em PL/pgSQL aceitável | ❌ | ✅ |
+
+### Template TS single-row producer
+
+Localização sugerida: `workers/<service>/src/handlers/<feature>.ts` ou
+`workers/<service>/src/handlers/webhook/analytics-events.ts`.
+
+```typescript
+async function recordSomething(
+  sql: SqlInstance,
+  input: { tenantId: string; partyId: string; /* ... */ }
+) {
+  await sql.begin(async (tx) => {
+    // 1. (opcional) registrar evento imutável
+    await tx`SELECT analytics.record_contact_event(...)`;
+
+    // 2. UPDATE de domínio
+    //    - NÃO bumpar state_version (Decision API faz)
+    //    - state_updated_at = now() é OK (redundante mas inócuo)
+    await tx`
+      UPDATE analytics.contact_state
+      SET <coluna_relevante> = <novo_valor>,
+          state_updated_at = now()
+      WHERE tenant_id = ${input.tenantId}::uuid
+        AND party_id = ${input.partyId}::uuid
+    `;
+
+    // 3. Decision API (gating + enqueue + atomic merge via coalescing)
+    await tx`
+      SELECT analytics.apply_contact_state_mutation(
+        ${input.tenantId}::uuid,
+        ${input.partyId}::uuid,
+        '<producerName>',                        -- camelCase, ex: 'recordTagChange'
+        ARRAY['<dimensão1>','<dimensão2>']::text[],
+        ${JSON.stringify({ /* contexto */ })}::jsonb,
+        5::smallint,                              -- priority (números menores = mais urgente)
+        'enforce'
+      )
+    `;
+  });
+}
+```
+
+### Template TS bulk producer
+
+```typescript
+async function recomputeBatch(sql: SqlInstance, /* ... */) {
+  for (const chunk of chunks) {
+    const partyIds = chunk.map((c) => c.party_id);
+
+    await sql.begin(async (tx) => {
+      // 1. UPSERT bulk de domínio
+      await tx`
+        INSERT INTO analytics.contact_state ${tx(rows)}
+        ON CONFLICT (tenant_id, party_id) DO UPDATE SET
+          <colunas>,
+          state_updated_at = now()
+      `;
+
+      // 2. Decision API batch
+      await tx`
+        SELECT analytics.apply_contact_state_mutation_batch(
+          ${tenantId}::uuid,
+          ${partyIds}::uuid[],
+          '<producerName>',
+          ARRAY[<dimensões reais tocadas>]::text[],
+          <priority>::smallint
+        )
+      `;
+    });
+  }
+}
+```
+
+### Template SQL trigger
+
+```sql
+CREATE OR REPLACE FUNCTION <schema>.<function_name>()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_tenant_id uuid;
+  v_party_id uuid;
+BEGIN
+  -- Resolver party_id e tenant_id do trigger context
+  -- (varia por tabela de origem)
+
+  -- Decision API via PERFORM
+  PERFORM analytics.apply_contact_state_mutation(
+    v_tenant_id,
+    v_party_id,
+    '<producerName>',                  -- ex: 'syncTagIds'
+    ARRAY['<dimensão>']::text[],
+    jsonb_build_object('context', NEW.id),
+    5::smallint,
+    'enforce'
+  );
+
+  RETURN NEW;
+END;
+$$;
+```
+
+### Dimensões whitelist (consultar antes de codificar)
+
+Whitelist regular (Decision API bumpa `segmentation_input_version`):
+- `frequency`, `monetary`, `recency_days`
+- `total_purchases`, `total_revenue`, `avg_order_value`, `distinct_products`
+- `last_purchase_at`, `first_product_at`, `bought_product_ids`
+- `r_score`, `f_score`, `m_score`, `rfm_segment`, `value_tier`, `lifecycle_stage`
+- `tag_ids`, `responded_form_ids`, `import_ids`
+- `acquisition_source`, `acquisition_campaign_id`
+- `reactivation_priority`, `party_type`
+- `last_email_opened_at`, `last_email_clicked_at`, `email_open_rate_30d`,
+  `email_click_rate_30d`, `whatsapp_read_rate_30d`, `last_engagement_at`
+
+BULK_ONLY (R36 — vivem fora de `contact_state`):
+- `cluster_id`, `cluster_subgroup_id`
+- `has_opportunity`, `opportunity_pipeline`, `opportunity_stage`,
+  `opportunity_status`
+- `party_traits` (genérico, >5 traits) e `party_trait_<key>` (granular, ≤5 keys)
+
+Para adicionar dimensão nova: editar `analytics.is_segmentation_relevant_dimension`
+(whitelist regular) ou `analytics.is_bulk_only_dimension` (BULK_ONLY).
+
+### Antes de PR — checklist obrigatório
+
+- [ ] Producer name em camelCase, descritivo (ex: `recordTagChange`,
+      não `tag_change`)
+- [ ] Constraint `segment_eval_queue_triggered_by_check` aceita o nome
+      novo (adicionar via migration se necessário)
+- [ ] Producer NÃO faz UPDATE direto em `state_version` ou `segmentation_input_version`
+- [ ] Producer NÃO faz INSERT direto em `segment_eval_queue`
+- [ ] `dimensions_changed` passado contém SOMENTE dimensões realmente
+      modificadas pelo producer (evitar arrays inflados)
+- [ ] Tudo dentro de `sql.begin()` — atomicidade total
+- [ ] Sem `try/catch` envolvendo Decision API (atomicity > resilience local — D-2026-05-03-02)
+- [ ] Producer registrado nesta seção §22.10 (lista de producers ativos abaixo)
+
+### Producers ativos (atualizar quando adicionar/remover)
+
+**TS workers:**
+- `process_purchase_analytics` (SQL fn chamada via webhook ingestion)
+- `recordTagChange`, `recordFormSubmitted`, `recordImportAdded`
+- `refreshFeatures`, `refreshRfm`, `refreshReactivation` (cron-driven)
+- `linkProducts`, `traitProducer`
+
+**SQL triggers:**
+- `syncTagIds`, `syncPartyType`, `autoPopulateContactState`
+- `recordEmailEngagement`, `productNameMapped`
+
+**Out-of-scope (não usam Decision API por design):**
+- `computeClusters`, `computeClusterSubgroups` (D-2026-05-05-06: notificação
+  cross-system, não mutam `contact_state`)
+- `run_segment_eval_fallback` / repair (D-2026-05-05-09: usa coalescing
+  pattern direto, não Decision API)
+
+---
+
+## §22.11 — Playbook: Troubleshooting
+
+### Pergunta 1: o sistema está saudável?
+
+```sql
+SELECT analytics.check_health_alerts();
+```
+
+Retorno traz `alerts[]`, `has_critical`, `pipeline_status{}`.
+
+- `has_critical = true` → atenção imediata (ver Pergunta 4)
+- `alert_count > 0` mas só warnings → degradação tolerável (ver Pergunta 2)
+- `alert_count = 0` → sistema em estado verde
+
+### Pergunta 2: tem warnings — preciso me preocupar?
+
+```sql
+SELECT * FROM analytics.v_pipeline_status;
+SELECT * FROM analytics.v_drift_by_tenant;
+```
+
+Decisão:
+- **drift_total > 1000 mas jobs_processed_5m alto** → drenando, OK (típico em burst do cron rolling-refresh)
+- **drift_total alto E jobs_processed_5m baixo** → workers travados (ver Pergunta 4)
+- **drift concentrado em 1 tenant específico** → tenant com producer travado, investigar
+
+### Pergunta 3: qual worker está mais lento?
+
+```sql
+SELECT * FROM analytics.v_worker_throughput;
+```
+
+- **p95_ms muito acima de outros workers** → réplica problemática (Railway: rolling restart)
+- **p95_ms uniformemente alto** → segmentos pesados (otimizar regras)
+
+### Pergunta 4: tem critical alert ou sistema travado
+
+Diagnóstico passo-a-passo:
+
+1. **Workers vivos?**
+   ```sql
+   SELECT
+     COUNT(DISTINCT worker_id) AS active,
+     array_agg(DISTINCT worker_id) AS workers
+   FROM analytics.segment_eval_queue
+   WHERE claimed_at > now() - interval '5 minutes';
+   ```
+   < 3 workers = problema infra Railway. Verificar dashboard Railway.
+
+2. **Algum job travado em `claimed`?**
+   ```sql
+   SELECT id, party_id, claimed_at, worker_id
+   FROM analytics.segment_eval_queue
+   WHERE status = 'claimed'
+     AND claimed_at < now() - interval '10 minutes';
+   ```
+   Se houver, worker que claim ouviu `kill -9`. Correção: cron `cleanup_stale_jobs` reseta após 30min, ou manual:
+   ```sql
+   UPDATE analytics.segment_eval_queue
+   SET status = 'pending', claimed_at = NULL, worker_id = NULL
+   WHERE status = 'claimed' AND claimed_at < now() - interval '10 minutes';
+   ```
+
+3. **Tem job em loop de retry?**
+   ```sql
+   SELECT id, party_id, retry_count, error_message
+   FROM analytics.segment_eval_queue
+   WHERE retry_count >= 3
+   ORDER BY retry_count DESC LIMIT 20;
+   ```
+   Se sim, mover para DLQ:
+   ```sql
+   SELECT analytics.move_to_dead_letter('segment_eval_queue', '<id>');
+   ```
+
+4. **Tem segmento gerando erro consistente?**
+   ```sql
+   SELECT error_message, COUNT(*) AS occurrences
+   FROM analytics.segment_eval_queue
+   WHERE status = 'error'
+     AND created_at > now() - interval '1 hour'
+   GROUP BY error_message
+   ORDER BY occurrences DESC LIMIT 10;
+   ```
+
+### Pergunta 5: como saber se um producer específico está bumpando
+
+```sql
+SELECT
+  triggered_by,
+  COUNT(*) AS jobs_24h,
+  COUNT(*) FILTER (WHERE status='processed') AS processed,
+  COUNT(*) FILTER (WHERE status='error') AS errors,
+  AVG(EXTRACT(EPOCH FROM (processed_at - claimed_at))*1000)::int AS avg_ms
+FROM analytics.segment_eval_queue
+WHERE created_at > now() - interval '24 hours'
+GROUP BY triggered_by
+ORDER BY jobs_24h DESC;
+```
+
+Se producer esperado não aparece → producer quebrado ou enfileirando com nome errado.
+
+### Pergunta 6: coalescing está funcionando?
+
+```sql
+SELECT
+  ROUND(100.0 * COUNT(*) FILTER (WHERE triggered_by='coalesced')
+        / NULLIF(COUNT(*), 0), 2) AS coalescing_rate_pct
+FROM analytics.segment_eval_queue
+WHERE created_at > now() - interval '1 hour';
+```
+
+Esperado: > 70%. Se < 30% sustentado → producers podem estar enfileirando
+fora da Decision API.
+
+### Pergunta 7: histórico de incidentes
+
+```sql
+SELECT logged_at, alert_count, alerts
+FROM analytics.health_alert_log
+WHERE logged_at > now() - interval '7 days'
+ORDER BY logged_at DESC;
+```
+
+### Casos comuns
+
+| Sintoma | Causa provável | Ação |
+|---|---|---|
+| Drift sustentado em 1 tenant | Producer específico não chama Decision API | Investigar logs Railway por tenant |
+| Errors uniforme em todos workers | Bug em evaluator/migration recente | Rollback migration |
+| Wait máximo > 5min | Burst grande sem capacity | Aumentar réplicas Railway |
+| DLQ recebeu jobs | Jobs em loop irrecuperável | Inspecionar `analytics.dead_letter_queue` |
+| Queue cresce mas workers vivos | Producer mal-comportado em loop | `SELECT triggered_by, COUNT(*) FROM segment_eval_queue WHERE status='pending' GROUP BY 1` |
 
 ---
 
