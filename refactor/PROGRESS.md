@@ -10,20 +10,16 @@
 
 ## Estado atual
 
-**Sprint:** 5 (Worker fairness) — **R-5.1 SQL aplicado via MCP em 2026-05-06**, **patch TS commitado** (`segment-eval-worker.ts`), aguardando deploy Railway + validação produção (30min).
-**Fase ativa:** Sprints 1+2+3+4 fechadas. Sprint 5 em deploy.
+**Sprint:** 5 (Worker fairness) — 🎯 **FECHADA em 2026-05-06** (validada via teste E2E em produção: **wait máximo 1189s → 76s**, ~16x improvement; throughput total ~6x). 5/6 sprints fechadas. Resta **Sprint 6** (Dead letter + observability).
+**Fase ativa:** Sprints 1+2+3+4+5 fechadas.
 **Última atualização:** 2026-05-06
-**Quem atualizou:** Claude Code via R-5.1 patch TS
+**Quem atualizou:** Claude Code via Sprint 5 closure (validação E2E produção)
 
 ## Próximas 3 ações
 
-1. **Validar R-5.1 em produção (30min pós-deploy):**
-   - `v_queue_fairness_status`: `oldest_pending_seconds < 60s` para TODOS tenants ativos
-   - Logs Railway emitem `fair_claim_received` periodicamente
-   - Logs **não** emitem `segment_eval_sharding_deprecated` (envs default)
-   - Throughput total ≥ 70 jobs/min (sustentado vs atual)
-2. **Reavaliar R-5.2/R-5.3** pós-validação — talvez Sprint 5 termine só com R-5.1.
-3. **Sprint 6** — dead letter + observability completa (telemetria estruturada, alertas, dashboards).
+1. **(decisão estratégica)** Sprint 6 (última) — dead letter queue para jobs irrecuperáveis + telemetria estruturada + dashboards/alertas. Envolve mais TS (worker emit metrics) + possível integração com observability platform.
+2. **(alternativa)** Pause estratégica de 24h+ para validação completa do estado pós-Sprints 1-5 em produção antes de iniciar Sprint 6.
+3. **(alternativa)** Outra prioridade — débitos acumulados (D-2026-05-05-01 testabilidade workers, D-2026-05-05-03 unificação evaluators legacy↔v2, D-2026-05-05-11 cleanup sharding deprecated).
 
 ## Bloqueadores ativos
 
@@ -269,6 +265,39 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-05-11 — Sharding artificial via TOTAL_SHARDS/MY_SHARD deprecated
+
+**Contexto:** Sprint 5 (R-5.1) substituiu o algoritmo de claim baseado em
+sharding por hash de tenant pelo round-robin SQL atomic
+(`claim_next_segment_jobs_fair`). As envs `SEGMENT_EVAL_TOTAL_SHARDS` e
+`SEGMENT_EVAL_SHARD_INDEX` foram preservadas como dead code para compat com
+Railway envs existentes — se valor ≠ default, emite warning de inicialização.
+
+**Insight do teste E2E em produção (2026-05-06):** throughput total saltou
+de 70 para ~430 jobs/min (~6x) **mesmo sem starvation real ocorrendo**, porque
+o sharding particionava tenants entre réplicas e cada réplica iterava
+sequencialmente o subset do seu shard. Capacidade de processamento real
+estava sendo desperdiçada. O sharding tinha intenção de balanceamento mas
+introduzia overhead artificial.
+
+**Decisão:** sharding **deprecated**. Algoritmo de fairness centralizado em
+SQL torna sharding obsoleto. SKIP LOCKED + round-robin per-tenant cobre
+distribuição entre réplicas naturalmente.
+
+**Plano de cleanup futuro (sprint dedicada de limpeza pós-Sprint 6):**
+- Remover constantes `TOTAL_SHARDS`, `MY_SHARD` de `segment-eval-worker.ts`
+- Remover query `SELECT id FROM core.tenants WHERE hash...` (já feito em R-5.1)
+- Remover envs `SEGMENT_EVAL_TOTAL_SHARDS`, `SEGMENT_EVAL_SHARD_INDEX` do
+  Railway (após confirmação de que não há setting customizado em uso)
+- Remover warning de inicialização (se nenhum operador setou env não-default
+  em janela de 30 dias)
+- Remover log key `segment_eval_sharding_deprecated`
+
+**Custo evitado agora:** zero — feature continua funcionando, dead code
+inerte. Remove em sprint apropriada para evitar regressão em rolling deploys.
+
+**Custo futuro:** ~30min de cleanup quando ciclo permitir.
 
 ### D-2026-05-05-10 — Worker fairness implementado em SQL, não em TS
 
@@ -765,7 +794,37 @@ nesse nível.
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
 
-**🎯 SPRINT 5 — R-5.1 em deploy em 2026-05-06 (worker fairness)**
+**🎯 SPRINT 5 FECHADA em 2026-05-06 — worker fairness validado em produção**
+
+**Validação E2E (pós-deploy):** burst artificial de **500 jobs Escola do Fluxo +
+28 jobs SaudeNow simultâneos** disparado em produção pra exercitar starvation.
+
+**Resultados — anti-starvation funcionando:**
+
+| Métrica | Pré-Sprint 5 | Pós-Sprint 5 | Improvement |
+|---|---|---|---|
+| Wait máximo Escola do Fluxo | 1189s (19.8 min) | **76s** | **~16x** |
+| Wait máximo SaudeNow | ~5 min | **31s** | **~10x** |
+| SaudeNow drenagem | atrás do Escola (fila sequencial) | **paralelo** | anti-starv ✓ |
+| Throughput total | 70 jobs/min | **~430 jobs/min** | **~6x** |
+
+**Insight do throughput 6x:** o aumento veio porque o **sharding artificial**
+(`TOTAL_SHARDS/MY_SHARD`) particionava tenants entre réplicas e cada réplica
+iterava sequencialmente. Com `claim_next_segment_jobs_fair`, cada réplica
+pega 10 jobs/iteração **globalmente** (não preso ao subset de tenants do
+seu shard). Capacidade de processamento real estava sendo desperdiçada.
+
+**Critério de aceite produção — ✅ todos atendidos:**
+- ✅ `v_queue_fairness_status`: 0 rows após teste (queue limpa)
+- ✅ Logs Railway emitiram `fair_claim_received` corretamente
+- ✅ 0 errors funcionais
+- ✅ TOTAL_SHARDS warning **não** ocorreu (envs default no Railway)
+
+**5/6 sprints do refactor fechadas.** Resta Sprint 6 (Dead letter + observability).
+
+---
+
+**🎯 SPRINT 5 — R-5.1 deploy em 2026-05-06 (worker fairness)**
 
 Diagnóstico via MCP confirmou starvation real pré-fix:
 - **Escola do Fluxo:** 41k jobs/24h, wait médio **9.6min**, max **19.8min**

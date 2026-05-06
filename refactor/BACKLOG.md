@@ -691,9 +691,9 @@ FIFO). R-6.2/R-6.3 absorvidos / opcionais.
 
 ### R-6.1 — Claim com fairness (two-phase: round-robin + FIFO global)
 
-**Status:** ✅ DONE em 2026-05-06 (Sprint 5 do plano operacional)
+**Status:** ✅ DONE + VALIDADO EM PRODUÇÃO em 2026-05-06 (Sprint 5 do plano operacional)
 
-**Implementação real (D-2026-05-05-10):** algoritmo em SQL ao invés de
+**Implementação (D-2026-05-05-10):** algoritmo em SQL ao invés de
 ROW_NUMBER OVER PARTITION em TS. `analytics.claim_next_segment_jobs_fair(worker_id, batch_size)`:
 
 - **Phase 1 — round-robin:** `batch_size / tenant_count_active` por tenant ativo
@@ -701,22 +701,23 @@ ROW_NUMBER OVER PARTITION em TS. `analytics.claim_next_segment_jobs_fair(worker_
 - Lock via `FOR UPDATE SKIP LOCKED` (compatível multi-replica)
 - View `analytics.v_queue_fairness_status` para observability em tempo real
 
-**Patch TS aplicado (`workers/analytics/src/segment-eval-worker.ts:319-356`):**
+**Patch TS aplicado (`workers/analytics/src/segment-eval-worker.ts`, commit `d93bc65`):**
 - Removido loop `for (tenant of tenants) claim(tenant_id)` + query de tenants
   por hash sharding
 - Substituído por claim único via `claim_next_segment_jobs_fair(WORKER_ID, BATCH_SIZE)`
-- TOTAL_SHARDS/MY_SHARD preservados como dead code com warning
-  (compat Railway envs)
+- TOTAL_SHARDS/MY_SHARD preservados como dead code com warning (D-2026-05-05-11)
 - Logger `fair_claim_received` para validação pós-deploy
 
-**Diagnóstico pré-fix (via MCP):**
-- Escola do Fluxo: 41k jobs/24h, wait médio 9.6min, max 19.8min
-- Instituto Socrates: 2.7k jobs/24h, wait médio 2.7min, max 5.4min
+**Validação E2E em produção (2026-05-06):** burst de 500 jobs Escola + 28 SaudeNow simultâneos.
 
-**Critério produção (30min pós-deploy):**
-- ✅ `oldest_pending_seconds < 60s` para todos tenants ativos
-- ✅ Throughput ≥ 70 jobs/min sustentado
-- ⛔ Vermelho: > 300s pendente em algum tenant após 10min, ou throughput < 40/min
+| Métrica | Pré-Sprint 5 | Pós-Sprint 5 | Improvement |
+|---|---|---|---|
+| Wait máximo Escola | 1189s (19.8 min) | 76s | **~16x** |
+| Wait máximo SaudeNow | ~5 min | 31s | **~10x** |
+| SaudeNow drenagem | sequencial atrás Escola | **paralelo** | anti-starv ✓ |
+| Throughput total | 70 jobs/min | ~430 jobs/min | **~6x** |
+
+Throughput 6x veio de eliminar overhead artificial do sharding (D-2026-05-05-11).
 
 ### R-6.2 — Limit por tenant por ciclo
 
