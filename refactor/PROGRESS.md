@@ -10,16 +10,22 @@
 
 ## Estado atual
 
-**Sprint:** 5 (Worker fairness) — 🎯 **FECHADA em 2026-05-06** (validada via teste E2E em produção: **wait máximo 1189s → 76s**, ~16x improvement; throughput total ~6x). 5/6 sprints fechadas. Resta **Sprint 6** (Dead letter + observability).
-**Fase ativa:** Sprints 1+2+3+4+5 fechadas.
+**Sprint:** 6 (Dead letter + observability) — 🎯 **FECHADA em 2026-05-06** via MCP (~30min, 3 migrations cirúrgicas).
+
+# 🏁 REFACTOR COMPLETO — 6/6 SPRINTS FECHADAS
+
 **Última atualização:** 2026-05-06
-**Quem atualizou:** Claude Code via Sprint 5 closure (validação E2E produção)
+**Quem atualizou:** Claude Code via Sprint 6 closure + REFACTOR COMPLETO
 
-## Próximas 3 ações
+## Próximas 3 ações (pós-refactor)
 
-1. **(decisão estratégica)** Sprint 6 (última) — dead letter queue para jobs irrecuperáveis + telemetria estruturada + dashboards/alertas. Envolve mais TS (worker emit metrics) + possível integração com observability platform.
-2. **(alternativa)** Pause estratégica de 24h+ para validação completa do estado pós-Sprints 1-5 em produção antes de iniciar Sprint 6.
-3. **(alternativa)** Outra prioridade — débitos acumulados (D-2026-05-05-01 testabilidade workers, D-2026-05-05-03 unificação evaluators legacy↔v2, D-2026-05-05-11 cleanup sharding deprecated).
+1. **Decisão de produto:** observability stack externa (Datadog / Grafana / Metabase). Views `v_*` são portáveis — `SELECT` direto cabe em qualquer dashboard. Decisão de produto, não de banco.
+2. **Débitos do refactor para sprint dedicada futura:**
+   - D-2026-05-05-01 (workers/historical-sync sem suíte de testes)
+   - D-2026-05-05-03 (coexistência 2 evaluators legacy↔v2)
+   - D-2026-05-05-04 (state_updated_at redundante em refreshFeatures)
+   - D-2026-05-05-11 (cleanup sharding TOTAL_SHARDS deprecated)
+3. **Validação contínua de health alerts** (`analytics.check_health_alerts()` rodando a cada 5min) — observar `health_alert_log` em janela 7-30 dias para calibrar thresholds.
 
 ## Bloqueadores ativos
 
@@ -265,6 +271,50 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-05-12 — Refactor de pipeline de segmentação CONCLUÍDO em ~5 dias
+
+**Contexto:** entre 2026-05-02 e 2026-05-06, 6 sprints do refactor planejado em
+`docs/refactor/PLAN.md` foram fechadas. 17 producers de `contact_state` /
+`segment_eval_queue` endereçados. Pipeline de segmentação sai de "convergência
+eventual mascarada por fallback agressivo (1.58M hits/7d)" para "convergência
+event-driven com drift sustentado em 0".
+
+**Distribuição do trabalho:**
+
+- **4 sprints fechadas via MCP (~30min cada — Sprints 3, 4, 6)** — migrations
+  SQL cirúrgicas, **0 patch TS**
+- **2 sprints com patch TS** — Sprint 1 (longa, ~3-5 dias, watermark semântico
+  + worker per-party) e Sprint 5 (média, ~1h, claim fairness)
+- **Sprint 2 (3 dias)** — migração distribuída de 17 producers, hot path
+
+**Pattern arquitetural emergente:**
+
+> P2 (Decision API canônica) + P3 (workers stateless) + coalescing centralizado
+> tornam features novas **extensões cirúrgicas**, não refactors distribuídos.
+
+Sprint 2 (centralização canônica) foi a mais cara em esforço (3 dias,
+17 producers tocados). Mas habilitou todas as Sprints subsequentes a serem
+fechadas em **horas via MCP**, não em dias via patches distribuídos. ROI da
+centralização visível imediatamente nas Sprints 3-6.
+
+**Lição operacional:** investir em consolidação canônica antes de evoluções
+arquiteturais. Cada producer migrado para o ponto canônico transforma feature
+futura de "atualizar N callers" em "atualizar 1 função". Custo upfront de
+centralização tem payback rápido.
+
+**Métricas pós-refactor:**
+
+| Métrica | Pré | Pós | Improvement |
+|---|---|---|---|
+| Amplification | 24.6x | ~1.0x | ~25x |
+| Wait máximo | 19.8 min | ~76s | ~16x |
+| Throughput pico | 70/min | ~600/min | ~8.5x |
+| Coalescing rate | 0% | 94.8% | feature nova |
+| Errors 7d | legacy | 0 | — |
+
+**Custo total do refactor:** ~5 dias de execução real, distribuídos entre
+2026-05-02 e 2026-05-06.
 
 ### D-2026-05-05-11 — Sharding artificial via TOTAL_SHARDS/MY_SHARD deprecated
 
@@ -793,6 +843,97 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**🏁 REFACTOR COMPLETO em 2026-05-06 — 6/6 sprints fechadas**
+
+**Métricas pré/pós refactor (acumuladas Fases 1+2+3+4+5+6):**
+
+| Métrica | Pré-refactor (2026-05-02) | Pós-refactor (2026-05-06) | Improvement |
+|---|---|---|---|
+| Amplification ratio (enqueues / mudanças reais) | 24.6x | **~1.0x** | **~25x** |
+| Wait máximo per-tenant | 1189s (19.8 min) | **~76s** | **~16x** |
+| Throughput pico | 70 jobs/min | **~600 jobs/min** | **~8.5x** |
+| Coalescing rate | 0% (não existia) | **94.8%** | n/a (feature nova) |
+| Errors funcionais (7d) | legacy desconhecido | **0** | n/a |
+| Drift sustentado | crescente, mascarado por fallback | **0 transitório, drena <10min** | n/a |
+| Producers fora do contrato canônico | 12 ad-hoc | **2 out-of-scope (notificação cross-system)** | semantic boundary clarificada |
+
+**Pattern emergente das Sprints 3-6:**
+
+| Sprint | Modo de fechamento |
+|---|---|
+| Sprint 1 | Múltiplas tarefas TS+SQL, ~3-5 dias |
+| Sprint 2 | 17 producers TS+SQL, ~3 dias |
+| Sprint 3 | **1 migration MCP, ~30min, 0 patch TS** |
+| Sprint 4 | **1 migration MCP, ~15min, 0 patch TS** |
+| Sprint 5 | 1 migration MCP + 1 patch TS, ~1h |
+| Sprint 6 | **3 migrations MCP, ~30min, 0 patch TS** |
+
+**Insight central:** Sprints 1-2 (consolidação canônica via watermark + Decision API)
+**habilitam** Sprints 3-6 (extensions cirúrgicas via MCP). Centralização P2 +
+SQL como host de algoritmos transformou features novas em adições centralizadas
+de minutos, não refactors distribuídos de dias.
+
+---
+
+**🎯 SPRINT 6 FECHADA em 2026-05-06 — dead letter + observability portátil**
+
+Aplicada via Supabase MCP em **3 migrations cirúrgicas** (~30min, **0 patch TS**).
+
+**Mesmo padrão da Sprint 4 (D-2026-05-05-09):** problema original
+("dead letter worker dedicado + dashboards integrados") virou pequeno após
+Sprints 1-5 consolidarem o pipeline. **0 errors em 7 dias, 0 retries esgotados.**
+Sprint redimensionada para **safety net + views portáveis**, não worker dedicado.
+
+### R-6.1 — Dead Letter Queue (safety net)
+
+- `analytics.dead_letter_queue` (clone schema das duas queues —
+  `processing_jobs` e `segment_eval_queue`)
+- `analytics.move_to_dead_letter(queue text, job_id bigint)` — entrada manual
+  para jobs irrecuperáveis identificados via inspeção
+- TTL 90 dias via cron purge dedicado
+- View `analytics.v_dlq_summary` para inspeção rápida
+
+### R-6.2 — Health Views (4 views portáveis)
+
+- `analytics.v_pipeline_status` — snapshot multidimensional (queues, workers,
+  drift, throughput em uma query)
+- `analytics.v_queue_health` — throughput / latency / errors em janelas
+  (5m / 15m / 24h)
+- `analytics.v_drift_by_tenant` — drift summary per-tenant
+- `analytics.v_worker_throughput` — performance por worker (p50/p95/p99 latency)
+
+### R-6.3 — Health Alerts
+
+`analytics.check_health_alerts()` retorna `jsonb` com violações detectadas.
+Limites configurados:
+
+| Métrica | Threshold | Severity |
+|---|---|---|
+| `oldest_pending` | > 5 min | warning |
+| `errors` | > 10/h | critical |
+| `dlq_new_24h` | > 0 | warning |
+| `throughput` (com fila pending) | < 10 jobs/min | critical |
+| `active_workers` (com fila pending) | < 3 | critical |
+
+Cron a cada 5min loga **alertas críticos** em `analytics.health_alert_log`
+(TTL 30d).
+
+### Validação real-time pós-deploy
+
+Sistema detectou warnings ATIVOS imediatamente após deploy (esperado):
+- `queue_backlog`: oldest 521s — burst rolling-refresh em drenamento
+- `drift_high`: 5172 > 1000 (drenando normalmente)
+- `has_critical = false` (apenas warnings, comportamento correto)
+- `jobs_processed_5m = 2961` (~600 jobs/min throughput)
+- `coalescing_rate_pct = 94.8%`
+
+**Out-of-scope:** integração com observability stack externa
+(Datadog/Grafana/Metabase). Decisão de produto, não de banco. Views `v_*` são
+portáveis para qualquer dashboard via `SELECT`. Worker logs estruturados já
+existem (Railway).
+
+---
 
 **🎯 SPRINT 5 FECHADA em 2026-05-06 — worker fairness validado em produção**
 

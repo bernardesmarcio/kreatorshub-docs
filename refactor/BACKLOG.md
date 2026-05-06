@@ -741,12 +741,85 @@ observability).
 
 ---
 
-## Fase 8 — Dead letter + observability completa (macro)
+## Fase 8 — Dead letter + observability portátil
 
-### R-8.1 — Status 'dead' + max_retries em segment_eval_queue
-### R-8.2 — Métricas finais em event_health_metrics
-### R-8.3 — R52.1 nova: invariantes monitorados
-### R-8.4 — Documentação final em ARCHITECTURE.md v8.0
+**🎯 Sprint 6 do plano operacional FECHADA em 2026-05-06** (~30min via MCP,
+**0 patch TS**, 3 migrations cirúrgicas). Escopo redimensionado de "worker
+dedicado + dashboards integrados" para "safety net + views portáveis" —
+mesmo padrão de redução da Sprint 4 (D-2026-05-05-09): problema original
+encolheu após Sprints 1-5 consolidarem o pipeline (0 errors/7d, 0 retries
+esgotados).
+
+### R-8.1 — Dead Letter Queue (safety net)
+
+**Status:** ✅ DONE em 2026-05-06
+
+- `analytics.dead_letter_queue` (clone schema das duas queues)
+- `analytics.move_to_dead_letter(queue text, job_id bigint)` — entrada manual
+  para jobs irrecuperáveis identificados via inspeção
+- TTL 90 dias via cron purge dedicado
+- View `analytics.v_dlq_summary` para inspeção rápida
+
+### R-8.2 — Health Views (observability portátil)
+
+**Status:** ✅ DONE em 2026-05-06
+
+4 views SQL portáveis (qualquer dashboard via `SELECT`):
+- `v_pipeline_status` — snapshot multidimensional
+- `v_queue_health` — throughput / latency / errors em janelas (5m / 15m / 24h)
+- `v_drift_by_tenant` — drift summary per-tenant
+- `v_worker_throughput` — performance por worker (p50/p95/p99 latency)
+
+### R-8.3 — Health Alerts
+
+**Status:** ✅ DONE em 2026-05-06
+
+`analytics.check_health_alerts()` retorna `jsonb` com violações detectadas.
+Limites configurados:
+
+| Métrica | Threshold | Severity |
+|---|---|---|
+| `oldest_pending` | > 5 min | warning |
+| `errors` | > 10/h | critical |
+| `dlq_new_24h` | > 0 | warning |
+| `throughput` (com fila) | < 10/min | critical |
+| `active_workers` (com fila) | < 3 | critical |
+
+Cron a cada 5min loga alertas críticos em `analytics.health_alert_log` (TTL 30d).
+
+**Validação real-time pós-deploy:** sistema detectou warnings ATIVOS
+imediatamente (esperado durante drenamento de burst rolling-refresh):
+queue_backlog (oldest 521s), drift_high (5172 > 1000), `has_critical=false`,
+`jobs_processed_5m=2961` (~600/min), `coalescing_rate_pct=94.8%`.
+
+### R-8.4 — Documentação final em ARCHITECTURE.md
+
+**Status:** ✅ DONE em 2026-05-06 — bump v7.33 → v8.0 (marcador de refactor
+completo). §22.8 (Sprint 6) + §22.9 (REFACTOR COMPLETO — métricas finais).
+
+### Out-of-scope — decisão de produto
+
+Integração com observability stack externa (Datadog / Grafana / Metabase /
+similar) é decisão de produto, não de banco. Views `v_*` são portáveis para
+qualquer dashboard via `SELECT`. Worker logs estruturados já existem (Railway).
+
+---
+
+# 🏁 REFACTOR COMPLETO em 2026-05-06
+
+**6/6 sprints fechadas** entre 2026-05-02 e 2026-05-06. Ver
+`docs/refactor/PROGRESS.md` para métricas pré/pós e D-2026-05-05-12 (lição
+arquitetural sobre custo upfront de centralização).
+
+**Backlog futuro (não-bloqueador):**
+- Decisão observability stack (Datadog / Grafana / Metabase) — produto
+- Cleanup TOTAL_SHARDS env vars (D-2026-05-05-11)
+- Suíte de testes para workers/historical-sync (D-2026-05-05-01)
+- Unificar evaluators legacy (AST v1) ↔ v2 (AST v2) (D-2026-05-05-03)
+- Remover `state_updated_at` redundante de refreshFeatures UPSERT
+  (D-2026-05-05-04)
+- Investigar canal dedicado para journey notifications (separar dos 2 usos
+  semânticos do `segment_eval_queue` — D-2026-05-05-06)
 
 ---
 

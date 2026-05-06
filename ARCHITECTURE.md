@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.33 — Sprint 5 do refactor fechada (worker fairness validado: 16x improvement em wait máximo, 6x em throughput)*
+*Versão 8.0 — 🏁 REFACTOR COMPLETO (6/6 sprints, 2026-05-02 a 2026-05-06)*
 
 ---
 
@@ -1896,10 +1896,156 @@ hash → deprecated.
 - ✅ 0 errors funcionais
 - ✅ TOTAL_SHARDS warning não ocorreu (envs default no Railway)
 
-### Próximo: Sprint 6
+### Próximo: Sprint 6 ✅ FECHADA
 
-- **Sprint 6** — dead letter + observability completa (telemetria estruturada,
-  alertas, dashboards, métrica `tenant_fairness_p99` histórica)
+Ver §22.8 abaixo.
+
+---
+
+## §22.8 Sprint 6 do refactor — Dead letter + observability portátil
+
+**Status:** ✅ FECHADA em **2026-05-06** (~30min via MCP, 3 migrations
+cirúrgicas, **0 patch TS**).
+**Documentação operacional viva:** `docs/refactor/PROGRESS.md` + `docs/refactor/BACKLOG.md`.
+
+### Redimensionamento (mesmo padrão da Sprint 4)
+
+Plano original previa worker dedicado de dead letter + dashboards integrados
+(estimativa ~1 semana). Após Sprints 1-5 consolidarem o pipeline:
+
+- 0 errors funcionais em 7 dias
+- 0 retries esgotados
+- Drift sustentado em 0
+
+Worker dedicado virou overkill. Sprint redimensionada para **safety net
+manual + views portáveis** — solução proporcional ao problema real.
+
+### R-8.1 — Dead Letter Queue (safety net)
+
+- `analytics.dead_letter_queue` — clone schema das duas queues
+  (`processing_jobs` e `segment_eval_queue`)
+- `analytics.move_to_dead_letter(queue text, job_id bigint)` — entrada manual
+  para jobs irrecuperáveis identificados via inspeção
+- TTL 90 dias via cron purge dedicado
+- View `analytics.v_dlq_summary`
+
+### R-8.2 — Health Views (4 views portáveis)
+
+| View | Conteúdo |
+|---|---|
+| `v_pipeline_status` | Snapshot multidimensional (queues, workers, drift, throughput) |
+| `v_queue_health` | Throughput / latency / errors em janelas (5m, 15m, 24h) |
+| `v_drift_by_tenant` | Drift summary per-tenant |
+| `v_worker_throughput` | Performance por worker (p50/p95/p99 latency) |
+
+Portáveis: qualquer dashboard via `SELECT` (Grafana, Metabase, Datadog SQL,
+admin UI próprio).
+
+### R-8.3 — Health Alerts
+
+`analytics.check_health_alerts()` retorna `jsonb` com violações detectadas:
+
+| Métrica | Threshold | Severity |
+|---|---|---|
+| `oldest_pending` | > 5 min | warning |
+| `errors` | > 10/h | critical |
+| `dlq_new_24h` | > 0 | warning |
+| `throughput` (com fila pending) | < 10/min | critical |
+| `active_workers` (com fila pending) | < 3 | critical |
+
+Cron a cada 5min loga alertas **críticos** em `analytics.health_alert_log`
+(TTL 30d). Warnings transitórios aparecem na função mas não são persistidos
+(evita ruído em log; query view direto pra estado real-time).
+
+### Validação real-time pós-deploy
+
+Sistema detectou warnings ATIVOS imediatamente (esperado, drenamento de
+burst rolling-refresh):
+- `queue_backlog`: oldest 521s
+- `drift_high`: 5172 > 1000
+- `has_critical = false` (apenas warnings, comportamento correto)
+- `jobs_processed_5m = 2961` (~600/min)
+- `coalescing_rate_pct = 94.8%`
+
+### Out-of-scope — decisão de produto
+
+Integração com observability stack externa (Datadog / Grafana / Metabase) é
+decisão de produto, não de banco. Views `v_*` são portáveis. Worker logs
+estruturados já existem (Railway).
+
+---
+
+## §22.9 🏁 REFACTOR COMPLETO — métricas finais e lições
+
+**Status:** ✅ COMPLETO em **2026-05-06**. 6/6 sprints fechadas em **~5 dias**
+(2026-05-02 a 2026-05-06). 17 producers de `contact_state` /
+`segment_eval_queue` endereçados.
+
+### Métricas pré/pós (acumuladas)
+
+| Métrica | Pré-refactor (2026-05-02) | Pós-refactor (2026-05-06) | Improvement |
+|---|---|---|---|
+| Amplification ratio (enqueues / mudanças reais) | 24.6x | **~1.0x** | **~25x** |
+| Wait máximo per-tenant | 1189s (19.8 min) | **~76s** | **~16x** |
+| Throughput pico | 70 jobs/min | **~600 jobs/min** | **~8.5x** |
+| Coalescing rate | 0% (não existia) | **94.8%** | feature nova |
+| Errors funcionais (7d) | legacy desconhecido | **0** | — |
+| Drift sustentado | crescente, mascarado por fallback agressivo (1.58M hits/7d) | **0 transitório, drena <10min** | — |
+| Producers fora do contrato canônico | 12 ad-hoc, cada um decidia versão+enqueue | **2 out-of-scope (notificação cross-system)** | semantic boundary |
+| Triggers SQL com `state_version+1` legacy | 6 funções | **0** | — |
+
+### Distribuição do trabalho
+
+| Sprint | Modo | Duração efetiva |
+|---|---|---|
+| 1 — Watermark semântico + worker per-party | Múltiplas tarefas TS+SQL | ~3-5 dias |
+| 2 — Decision Write API canônica (17 producers) | Migração distribuída TS+SQL, hot path | ~3 dias |
+| 3 — Coalescing real | **1 migration MCP, 0 patch TS** | **~30min** |
+| 4 — Repair via coalescing | **1 migration MCP, 0 patch TS** | **~15min** |
+| 5 — Worker fairness | 1 migration MCP + 1 patch TS | **~1h** |
+| 6 — Dead letter + observability | **3 migrations MCP, 0 patch TS** | **~30min** |
+
+**4 das 6 sprints fechadas via MCP em <1h cada.** Sprint 2 (centralização) é
+a explicação: criou o ponto canônico que tornou Sprints 3-6 cirúrgicas.
+
+### Pattern arquitetural emergente (D-2026-05-05-12)
+
+> **P2 (Decision API canônica) + P3 (workers stateless) + coalescing
+> centralizado tornam features novas em extensões cirúrgicas, não refactors
+> distribuídos.**
+
+Custo upfront da Sprint 2 (centralização canônica) foi alto: 17 producers
+tocados ao longo de 3 dias. Mas habilitou todas as Sprints subsequentes a
+serem fechadas em **horas via MCP** ao invés de **dias via patches
+distribuídos**. ROI da centralização visível imediatamente.
+
+**Lição operacional:** investir em consolidação canônica antes de evoluções
+arquiteturais. Cada producer migrado para o ponto canônico transforma feature
+futura de "atualizar N callers" em "atualizar 1 função". Custo upfront de
+centralização tem payback rápido.
+
+### Constituição inviolável (resumo)
+
+| Princípio | Status pós-refactor |
+|---|---|
+| **P1** — Single producer per state column (writes em `contact_state`) | ✅ materializado para metadados de versão (Decision API canônica) |
+| **P2** — Single writer per state column (RFM, features, etc.) | ✅ materializado per-dimensão whitelist |
+| **P3** — Workers stateless | ✅ workers leem fila, processam, sem estado local |
+| **P4** — Membership é projeção, não input | ✅ `segment_ids` mantido fora da whitelist por design |
+| **P8** — Dependency-aware evaluation | ✅ filtragem `fields_changed ∩ depends_on_fields` no worker |
+| **P9** — Coalescing real via UNIQUE constraint | ✅ R-3.2 (UNIQUE INDEX parcial + UPSERT merge) |
+| **P10** — Observability é camada própria | ✅ R-8.2/R-8.3 (views portáveis + health alerts) |
+
+### Débitos remanescentes (não-bloqueadores)
+
+| Débito | Categoria | Esforço estimado |
+|---|---|---|
+| **D-2026-05-05-01** — workers/historical-sync sem suíte de testes | Testabilidade | 1 sprint dedicada |
+| **D-2026-05-05-03** — coexistência 2 evaluators (legacy AST v1 ↔ v2) | Cleanup arquitetural | 1 sprint dedicada |
+| **D-2026-05-05-04** — `state_updated_at` redundante em refreshFeatures | Cleanup pequeno | ~30min |
+| **D-2026-05-05-06** — `segment_eval_queue` 2 usos semânticos (canal dedicado para journey notifications) | Refactor médio | 1 sprint dedicada |
+| **D-2026-05-05-11** — Cleanup `TOTAL_SHARDS`/`MY_SHARD` envs deprecated | Cleanup pequeno | ~30min |
+| Decisão de produto: observability stack externa (Datadog / Grafana / Metabase) | Produto | escopo a definir |
 
 ---
 
