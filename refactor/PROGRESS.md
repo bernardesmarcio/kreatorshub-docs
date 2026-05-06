@@ -31,6 +31,57 @@
 
 Nenhum.
 
+## Incidentes pós-refactor
+
+### Incidente 2026-05-06 — `cleanup_stale_segment_eval_jobs` em loop de erro
+
+**Sintoma:** workers Railway logando `segment_eval_loop_error` com
+`duplicate key value violates unique constraint "idx_seg_eval_queue_pending_unique_party"`
+em loop em todas as réplicas.
+
+**Causa raiz (D-2026-05-06-14):** Sprint 3 introduziu invariante via
+índice unique partial `idx_seg_eval_queue_pending_unique_party
+(tenant_id, party_id) WHERE status='pending'`. Decision API
+(`apply_contact_state_mutation`) e `run_segment_eval_fallback` foram
+atualizados para respeitar (ON CONFLICT DO UPDATE merge), mas
+`cleanup_stale_segment_eval_jobs` ficou com `UPDATE simples
+'claimed' → 'pending'` sem checar duplicados.
+
+Cenário de ativação:
+1. Job A (party X) `pending` → worker pega → `claimed`
+2. Novo evento dispara → Decision API cria/coalesce → existe novo `pending` para party X
+3. Worker original morre (Railway restart, OOM) sem completar Job A
+4. Cleanup roda: tenta `UPDATE claimed → pending` em Job A → viola unique index
+   (já existe pending para mesma party)
+5. UPDATE atômico falha em qualquer linha → bloqueia cleanup inteiro → loop de erro
+
+**Diagnóstico:** ~3min após log inspecionado. Query confirmou 37 stale
+claimed, todos com pending duplicado para mesma `(tenant_id, party_id)`.
+
+**Fix aplicado via MCP:**
+
+1. `DELETE` 37 stale claimed com pending duplicado (limpeza imediata)
+2. `CREATE OR REPLACE FUNCTION cleanup_stale_segment_eval_jobs` idempotente:
+   - Passo 1: DELETE stale claimed com pending duplicado (job já coberto pelo pending)
+   - Passo 2: UPDATE restantes para 'pending' (seguro pós-passo 1)
+
+**Métricas:**
+- Tempo de diagnóstico: ~3min (após inspecionar log no Sentry/Railway)
+- Tempo de resolução: ~3min (1 DELETE manual + 1 migration via MCP)
+- **Downtime workers analytics:** ~3h (workers parados em loop de erro
+  desde primeira ocorrência; sistema sobreviveu via coalescing acumulando
+  pending sem perder writes)
+- Backlog acumulado: 9.275 pending (drenando normalmente pós-fix)
+
+**Lição operacional registrada:**
+- ARCHITECTURE.md §22.10 — checklist novo "Antes de criar UNIQUE INDEX
+  partial em fila/tabela quente"
+- ARCHITECTURE.md §22.11 — Pergunta 8 "worker em loop com duplicate
+  key violation" + caso na tabela de sintomas
+
+**Atualização BACKLOG.md:** D-2026-05-06-14 registrado nos débitos
+(resolvido, mas mantido como referência arquitetural).
+
 ## Métricas finais consolidadas (pré → pós refactor)
 
 | Métrica | Pré-refactor (2026-05-02) | Pós-refactor (2026-05-06) | Improvement |
@@ -289,6 +340,39 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-06-14 — Writers auxiliares de fila precisam respeitar invariantes de índice unique partial
+
+**Contexto:** Sprint 3 introduziu `idx_seg_eval_queue_pending_unique_party
+(tenant_id, party_id) WHERE status='pending'` para coalescing real
+(R-3.1). Decision API e fallback foram atualizados para respeitar via
+`ON CONFLICT DO UPDATE`, mas `cleanup_stale_segment_eval_jobs` —
+caminho auxiliar de recovery, não writer "principal" — manteve
+`UPDATE 'claimed' → 'pending'` simples. Bug latente até worker morrer
+em cenário com novo enqueue para mesma party após claim. Manifestou
+em 2026-05-06 como loop de erro nos workers Railway.
+
+**Decisão:** writer de cleanup tornado idempotente:
+1. DELETE stale claimed que tem pending duplicado para mesma chave
+   (job já coberto, deletar é seguro)
+2. UPDATE restantes para 'pending' (sem colisão possível pós-passo 1)
+
+**Lição arquitetural:** ao adicionar UNIQUE constraint/index parcial
+em tabela com múltiplos writers, auditar TODOS — não só os caminhos
+principais. Caminhos auxiliares (cleanup, repair, rollback, reset,
+recovery) também são writers e podem violar invariantes em cenários
+raros (worker morto, race entre claim e enqueue, etc.). Bug latente
+até cenário disparar; pode demorar dias/semanas para manifestar.
+
+**Cobertura para futuro:**
+- ARCHITECTURE.md §22.10 ganhou checklist "Antes de criar UNIQUE
+  INDEX partial em fila/tabela quente" — exige `grep` por todos os
+  writers + teste com pending duplicado artificial antes de aplicar
+- ARCHITECTURE.md §22.11 ganhou Pergunta 8 com diagnóstico e fix
+  template para caminhos auxiliares
+
+**Custo:** ~3h workers parados (sistema sobreviveu via coalescing
+acumulando pending). ~3min diagnóstico + ~3min fix via MCP.
 
 ### D-2026-05-06-13 — Sprint 7 (Incremental refresh) priorizada antes de 5M+ contatos
 

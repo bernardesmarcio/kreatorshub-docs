@@ -13,6 +13,29 @@
 
 # Pendente pós-refactor
 
+## Resolvidos pós-refactor
+
+### D-2026-05-06-14 — Writers auxiliares de fila respeitando invariantes de índice unique partial ✅ RESOLVIDO
+
+**Status:** ✅ Resolvido em 2026-05-06 (~6min total: diagnóstico + fix via MCP).
+**Manifestação:** workers analytics em loop de erro `duplicate key violates
+unique constraint "idx_seg_eval_queue_pending_unique_party"` após Sprint 3.
+**Causa raiz:** `cleanup_stale_segment_eval_jobs` fazia
+`UPDATE 'claimed' → 'pending'` sem checar se já existia pending para
+mesma `(tenant_id, party_id)`. Sprint 3 introduziu invariante mas só
+atualizou writers principais (Decision API, fallback). Caminho auxiliar
+(cleanup) ficou de fora.
+
+**Fix:** função tornada idempotente — DELETE stale com pending
+duplicado primeiro, depois UPDATE restantes.
+
+**Lição arquitetural permanente:** ao adicionar UNIQUE INDEX partial,
+auditar TODOS os writers (incluindo cleanup/repair/recovery), não só
+os principais. Detalhes em PROGRESS.md → D-2026-05-06-14.
+
+**Playbook atualizado:** ARCHITECTURE.md §22.10 (checklist UNIQUE INDEX
+partial) + §22.11 Pergunta 8 (diagnóstico de duplicate key em loop).
+
 ## Alta prioridade
 
 ### D-2026-05-06-13 — Sprint 7: Incremental refresh (cron rolling-refresh filtra por state_updated_at)

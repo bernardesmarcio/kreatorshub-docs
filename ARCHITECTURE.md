@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 8.1 — Playbooks operacionais (§22.10 Adding Producer + §22.11 Troubleshooting)*
+*Versão 8.2 — D-2026-05-06-14: writers de fila com índice unique partial precisam ser idempotentes (§22.10 + §22.11)*
 
 ---
 
@@ -2215,6 +2215,30 @@ Para adicionar dimensão nova: editar `analytics.is_segmentation_relevant_dimens
 - [ ] Sem `try/catch` envolvendo Decision API (atomicity > resilience local — D-2026-05-03-02)
 - [ ] Producer registrado nesta seção §22.10 (lista de producers ativos abaixo)
 
+### Antes de criar UNIQUE INDEX partial em fila/tabela quente — checklist obrigatório
+
+Lição D-2026-05-06-14: invariante introduzida por índice unique partial
+quebra TODOS os writers que não respeitam, não apenas o caminho principal.
+Bug latente até cenário raro disparar (ex: cleanup só roda quando há
+stale claimed).
+
+- [ ] `grep` por TODOS os writers da tabela (UPDATE, INSERT, DELETE)
+      em SQL functions, triggers e código TS dos workers
+- [ ] Garantir que TODOS respeitam a invariante do índice
+      (ON CONFLICT DO UPDATE, DELETE-then-INSERT, ou skip-if-exists)
+- [ ] Caminhos auxiliares são writers também: `cleanup_*`, `repair_*`,
+      `recover_*`, `rollback_*`, `reset_*` — auditar individualmente
+- [ ] Testar com pending duplicado artificial antes de aplicar o índice:
+      ```sql
+      -- Reproduzir cenário "stale claimed + novo pending para mesma chave"
+      INSERT INTO <tabela> (<chaves>, status) VALUES (..., 'pending');
+      UPDATE <tabela> SET status='claimed' WHERE id=<above_id>;
+      INSERT INTO <tabela> (<chaves mesmas>, status) VALUES (..., 'pending');
+      -- Rodar cleanup. Se quebra → fix antes do índice.
+      ```
+- [ ] Se algum writer auxiliar não puder ser idempotente, considerar
+      DELETE-first-then-UPDATE ou substituir por DELETE + reenfileiramento
+
 ### Producers ativos (atualizar quando adicionar/remover)
 
 **TS workers:**
@@ -2368,6 +2392,63 @@ ORDER BY logged_at DESC;
 | Wait máximo > 5min | Burst grande sem capacity | Aumentar réplicas Railway |
 | DLQ recebeu jobs | Jobs em loop irrecuperável | Inspecionar `analytics.dead_letter_queue` |
 | Queue cresce mas workers vivos | Producer mal-comportado em loop | `SELECT triggered_by, COUNT(*) FROM segment_eval_queue WHERE status='pending' GROUP BY 1` |
+| Worker em loop com `duplicate key value violates unique constraint` (`segment_eval_loop_error`) | Writer auxiliar (cleanup/repair/recovery) faz UPDATE/INSERT sem respeitar índice unique partial | Ver Pergunta 8 abaixo |
+
+### Pergunta 8: worker em loop com `duplicate key violation`
+
+Sintoma típico (Railway logs):
+```json
+{
+  "message": "segment_eval_loop_error",
+  "error": "duplicate key value violates unique constraint \"idx_seg_eval_queue_pending_unique_party\""
+}
+```
+
+Diagnóstico:
+
+1. **Detectar colisões pending+claimed para mesma chave:**
+   ```sql
+   SELECT COUNT(*) FROM (
+     SELECT tenant_id, party_id
+     FROM analytics.segment_eval_queue
+     WHERE status IN ('pending','claimed')
+     GROUP BY tenant_id, party_id
+     HAVING COUNT(DISTINCT status) > 1
+   ) t;
+   ```
+   Se > 0 → tem stale claimed que tentaria voltar para pending mas violaria
+   índice. Isso bloqueia `cleanup_stale_segment_eval_jobs` em loop.
+
+2. **Limpar stale claimed com pending duplicado (operação idempotente, segura):**
+   ```sql
+   DELETE FROM analytics.segment_eval_queue q
+   WHERE q.status = 'claimed'
+     AND q.claimed_at < now() - interval '10 minutes'
+     AND EXISTS (
+       SELECT 1 FROM analytics.segment_eval_queue p
+       WHERE p.status = 'pending'
+         AND p.tenant_id = q.tenant_id
+         AND p.party_id  = q.party_id
+     );
+   ```
+   O job pending duplicado já cobre o trabalho — deletar o claimed é seguro.
+
+3. **Auditar writers da fila:** `grep` em SQL functions e workers TS por
+   `INSERT INTO segment_eval_queue` ou `UPDATE analytics.segment_eval_queue
+   SET status='pending'`. Cada writer DEVE respeitar o índice unique
+   partial (ON CONFLICT DO UPDATE, ou DELETE-first quando duplicado existe).
+   Ver §22.10 checklist "UNIQUE INDEX partial".
+
+4. **Aplicar fix idempotente** (template para qualquer writer auxiliar):
+   ```sql
+   -- Passo 1: deletar candidatos com pending duplicado
+   DELETE FROM <tabela> q
+   WHERE <condicao_writer> AND EXISTS (
+     SELECT 1 FROM <tabela> p
+     WHERE p.status='pending' AND p.<chaves_unicas> = q.<chaves_unicas>
+   );
+   -- Passo 2: writer original (UPDATE/INSERT) sobre os restantes — agora seguro
+   ```
 
 ---
 
