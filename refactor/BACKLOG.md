@@ -616,35 +616,56 @@ segmentos a partir do `rules_json_v2` antes de habilitar filter agressivo.
 
 ---
 
-## Fase 4 — Repair worker substitui fallback (macro)
+## Fase 4 — Repair via coalescing (escopo redimensionado — D-2026-05-05-09)
 
-### R-4.1 — Implementar runSegmentRepairCheck em journeys-worker
+**🎯 Sprint 4 FECHADA em 2026-05-06 via mudança cirúrgica em
+`run_segment_eval_fallback`. Plano original (worker dedicado +
+4 sub-tarefas R-4.1 a R-4.5) foi substituído por 1 migration MCP única.**
 
-**Status:** todo
-**Estimativa:** 4h
-**Risco:** baixo
+**Por que redimensionado:**
+- Pré-Sprint 3: cron fallback detectava ~120k parties/dia (justificava worker)
+- Pós-Sprint 3: 20 jobs/dia (causa raiz do drift transitório morta pelas
+  Sprints 1+2+3)
+- Worker dedicado seria overkill para volume edge raro
 
-### R-4.2 — Telemetria repair_hits em event_health_metrics
+### R-4.1 — Repair via coalescing pattern
 
-**Status:** todo
-**Estimativa:** 1h
+**Status:** ✅ DONE em 2026-05-06 (aplicado via MCP, 1 migration cirúrgica)
 
-### R-4.3 — Validação 7 dias em paralelo ao fallback
+**Aplicado:**
+- `analytics.run_segment_eval_fallback` reescrita: INSERT direto em queue →
+  **`INSERT ... ON CONFLICT DO UPDATE`** (mesmo merge pattern de R-3.2)
+- `fields_changed`: lista hardcoded de 13 dimensões → **`['repair_full_eval']`**
+  (sinal especial para o evaluator significando "re-avalia tudo, não filtra
+  por interseção `depends_on_fields`")
+- `priority = 9` preservada (baixa urgência, última a processar)
+- `triggered_by = 'repair'` preservado (identifica origem)
 
-**Status:** todo
-**Estimativa:** 7 dias monitoramento
+**Validação E2E (via MCP, 2026-05-06):**
+- Drift artificial criado em 1 party
+- `run_segment_eval_fallback()` detectou
+- Job enfileirado com `triggered_by='repair'`, `fields_changed=['repair_full_eval']`
+- Worker processou em 568ms, drift drenado para 0
+- Sprint 3 não quebrado: 10.639 jobs `coalesced` em 2h continuam aparecendo
 
-### R-4.4 — Drop pg_cron segment-eval-fallback
+**Decisão arquitetural (D-2026-05-05-09):** repair NÃO usa Decision API porque
+não muta `contact_state` (P2 aplica-se a contact_state, não a queue inserts).
+Mas usa o mesmo coalescing pattern via `ON CONFLICT DO UPDATE` direto.
 
-**Status:** todo
-**Estimativa:** 30min
-**Bloqueado por:** R-4.3 com `repair_hits` próximo de zero
+### R-4.2 a R-4.5 — Substituídos pelo R-4.1
 
-### R-4.5 — Drop function run_segment_eval_fallback
+**Status:** ⛔ NOT DONE — escopo absorvido / não-aplicável após Sprint 1+2+3
 
-**Status:** todo
-**Estimativa:** 30min
-**Bloqueado por:** R-4.4 + 30 dias
+- **R-4.2 (telemetria repair_hits):** parcialmente coberto via
+  `event_health_metrics` que já existe. Métrica granular pode ser adicionada
+  como item futuro se a observability pedir.
+- **R-4.3 (validação 7 dias paralelo):** não-aplicável — não há worker novo
+  rodando em paralelo, apenas a função SQL existente foi reescrita.
+- **R-4.4 (drop pg_cron segment-eval-fallback):** **não fazer** — fallback
+  agora é o único caminho de repair (proporcional ao volume real). Drop seria
+  perder a safety net.
+- **R-4.5 (drop function run_segment_eval_fallback):** **não fazer** — função
+  permanece, agora alinhada com pattern de coalescing.
 
 ---
 

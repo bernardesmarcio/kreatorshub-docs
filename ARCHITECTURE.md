@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.30 — Sprint 3 do refactor fechada (Coalescing real via UNIQUE INDEX + UPSERT merge)*
+*Versão 7.31 — Sprint 4 do refactor fechada (Repair via coalescing pattern)*
 
 ---
 
@@ -1696,10 +1696,92 @@ SQL — fator de redução de complexidade de **~15x** vs. cenário pré-Sprint 
 - `avg_ms_processing` estável ou melhor (menos jobs duplicados = menos contenção)
 - 0 errors funcionais
 
-### Próximo: Sprint 4
+### Próximo: Sprint 4 ✅ FECHADA
 
-- **D-CRON-4** — Repair worker substituir cron fallback (worker dedicado de
-  repair com observability própria)
+Ver §22.6 abaixo.
+
+---
+
+## §22.6 Sprint 4 do refactor — Repair via coalescing pattern
+
+**Status:** ✅ FECHADA em **2026-05-06** (~15min via MCP, sem patch TS, **escopo
+90% menor que planejado**).
+**Documentação operacional viva:** `docs/refactor/PROGRESS.md` + `docs/refactor/BACKLOG.md`.
+
+### Objetivo (redimensionado)
+
+O plano original (R-4.1 a R-4.5) previa criar um **repair worker dedicado** com
+observability própria, validação 7 dias em paralelo, e eventual drop do
+`pg_cron segment-eval-fallback` + função SQL legada. Estimativa: ~5 dias.
+
+**O que mudou:** as Sprints 1+2+3 mataram a causa raiz do drift transitório.
+Pré-Sprint 3, fallback detectava ~120k parties/dia (worker dedicado fazia
+sentido). Pós-Sprint 3: 20 jobs/dia. Worker dedicado virou overkill.
+
+**Sprint 4 redimensionada:** alinhar `run_segment_eval_fallback` com o pattern
+de coalescing do R-3.2. 1 migration MCP única, sem worker novo.
+
+### Implementação (R-4.1)
+
+`analytics.run_segment_eval_fallback` reescrita:
+
+| Antes | Depois |
+|---|---|
+| `INSERT INTO segment_eval_queue (...)` direto | `INSERT ... ON CONFLICT (tenant_id, party_id) WHERE status='pending' DO UPDATE` (mesmo merge de R-3.2) |
+| `fields_changed = ARRAY[...13 dimensões hardcoded...]` | `fields_changed = ARRAY['repair_full_eval']` (sinal especial) |
+| `priority = 9` | `priority = 9` (preservada — baixa urgência) |
+| `triggered_by = 'repair'` | `triggered_by = 'repair'` (preservado — identifica origem) |
+
+### `repair_full_eval` — sinal especial para o evaluator
+
+Worker R-1.6 normalmente filtra segmentos via interseção
+`fields_changed ∩ depends_on_fields` (princípio P8 — dependency-aware
+evaluation). Se um segmento não declara dependência das dimensões mudadas, é
+pulado.
+
+`repair_full_eval` é **sinal especial** que diz ao evaluator: *"não filtra,
+re-avalia o party contra todos os segmentos do tenant"*. Apropriado para
+repair porque o fallback detecta drift por causas que não conhece a priori.
+
+Implementação no evaluator: se `fields_changed` contém `'repair_full_eval'`,
+o filtro `depends_on_fields` é bypassado para esse job.
+
+### Decisão arquitetural — Decision API vs queue inserts (D-2026-05-05-09)
+
+Sprint 4 clarificou um critério arquitetural não-óbvio: **P2 aplica-se a
+escritas em `contact_state`, não a inserts em `segment_eval_queue`**.
+
+| Caller | Muta `contact_state`? | Decision API? | Coalescing pattern? |
+|---|---|---|---|
+| Producer de dimensão whitelisted | ✅ | ✅ obrigatório (P2) | ✅ herda de R-3.2 |
+| Producer BULK_ONLY (cluster, traits, opportunity) | ❌ | ✅ por uniformidade | ✅ herda |
+| Notificação cross-system (computeClusters, repair) | ❌ | ❌ não obrigatório | ✅ obrigatório |
+
+`run_segment_eval_fallback` cai na 3ª linha: notificação cross-system, sinaliza
+ao worker "preciso re-avaliar esse party" sem mutar estado canônico. Não passa
+pela Decision API; usa coalescing pattern via `ON CONFLICT DO UPDATE` direto.
+
+### Validação E2E (via MCP, 2026-05-06)
+
+- Drift artificial criado em 1 party
+- `analytics.run_segment_eval_fallback()` detectou
+- Job enfileirado com `triggered_by='repair'`, `fields_changed=['repair_full_eval']`
+- Worker processou em **568ms**
+- Drift drenado para 0
+- Sprint 3 intacto: **10.639 jobs `coalesced`** em 2h continuam aparecendo
+
+### Tarefas absorvidas / canceladas
+
+| Tarefa original | Status | Justificativa |
+|---|---|---|
+| R-4.1 — runSegmentRepairCheck worker | ✅ DONE (redimensionado) | Substituída por mudança em SQL fn existente |
+| R-4.2 — Telemetria `repair_hits` | parcial | `event_health_metrics` já cobre o essencial; métrica granular fica como item futuro |
+| R-4.3 — Validação 7 dias em paralelo | n/a | Não há worker novo rodando em paralelo |
+| R-4.4 — Drop pg_cron `segment-eval-fallback` | ❌ não fazer | Fallback agora é o único caminho de repair, proporcional ao volume real (20/dia). Drop perderia safety net |
+| R-4.5 — Drop function `run_segment_eval_fallback` | ❌ não fazer | Função permanece, alinhada com pattern de coalescing |
+
+### Próximo: Sprint 5 + 6
+
 - **Sprint 5** — worker fairness real (anti-starvation per tenant)
 - **Sprint 6** — dead letter + observability completa (telemetria estruturada,
   alertas, dashboards)

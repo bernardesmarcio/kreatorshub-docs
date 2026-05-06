@@ -10,20 +10,19 @@
 
 ## Estado atual
 
-**Sprint:** 3 — Fase 3 (Coalescing real) — 🎯 **FECHADA em 2026-05-05** (~30min via MCP, sem patch TS)
-**Fase ativa:** Sprints 1+2+3 fechadas. Drift sustentado em 0. Coalescing reduz 30-50% do volume da queue (estimativa). Validação E2E em produção via teste manual: ✓.
-**Última atualização:** 2026-05-05
-**Quem atualizou:** Claude Code via Sprint 3 closure (R-3.1+R-3.2 aplicados via MCP por Marcio)
+**Sprint:** 4 (Repair via coalescing) — 🎯 **FECHADA em 2026-05-06** (~15min via MCP, sem patch TS, escopo 90% menor que planejado)
+**Fase ativa:** Sprints 1+2+3+4 fechadas. Drift transitório caiu de ~120k/dia (pré-Sprint 3) para 20/dia (atual). Validação E2E: ✓ via MCP.
+**Última atualização:** 2026-05-06
+**Quem atualizou:** Claude Code via Sprint 4 closure (R-4.1 aplicado via MCP por Marcio)
 
 ## Próximas 3 ações
 
-1. **Monitorar Sprint 3 em produção (próximas 6h):**
-   - Jobs com `triggered_by='coalesced'` aparecem na queue
-   - Volume total da queue cai 30-50%
-   - `avg_ms_processing` estável ou melhor
-   - 0 errors
-2. **Sprint 4** (D-CRON-4 — Repair worker) — substituir cron fallback por worker dedicado de repair com observability própria.
-3. **Sprint 5** (worker fairness real) e **Sprint 6** (dead letter + observability).
+1. **Monitorar Sprints 3+4 em produção (próximas 24h):**
+   - `triggered_by='coalesced'` (Sprint 3) e `triggered_by='repair'` com `fields_changed=['repair_full_eval']` (Sprint 4) aparecem
+   - Drift continua em 0
+   - 0 errors funcionais
+2. **Sprint 5** — worker fairness real (anti-starvation per tenant).
+3. **Sprint 6** — dead letter + observability completa.
 
 ## Bloqueadores ativos
 
@@ -269,6 +268,45 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-05-09 — Critério P2: Decision API é sobre escritas em contact_state, não sobre todas as escritas em queue
+
+**Contexto:** durante Sprint 4, decisão de **não migrar** `run_segment_eval_fallback`
+para chamar a Decision API. O fallback faz INSERT em `segment_eval_queue` para
+parties com drift detectado, mas **não escreve em `contact_state`**. Pergunta:
+isso viola P2 ("single producer, single writer per dimension")?
+
+**Resposta arquitetural (regra clarificada):**
+
+P2 aplica-se a **escritas em `contact_state`** (a tabela de estado canônico). A
+Decision API existe para garantir que producers de dimensões whitelisted tenham
+um único caminho de escrita que centraliza versionamento + enqueue.
+
+**P2 NÃO se aplica a inserts em `segment_eval_queue`** se o caller não está
+mutando `contact_state`. A queue é um canal de comunicação cross-system; quem
+sinaliza "preciso re-avaliar" não precisa passar pela Decision API.
+
+**Critério prático:**
+
+| Caller | Muta `contact_state`? | Deve usar Decision API? | Deve usar coalescing pattern? |
+|---|---|---|---|
+| Producer de dimensão whitelisted | ✅ SIM | ✅ SIM (P2) | ✅ herda de R-3.2 automaticamente |
+| Producer BULK_ONLY (cluster, traits, opportunity) | ❌ NÃO (vivem em outras tabelas) | ✅ SIM (uniformidade — Decision API trata BULK_ONLY) | ✅ herda |
+| Notificação cross-system (computeClusters, repair) | ❌ NÃO | ❌ NÃO obrigatório | ✅ deve usar mesmo `ON CONFLICT DO UPDATE` para coalescer |
+
+**Aplicação na Sprint 4:** `run_segment_eval_fallback` é "notificação cross-system"
+(sinaliza ao worker que esse party precisa de re-eval por motivo de safety net,
+não por mudança de dimensão). Não muta `contact_state`. Caso da terceira linha
+da tabela: não obrigatório passar pela Decision API, mas obrigatório alinhar
+com pattern de coalescing — feito via `INSERT ... ON CONFLICT DO UPDATE` direto.
+
+**Lição operacional:** P2 não é regra absoluta sobre "tudo passa por uma função".
+É regra **semântica** sobre quem escreve em estado canônico. Inserts em filas
+de notificação podem permanecer onde fazem sentido — desde que respeitem o
+pattern de coalescing do schema (UNIQUE INDEX + UPSERT merge).
+
+**Custo evitado:** worker dedicado de repair (~3-5 dias de trabalho), observability
+paralela, dead letter caminho específico. Sprint 4 condensada em 15min de MCP.
 
 ### D-2026-05-05-08 — Sprint 3 aplicada via MCP em ~30min sem patch TS
 
@@ -687,6 +725,49 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**🎯 SPRINT 4 FECHADA em 2026-05-06 — repair via coalescing (R-4.1)**
+
+Aplicada via Supabase MCP em **migration cirúrgica única**, ~15min, **0 patch TS**.
+Escopo final 90% menor que o planejado (D-2026-05-05-09): repair worker dedicado
+**não foi criado** — Sprint 1+2+3 já mataram a causa raiz do drift transitório.
+
+**Achado contextual antes da decisão:**
+- Pré-Sprint 3: cron fallback detectava ~120k parties/dia
+- Pós-Sprint 3 (atual): **20 jobs em 24h** total
+- Sprint 4 monolítica (worker dedicado, observability própria, dead letter
+  caminho específico) seria overkill para um caso edge raríssimo
+
+**Implementação aplicada:**
+
+Mudança cirúrgica em `analytics.run_segment_eval_fallback`:
+- INSERT direto em `segment_eval_queue` → **`INSERT ... ON CONFLICT DO UPDATE`**
+  (mesmo merge pattern do R-3.2 — Sprint 3)
+- `fields_changed`: lista hardcoded de 13 dimensões → **`['repair_full_eval']`**
+  (sinal especial para o evaluator significando "re-avalia tudo, não filtra
+  por interseção `depends_on_fields`")
+- `priority = 9` preservada (baixa urgência — última a ser processada)
+- `triggered_by = 'repair'` preservado (identifica origem)
+
+**Validação E2E (via MCP, 2026-05-06):**
+- Drift artificial criado em 1 party
+- `run_segment_eval_fallback()` detectou
+- Job enfileirado com `triggered_by='repair'`, `fields_changed=['repair_full_eval']`
+- Worker processou em **568ms**
+- Drift drenado para 0
+- Sprint 3 não quebrado: **10.639 jobs `coalesced`** em 2h continuam aparecendo
+
+**Beleza arquitetural:** Sprint 1+2+3 fizeram o trabalho pesado. Sprint 4 ficou
+sendo "alinhar repair com o pattern de coalescing existente" — adição
+centralizada (1 função SQL alterada), não distribuída. Continua a tese
+P2 + D-2026-05-05-08.
+
+**Resolve:**
+- ✅ **D-CRON-4** (Repair worker) — closed via mudança cirúrgica em vez de
+  worker dedicado. Solução é proporcional ao tamanho real do problema (20 jobs/dia,
+  não 120k/dia).
+
+---
 
 **🎯 SPRINT 3 FECHADA em 2026-05-05 — coalescing real aplicado via MCP**
 
