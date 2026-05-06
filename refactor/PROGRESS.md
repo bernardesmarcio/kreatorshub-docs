@@ -374,6 +374,38 @@ até cenário disparar; pode demorar dias/semanas para manifestar.
 **Custo:** ~3h workers parados (sistema sobreviveu via coalescing
 acumulando pending). ~3min diagnóstico + ~3min fix via MCP.
 
+### D-2026-05-06-15 — RPCs do dashboard com defesa em profundidade
+
+**Contexto:** durante DASH-1 backend, as 4 RPCs de observabilidade
+(`public.system_observability_snapshot`, `system_throughput_timeseries`,
+`system_alerts_history`, `system_cron_health`) + wrapper
+`system_move_to_dead_letter` foram protegidas com guard interno via
+`public.check_is_system_admin(auth.uid())` antes de retornar dados.
+
+**Justificativa:**
+- Dados cross-tenant retornados pelas RPCs (snapshot tem top 50 tenants,
+  todas as filas, todos os workers)
+- `<SystemRoute>` wrapper na UI é primeira linha de defesa (gate de rota)
+- Guard SQL é segunda linha — defesa em profundidade
+
+**Protege contra:**
+- Bug futuro removendo gate da UI (alguém edita `SystemRoute` sem perceber
+  que isso vaza acesso aos endpoints)
+- JWT vazado de usuário não-admin sendo usado em curl direto contra a RPC
+- Descoberta de endpoint via inspeção de Network tab + replay
+
+**Comportamento:** usuário sem registro em `core.system_admins` recebe
+`ERROR 42501: access_denied: system_admin required`. Cliente HTTP recebe
+erro PostgREST com message correspondente. Frontend captura via try/catch
+das chamadas Supabase RPC.
+
+**Cron interno NÃO afetado:** `analytics.check_health_alerts()` (cron a cada
+5min) chama função SECURITY DEFINER no schema `analytics`, não passa pelo
+wrapper `public.system_*`. Pipeline operacional intocado.
+
+**Lição:** RPCs que retornam dados cross-tenant **devem ter guard SQL**
+mesmo que UI seja gated. Princípio: cada camada protege independente.
+
 ### D-2026-05-06-13 — Sprint 7 (Incremental refresh) priorizada antes de 5M+ contatos
 
 **Contexto:** pós-refactor v8.0, cron `rfm-rolling-refresh` é o consumidor
