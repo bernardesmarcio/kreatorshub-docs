@@ -685,9 +685,50 @@ Mas usa o mesmo coalescing pattern via `ON CONFLICT DO UPDATE` direto.
 
 ## Fase 6 — Worker com fairness real (macro)
 
-### R-6.1 — Refactor claim para ROW_NUMBER OVER PARTITION
+**🎯 Sprint 5 do plano operacional aplicada em 2026-05-06**: SQL via MCP +
+patch TS commitado. R-6.1 done via implementação two-phase (round-robin +
+FIFO). R-6.2/R-6.3 absorvidos / opcionais.
+
+### R-6.1 — Claim com fairness (two-phase: round-robin + FIFO global)
+
+**Status:** ✅ DONE em 2026-05-06 (Sprint 5 do plano operacional)
+
+**Implementação real (D-2026-05-05-10):** algoritmo em SQL ao invés de
+ROW_NUMBER OVER PARTITION em TS. `analytics.claim_next_segment_jobs_fair(worker_id, batch_size)`:
+
+- **Phase 1 — round-robin:** `batch_size / tenant_count_active` por tenant ativo
+- **Phase 2 — FIFO global:** preenche capacity restante por ordem de `created_at`
+- Lock via `FOR UPDATE SKIP LOCKED` (compatível multi-replica)
+- View `analytics.v_queue_fairness_status` para observability em tempo real
+
+**Patch TS aplicado (`workers/analytics/src/segment-eval-worker.ts:319-356`):**
+- Removido loop `for (tenant of tenants) claim(tenant_id)` + query de tenants
+  por hash sharding
+- Substituído por claim único via `claim_next_segment_jobs_fair(WORKER_ID, BATCH_SIZE)`
+- TOTAL_SHARDS/MY_SHARD preservados como dead code com warning
+  (compat Railway envs)
+- Logger `fair_claim_received` para validação pós-deploy
+
+**Diagnóstico pré-fix (via MCP):**
+- Escola do Fluxo: 41k jobs/24h, wait médio 9.6min, max 19.8min
+- Instituto Socrates: 2.7k jobs/24h, wait médio 2.7min, max 5.4min
+
+**Critério produção (30min pós-deploy):**
+- ✅ `oldest_pending_seconds < 60s` para todos tenants ativos
+- ✅ Throughput ≥ 70 jobs/min sustentado
+- ⛔ Vermelho: > 300s pendente em algum tenant após 10min, ou throughput < 40/min
+
 ### R-6.2 — Limit por tenant por ciclo
+
+**Status:** ✅ ABSORVIDO por R-6.1. A função `claim_next_segment_jobs_fair`
+implementa limit per-tenant via Phase 1 (`batch_size / tenant_count_active`).
+
 ### R-6.3 — Métrica tenant_fairness_p99
+
+**Status:** parcial — `analytics.v_queue_fairness_status` cobre `oldest_pending_seconds`
+per-tenant em tempo real. Métrica histórica p99 fica como item futuro
+(observability complementar) — pode ser absorvido pela Sprint 6 (dead letter +
+observability).
 
 ---
 

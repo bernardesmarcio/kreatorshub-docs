@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 7.31 — Sprint 4 do refactor fechada (Repair via coalescing pattern)*
+*Versão 7.32 — Sprint 5 do refactor (Worker fairness via SQL two-phase claim)*
 
 ---
 
@@ -1780,11 +1780,113 @@ pela Decision API; usa coalescing pattern via `ON CONFLICT DO UPDATE` direto.
 | R-4.4 — Drop pg_cron `segment-eval-fallback` | ❌ não fazer | Fallback agora é o único caminho de repair, proporcional ao volume real (20/dia). Drop perderia safety net |
 | R-4.5 — Drop function `run_segment_eval_fallback` | ❌ não fazer | Função permanece, alinhada com pattern de coalescing |
 
-### Próximo: Sprint 5 + 6
+### Próximo: Sprint 5 ✅ APLICADA (deploy + validação em curso)
 
-- **Sprint 5** — worker fairness real (anti-starvation per tenant)
+Ver §22.7 abaixo.
+
+---
+
+## §22.7 Sprint 5 do refactor — Worker fairness via SQL two-phase claim
+
+**Status:** SQL aplicado via MCP em 2026-05-06; patch TS commitado;
+deploy + validação produção (30min) em curso.
+**Documentação operacional viva:** `docs/refactor/PROGRESS.md` + `docs/refactor/BACKLOG.md`.
+
+### Problema observado
+
+Diagnóstico via MCP em 2026-05-06 confirmou starvation real entre tenants:
+
+| Tenant | Jobs/24h | Wait médio | Wait máx |
+|---|---|---|---|
+| Escola do Fluxo | 41k | **9.6min** | **19.8min** |
+| Instituto Socrates | 2.7k | 2.7min | 5.4min |
+
+Capacidade média OK (70 jobs/min, 10 réplicas). O problema era **concentração
+temporal** (bursts de cron) + sharding por hash de tenant não distribuía
+fairly entre tenants ativos no mesmo momento. Tenant grande monopolizava
+réplicas que tinham seu hash, enquanto outros esperavam.
+
+### Solução
+
+`analytics.claim_next_segment_jobs_fair(worker_id text, batch_size int = 10)`:
+
+**Phase 1 — round-robin per-tenant:**
+- Conta `tenant_count_active` (tenants com pending > 0)
+- Aloca `floor(batch_size / tenant_count_active)` jobs por tenant ativo
+- Garante que cada tenant ativo recebe parcela igual da capacity
+
+**Phase 2 — FIFO global:**
+- Preenche capacity restante por `created_at ASC`
+- Cobre o caso de só 1 tenant ter jobs pendentes (Phase 1 retorna pouco)
+
+**Concorrência multi-replica:** `FOR UPDATE SKIP LOCKED` no INSERT de claim.
+Réplicas competem pelas mesmas pending rows; SKIP LOCKED garante exclusão
+mútua sem coordenação aplicacional. Algoritmo é **atômico** dentro da função
+SQL — não há janela de raça.
+
+### Por que SQL ao invés de TS (D-2026-05-05-10)
+
+Alternativa considerada: round-robin local em TS com state per-replica
+(possivelmente sincronizado via Redis ou similar).
+
+Decisão: **SQL é melhor** porque:
+- Single source of truth (1 função, não N réplicas com cópia de estado)
+- Atomicidade real via `FOR UPDATE SKIP LOCKED`, sem coordenação cross-replica
+- Worker TS fica magro: chama 1 função, processa o que volta
+- Mudar política (round-robin → priority-weighted, etc.) é alterar 1 função
+- View de observability (`v_queue_fairness_status`) é trivial
+
+Continuação da tese de centralização (P2 + D-2026-05-05-08): primitivas que
+existem no banco (SKIP LOCKED + funções SQL) devem hospedar coordenação;
+lift to TS apenas se houver razão específica (cross-system, side effects de
+processo).
+
+### Worker TS — patch (`segment-eval-worker.ts:319-356`)
+
+| Antes | Depois |
+|---|---|
+| `SELECT id FROM core.tenants WHERE hash % TOTAL_SHARDS = MY_SHARD` | (removido) |
+| `for (tenant of tenants) claim(tenant_id, ...)` | claim único `claim_next_segment_jobs_fair(WORKER_ID, BATCH_SIZE)` |
+| Loop processa jobs por tenant | Loop processa jobs retornados (já distribuídos) |
+
+**TOTAL_SHARDS / MY_SHARD preservados como dead code** com warning de
+inicialização se valor ≠ default (compat com Railway envs existentes; remoção
+em sprint futura de cleanup). Não quebra deployments rolling.
+
+**Logger `fair_claim_received`** adicionado para janela de validação.
+
+### Observability
+
+`analytics.v_queue_fairness_status`: view em tempo real com
+- `tenant_id`, `tenant_name`
+- `pending_count`, `claimed_count`
+- `oldest_pending_seconds`
+
+Query padrão para checkpoint pós-deploy:
+```sql
+SELECT * FROM analytics.v_queue_fairness_status
+WHERE oldest_pending_seconds > 60
+ORDER BY oldest_pending_seconds DESC;
+```
+**Esperado: 0 rows.**
+
+### Critério de aceite produção (30min pós-deploy)
+
+✅ **Verde:**
+- `oldest_pending_seconds < 60s` para TODOS tenants ativos
+- Logs Railway emitem `fair_claim_received` periodicamente
+- Logs **não** emitem `segment_eval_sharding_deprecated` (envs default)
+- Throughput total (jobs_per_min últimos 30min) ≥ 70 sustentado
+
+⛔ **Vermelho** (rollback ou ajuste):
+- `oldest_pending_seconds > 300s` para algum tenant após 10min
+- Throughput cair para <40/min sustentado
+- Erros novos em logs Railway
+
+### Próximo: Sprint 6
+
 - **Sprint 6** — dead letter + observability completa (telemetria estruturada,
-  alertas, dashboards)
+  alertas, dashboards, métrica `tenant_fairness_p99` histórica)
 
 ---
 

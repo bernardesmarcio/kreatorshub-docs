@@ -10,19 +10,20 @@
 
 ## Estado atual
 
-**Sprint:** 4 (Repair via coalescing) — 🎯 **FECHADA em 2026-05-06** (~15min via MCP, sem patch TS, escopo 90% menor que planejado)
-**Fase ativa:** Sprints 1+2+3+4 fechadas. Drift transitório caiu de ~120k/dia (pré-Sprint 3) para 20/dia (atual). Validação E2E: ✓ via MCP.
+**Sprint:** 5 (Worker fairness) — **R-5.1 SQL aplicado via MCP em 2026-05-06**, **patch TS commitado** (`segment-eval-worker.ts`), aguardando deploy Railway + validação produção (30min).
+**Fase ativa:** Sprints 1+2+3+4 fechadas. Sprint 5 em deploy.
 **Última atualização:** 2026-05-06
-**Quem atualizou:** Claude Code via Sprint 4 closure (R-4.1 aplicado via MCP por Marcio)
+**Quem atualizou:** Claude Code via R-5.1 patch TS
 
 ## Próximas 3 ações
 
-1. **Monitorar Sprints 3+4 em produção (próximas 24h):**
-   - `triggered_by='coalesced'` (Sprint 3) e `triggered_by='repair'` com `fields_changed=['repair_full_eval']` (Sprint 4) aparecem
-   - Drift continua em 0
-   - 0 errors funcionais
-2. **Sprint 5** — worker fairness real (anti-starvation per tenant).
-3. **Sprint 6** — dead letter + observability completa.
+1. **Validar R-5.1 em produção (30min pós-deploy):**
+   - `v_queue_fairness_status`: `oldest_pending_seconds < 60s` para TODOS tenants ativos
+   - Logs Railway emitem `fair_claim_received` periodicamente
+   - Logs **não** emitem `segment_eval_sharding_deprecated` (envs default)
+   - Throughput total ≥ 70 jobs/min (sustentado vs atual)
+2. **Reavaliar R-5.2/R-5.3** pós-validação — talvez Sprint 5 termine só com R-5.1.
+3. **Sprint 6** — dead letter + observability completa (telemetria estruturada, alertas, dashboards).
 
 ## Bloqueadores ativos
 
@@ -268,6 +269,44 @@ de bumpar `state_version`). Dev solicitou audit antes de aplicar.
 membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
+
+### D-2026-05-05-10 — Worker fairness implementado em SQL, não em TS
+
+**Contexto:** Sprint 5 (anti-starvation per tenant) tinha 2 caminhos:
+
+1. **Algoritmo em TS:** worker mantém estado de "última vez que claimei do
+   tenant X" e faz round-robin local. Cada réplica tem cópia do estado;
+   sharding via TOTAL_SHARDS/MY_SHARD particiona tenants entre réplicas.
+
+2. **Algoritmo em SQL:** função `claim_next_segment_jobs_fair` faz round-robin
+   atomic via single query (Phase 1 round-robin + Phase 2 FIFO). Réplicas
+   competem pelas mesmas pending rows; SKIP LOCKED resolve concorrência.
+
+**Decisão:** caminho 2 (SQL). Justificativa:
+
+- **Single source of truth.** Algoritmo de claim vive em 1 função SQL que tudo
+  chama. Mudar política (round-robin → priority-weighted, p.ex.) é alterar 1
+  função, não N réplicas.
+- **Worker TS fica magro:** chama `claim_next_segment_jobs_fair(worker_id, batch_size)`
+  e processa o que volta. Sem estado local de fairness. Sem partição de tenants.
+- **Atomicidade real.** Em TS multi-replica, 2 réplicas podem decidir "vou claim
+  do tenant X" simultaneamente baseadas em estado local desatualizado. Em SQL,
+  `FOR UPDATE SKIP LOCKED` garante exclusão mútua sem coordenação aplicacional.
+- **Mais fácil testar, evoluir, debugar.** SQL é declarativo; behavior é
+  inspecionável via `pg_get_functiondef` + `EXPLAIN`. View de observability
+  (`v_queue_fairness_status`) é trivial.
+
+**Continuação da tese (D-2026-05-05-08):** centralização de operações no SQL
++ Decision API torna mudanças arquiteturais cirúrgicas. Sprint 5 endereçou
+fairness alterando 1 função SQL + ~20 linhas TS (substituir loop por 1 chamada).
+
+**Custo evitado:** algoritmo distribuído em TS multi-replica com state sharing
+(possivelmente Redis ou similar). Complexidade operacional adicional.
+**Custo real:** 1 função SQL + diff TS pequeno.
+
+**Lição:** quando a primitiva já existe no banco (SKIP LOCKED + funções SQL),
+algoritmos de coordenação devem viver lá. Lift to TS apenas se houver razão
+específica (ex: coordenação cross-system, side effects de processo).
 
 ### D-2026-05-05-09 — Critério P2: Decision API é sobre escritas em contact_state, não sobre todas as escritas em queue
 
@@ -725,6 +764,65 @@ nesse nível.
   - Backup `process_purchase_analytics__pre_r21b_2026_05` (versão R-2.1a com bloco dryrun)
 - 7/7 validações regex pós-cutover ✓: calls_decision_api=true, uses_enforce_mode=true, still_uses_dryrun=false, still_bumps_state_version=false, still_has_step3_insert=false, preserves_state_updated_at=true, still_has_exception_isolation=false
 - Próximo: validar com purchase real via webhook + R-2.3 (próximo producer)
+
+**🎯 SPRINT 5 — R-5.1 em deploy em 2026-05-06 (worker fairness)**
+
+Diagnóstico via MCP confirmou starvation real pré-fix:
+- **Escola do Fluxo:** 41k jobs/24h, wait médio **9.6min**, max **19.8min**
+- **Instituto Socrates:** 2.7k jobs/24h, wait médio 2.7min, max 5.4min
+- Capacidade média OK (70 jobs/min, 10 réplicas) — problema era
+  **concentração temporal** (bursts do cron) + sharding hash não distribuía
+  fairly entre tenants ativos no mesmo momento
+
+**SQL aplicado via MCP (Marcio, 2026-05-06):**
+
+`analytics.claim_next_segment_jobs_fair(p_worker_id text, p_batch_size int = 10)`:
+- **Phase 1 — round-robin:** `batch_size / tenant_count_active` por tenant ativo
+- **Phase 2 — FIFO global:** preenche capacity restante por ordem de `created_at`
+- Lock via `FOR UPDATE SKIP LOCKED` (compatível com multi-replica)
+
+Validação SQL E2E (via MCP):
+- ✅ 1 tenant ativo → batch inteiro absorvido (10/10)
+- ✅ 2 tenants ativos → 5+5 distribuído (anti-starvation)
+
+View para observability:
+- `analytics.v_queue_fairness_status` mostra `pending`, `claimed`,
+  `oldest_pending_seconds` por tenant em tempo real
+
+**Patch TS aplicado em 2026-05-06 (este commit):**
+
+`workers/analytics/src/segment-eval-worker.ts:319-356` reescrito:
+
+| Antes | Depois |
+|---|---|
+| `SELECT id FROM core.tenants WHERE hash % TOTAL_SHARDS = MY_SHARD` | (removido) |
+| `for (tenant of tenants) claim(tenant_id, ...)` | claim único `claim_next_segment_jobs_fair(WORKER_ID, BATCH_SIZE)` |
+| Loop processa jobs por tenant | Loop processa jobs retornados (já distribuídos pela função SQL) |
+
+**Sharding TOTAL_SHARDS/MY_SHARD preservado como dead code** com warning na
+inicialização se valor ≠ default (compat com Railway envs existentes; remoção
+em sprint futura de cleanup).
+
+**Logger `fair_claim_received`** adicionado para janela de validação pós-deploy
+(remover depois se ficar ruidoso).
+
+**Throughput esperado:** sem regressão. Cálculo: 10 jobs × 2.5s/job ≈ 25s por
+iteração; 10 réplicas → ~240 jobs/min de capacidade vs 70 atual. Margem confortável.
+Se latência subir, ajusta `SEGMENT_EVAL_BATCH_SIZE` no Railway sem redeploy.
+
+**Validação local:** typecheck ✓, build ✓, vitest 55/55 ✓.
+
+**Critério produção (30min pós-deploy):**
+- ✅ Verde: `oldest_pending_seconds < 60s` para todos tenants ativos; `fair_claim_received` aparece nos logs; throughput ≥ 70/min
+- ⛔ Vermelho (rollback ou ajuste): algum tenant > 300s pendente após 10min, throughput < 40/min sustentado, ou erros novos nos logs
+
+**Decisão arquitetural — D-2026-05-05-10:**
+Worker fairness implementado em **SQL** ao invés de TS. Single source of truth
+para algoritmo de claim. Worker TS fica magro: chama 1 função, processa o que
+volta. Mais fácil testar, evoluir, debugar. Continua a tese de centralização
+(P2 + D-2026-05-05-08).
+
+---
 
 **🎯 SPRINT 4 FECHADA em 2026-05-06 — repair via coalescing (R-4.1)**
 
