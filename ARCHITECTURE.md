@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 8.5 — D-2026-05-07-03: backfill de origem das oportunidades concluído (633/750 = 84% reclassificadas como `automation`). Adicionada coluna `source_journey_id` com FK para `journeys.journeys` + handler `executeCreateOpportunityNode` instrumentado. Webhooks/forms NÃO criam opportunity diretamente hoje — D-OPP-SOURCE-2 segue válida só caso esses paths sejam adicionados no futuro.*
+*Versão 8.6 — Sprint 9+10 closure: RFM-driven state-change marketing automation (§22.12 — pipeline event→ledger→journey, transitions framework, performance comprovada).*
 
 ---
 
@@ -2491,6 +2491,104 @@ Diagnóstico:
    );
    -- Passo 2: writer original (UPDATE/INSERT) sobre os restantes — agora seguro
    ```
+
+---
+
+## §22.12 — RFM-driven state-change marketing automation
+
+**Status:** ✅ FECHADO em **2026-05-07**. Sprint 9 (compute_rfm_thresholds desacoplado para platform-scheduler) + Sprint 10 phase 1+2 (state-change transitions ledger + journey events) operacionais em produção.
+**Documentação operacional:** `docs/refactor/PROGRESS.md` (D-2026-05-07-01 a -04).
+
+### Visão arquitetural
+
+Sistema **state-change-driven** (não apenas RFM-driven). Pipeline completo:
+
+```
+Cliente compra (event)
+  ↓
+process_purchase_analytics (Step 5)
+  ↓ apply_rfm_buckets_for_party (cache thresholds + score real-time)
+contact_state.rfm_segment changes
+  ↓ trigger AFTER UPDATE (zero coupling com handlers)
+INSERT analytics.rfm_transitions  (audit ledger imutável, 180d TTL)
+INSERT journeys.journey_events    (event_type='rfm_segment_changed')
+  ↓ worker journeys consume queue
+journey_enrollments criados (se journey config matches trigger_event_type)
+  ↓ worker journeys-event executa nodes
+Email sent / tag applied / segment update / etc.
+```
+
+### Componentes por estágio
+
+| Estágio | Componente | Origem | Custo |
+|---|---|---|---|
+| Input capture | `commerce.transactions` → triggers → `contact_state` | Sprint pré-existente | <5ms/tx |
+| Score per-party real-time | `analytics.apply_rfm_buckets_for_party` | Sprint 8 | ~1ms/batch |
+| Features handler | `refresh_features` (incremental) | Sprint 7 | linear no #parties |
+| Thresholds globais | `analytics.compute_rfm_thresholds` | Sprint pré-existente | ~50ms/13k, ~3min/50M |
+| Thresholds gate | `analytics.tenant_should_recompute_rfm` | Sprint 9 + fix | <1ms |
+| Thresholds scheduler | worker journeys (`IS_SCHEDULER`) handler `refreshRfmThresholds` | Sprint 9 | 30min cycle |
+| Transition detection | trigger `trg_record_rfm_transition` AFTER UPDATE OF `rfm_segment` | Sprint 10 P1 | <1ms |
+| Audit ledger | `analytics.rfm_transitions` (append-only, 180d TTL) | Sprint 10 P1 | <1ms INSERT |
+| Journey event emit | INSERT `journeys.journey_events` `'rfm_segment_changed'` | Sprint 10 P2 | <1ms INSERT |
+| Worker consume | worker journeys (worker mode) | pré-existente, sem mudança | — |
+
+### Decisões arquiteturais relacionadas
+
+- **D-2026-05-07-02:** Sprint 9 — desacoplar `compute_rfm_thresholds` do handler `refresh_features`. Features são tempo-driven (recency aging diário); thresholds são volume-driven (compras). Migrado para platform-scheduler com gate condicional via `tenant_should_recompute_rfm`.
+- **D-2026-05-07-03:** Sprint 9 fix — gate retorna false se tenant tem < 10 parties com purchase (sample estatisticamente insuficiente para RFM). Evita loop infinito de no-op em tenants pequenos.
+- **D-2026-05-07-04:** Sprint 10 — append-only state transitions ledger via trigger AFTER UPDATE. Phase 1 (rfm_transitions ledger) + Phase 2 (journey_events emit). Phase 3 (UI builder) em parking lot pendente decisão de generalização.
+
+### Generalização (parking lot)
+
+O padrão "**trigger AFTER UPDATE em contact_state → INSERT em ledger + journey_event**" é generalizável para outras dimensões de mudança de estado. Candidatas para futuras Phases:
+
+- `lifecycle_stage` (lead → MQL → SQL → customer → ...)
+- `engagement_score` crossing thresholds
+- `churn_score` crossing thresholds
+- tag added/removed
+- custom field changes
+
+Cada dimensão seguiria pattern similar com trigger separado e `event_type` específico, mantendo zero-coupling com handlers existentes.
+
+### Compliance constituição
+
+| Princípio | Validação |
+|---|---|
+| P1 Escala horizontal absoluta | Workers stateless, SQL functions replicáveis |
+| P2 Recepção O(1) | Triggers AFTER UPDATE são O(1) per row |
+| P3 Async + idempotente | ON CONFLICT em journey_events, append-only ledger |
+| P4 Isolation por tenant | RLS + tenant_id em todas tabelas |
+| P5 Append-only ledger | `rfm_transitions` immutable |
+| P6 Erros classificados | scheduler logs distinguish `complete`/`noop`/`failed` |
+| P7 Mutação atômica | Trigger same-transaction com UPDATE |
+| R20 TTL queue/log tables | `rfm-transitions-purge` cron 180d |
+
+### Rules adicionados (registrar em §21)
+
+- **R-NEW:** queries divergentes entre INPUT (SELECT) e RPC de cálculo precisam validação de consistência de filtros — caso R-7-FIX (D-2026-05-07-01)
+- **R-NEW:** UPDATE crítico em `contact_state` deve usar COALESCE para preservar valores quando dado novo é NULL
+- **R-NEW:** testar primeiro em tenant pequeno antes de production deployment
+
+### Performance comprovada (dataset atual)
+
+| Operação | Latência | Escala |
+|---|---|---|
+| `apply_rfm_buckets_for_party` | ~1ms | OK até 50M parties |
+| `compute_rfm_thresholds` (13k) | ~50ms | ~3min @ 50M parties |
+| `tenant_should_recompute_rfm` | <1ms (indexed) | OK escala 50k tenants |
+| `trg_record_rfm_transition` | <1ms (1 INSERT × 2 tabelas) | OK escala milhões/dia |
+
+### Validação operacional 2026-05-07
+
+- **Test 1 Escola:** stale forçada 20:58 UTC → recomputed 21:13 UTC (15min) ✅
+- **Test 2 Sócrates:** stale forçada 21:59 UTC → recomputed 22:11 UTC (12min) ✅
+- **Sprint 10 Phase 1+2:** validated E2E via smoke tests com transitions reais
+- **0 failed jobs** últimas 24h durante toda implementação
+
+### Workaround Phase 3 pendente
+
+Admin pode criar journey via SQL direto com `trigger_type='event_entry'` + `trigger_event_type='rfm_segment_changed'`. Worker já processa esses events sem modificação. UI builder específica é opcional e em discussão arquitetural (generalização para state-change-driven antes de UI dedicada por dimensão).
 
 ---
 
