@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 8.3 — D-2026-05-06-18: workers Edge Function precisam filtrar claim_jobs por handlers conhecidos quando sem provider (§22.10)*
+*Versão 8.5 — D-2026-05-07-03: backfill de origem das oportunidades concluído (633/750 = 84% reclassificadas como `automation`). Adicionada coluna `source_journey_id` com FK para `journeys.journeys` + handler `executeCreateOpportunityNode` instrumentado. Webhooks/forms NÃO criam opportunity diretamente hoje — D-OPP-SOURCE-2 segue válida só caso esses paths sejam adicionados no futuro.*
 
 ---
 
@@ -1324,6 +1324,10 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | D-CRON-3 | **`segment-eval-fallback` instrumentar.** ✅ **Resolvido (v7.25).** Implementação muito além do "alarme em fallback_log" original: 3-camada Platform Health Observability decoupled (Camada A `event_health_metrics` particionada mensal + RPC `emit_health_metric` + 3 crons categoria A; Camada B view `v_event_driven_health` com tier classification per-tenant baseado em rolling 7d P50/P95/P99; Camada C handler `runEventDrivenHealthCheck` em `journeys-worker` com dedup, recovery silencioso, integração Sentry via `workers/shared/src/sentry.ts` reutilizável). 19 testes unit/integration. R52 estabelece o decoupling como regra para futura observability arquitetural. Pré-requisito de produção: criar Sentry project `workers-railway` e setar `SENTRY_DSN_WORKERS`. Auto-noop sem DSN. | ✅ Done |
 | D-CRON-4 | **`segment-eval-fallback` migrar para worker.** Após baseline de D-CRON-3 estabelecido, mover loop de tenants para Railway. Cron vira pulse simples ou desaparece se métrica de hits zerar. Bloqueado por: D-CRON-3 + D-SEG-7 (event-driven audit) fechado. | **P3** |
 | D-SEG-12-LOOKALIKE-DIRECT-WRITE | **`src/lib/analyticsStorage.ts:527 createSegmentFromLookalikes`** faz BULK INSERT direto no `analytics.segment_parties` da UI com `source: "customer"` hardcoded — bypassa todas as funções canonical. Para segmentos lookalike (todos os membros são customers por definição) é semanticamente correto, mas é mais um produtor fora do path canonical. Migrar para função SQL canonical (ex: `analytics.create_lookalike_segment_from_scores`) que reuse `apply_segment_membership_diff` para determinar `source` via `party_type` e mantenha audit trail. | **P3** |
+| D-OPP-SOURCE-1-BACKFILL | ✅ **Resolvido (2026-05-07).** Migration `20260507160000_opportunity_source_journey_link` adicionou coluna `source_journey_id` (FK `journeys.journeys` ON DELETE SET NULL) e fez backfill lendo `metadata->>'created_by_journey'` (gravado historicamente pelo handler `executeCreateOpportunityNode` em `workers/journeys`). Resultado: 633/750 oportunidades reclassificadas como `source_origin='automation'` + journey vinculada, 117 mantidas como `'manual'`. Webhooks/forms não criam opportunity diretamente hoje — não houve nada a backfillar nesses paths. | ✅ Done |
+| D-OPP-SOURCE-2-AUTO-TAG | ✅ **Parcial (2026-05-07).** Único writer não-UI hoje (handler `executeCreateOpportunityNode` em `workers/journeys/src/handlers/processJourneyNode.ts`) instrumentado para gravar `source_origin='automation'` + `source_journey_id` direto no INSERT. Webhooks (Eduzz/Asaas) e form submissions **não criam opportunity diretamente** hoje — só atualizam estado de transações ou criam leads. Quando esses paths forem adicionados, este item reabre como **P2** com prefix `D-OPP-SOURCE-2-FORM` / `D-OPP-SOURCE-2-WEBHOOK`. | ✅ Done (parcial) |
+| D-OPP-SOURCE-3-METADATA-PROVENANCE | ✅ **Resolvido (2026-05-07).** Provenance já existia em `metadata.created_by_journey` (UUID) + `metadata.enrollment_id` + `metadata.journey_name` para 100% das 633 opportunities criadas por journey — permitiu backfill exato em D-OPP-SOURCE-1. Padronização para futuros writers (form/webhook) fica embutida no item D-OPP-SOURCE-2 quando esses paths forem adicionados. | ✅ Done |
+| D-OPP-SOURCE-4-REPORT-UI | **Relatório de oportunidades por origem.** Implementar tela `/admin/opportunities/insights` ou aba no dashboard atual: ganhas/perdidas agrupadas por (a) `source_id` (origem cadastrada), (b) `source_origin` (canal: manual/automation/etc.), (c) `source_journey_id` (qual automação especificamente). Cross-tab com `lost_reason_id` quando `status='lost'` para análise de funil. | **P3** |
 
 ---
 
@@ -2491,6 +2495,12 @@ Diagnóstico:
 ---
 
 ## 23. Roadmap Futuro
+
+**Tracking de origem das oportunidades** (D-OPP-SOURCE-4 segue aberta)
+- ✅ Backfill executado em 2026-05-07: 633/750 reclassificadas como `automation` com `source_journey_id` populado
+- ✅ Handler `executeCreateOpportunityNode` instrumentado — novas oportunidades de automação já nascem etiquetadas
+- ⏳ Relatório `/insights` cruzando `source_id` × `source_origin` × `source_journey_id` × `lost_reason_id`
+- ⏳ Quando webhooks/forms passarem a criar opportunity (não criam hoje), instrumentar igual ao caminho automation
 
 **Personalização e cache**
 - Vercel KV para cache de edge (`contact_state` hot path)
