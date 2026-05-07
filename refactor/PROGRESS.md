@@ -341,6 +341,66 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
 
+### D-2026-05-07-01 — Bug crítico R-7 incremental + `crm.party_role_assignments`
+
+**Incidente:** 2026-05-07 — 4.936 parties tiveram `last_purchase_at`, `frequency`,
+`monetary` zerados após o R-7 (commit `83e18dd`) entrar em produção.
+
+**Causa raiz:** R-7 modo incremental selecionou parties via SELECT em
+`analytics.contact_state` (filtro: `last_purchase_at IS NOT NULL` + helper
+`party_needs_features_refresh`). Mas a RPC `public.calculate_customer_features_batch`
+tem `INNER JOIN crm.party_role_assignments` exigindo `role_id=customer` +
+`revoked_at IS NULL`, e filtra `p.status != 'merged'`. Parties mergeadas /
+com role revogada / sem transactions paid foram **skipped pela RPC** mas
+estavam no input do handler. `featuresMap.get(party_id)` → `undefined` →
+fallback `?? null` → UPSERT incondicional sobrescreveu com NULL/0.
+
+**Magnitude antes do fix:**
+- Escola: 81% corrupção (3.117/3.846 parties)
+- Socrates: 100% corrupção (1.819/1.819)
+- Total: 4.936 parties em 2 tenants
+
+**Mitigação imediata (Marcio, via MCP):** cron `rfm-rolling-refresh`
+pausado via `cron.unschedule`. Recovery via reconstrução de
+`commerce.transactions`: **4.783 parties recuperadas**, 153 não
+recuperáveis (sem transactions paid históricas).
+
+**Fix em 2 camadas (commit `677e893`):**
+
+1. **Preventiva (TS):** `partyIdsWithFeatures = partyIds.filter(featuresMap.has)`.
+   `contactRows` só inclui parties que a RPC efetivamente retornou.
+   Skipped parties são **logadas** (`refresh_features_skipped_no_rpc_data`
+   warn com sample_skipped[0..5]) e Decision API batch chamada apenas
+   com partyIdsWithFeatures.
+2. **Defensiva (SQL):** UPSERT com `CASE WHEN EXCLUDED.last_purchase_at
+   IS NOT NULL THEN EXCLUDED.<field> ELSE contact_state.<field>` em **9
+   campos** de purchase. `last_purchase_at` e `first_product_at` via
+   COALESCE. Mesmo se uma row escapar do filtro client-side com
+   last_purchase_at=NULL, todos os campos de purchase preservam valores
+   existentes.
+
+**Pendente Marcio pós-deploy:** re-ativar cron `rfm-rolling-refresh` via
+MCP + monitorar primeiro run sem novos zeros.
+
+**Lição estrutural — prevenção futura:**
+
+Ao introduzir filtros divergentes em queries de **input** vs **RPCs de
+cálculo**, validar consistência. No caso: query de input lê só de
+`contact_state`, RPC de cálculo tem JOIN com `party_role_assignments`.
+Inputs que passam mas não retornam da RPC viram pontos de corrupção
+silenciosa.
+
+Padrão recomendado:
+- **Antes de deploy production:** rodar handler em modo incremental
+  manualmente para tenant pequeno; verificar antes/depois que campos
+  críticos não foram zerados.
+- **Em handlers que consomem RPCs:** SEMPRE filtrar inputs pelos rows
+  efetivamente retornados pela RPC. Nunca assumir que `partyIds.length
+  === features.length`.
+- **UPSERT de campos críticos:** usar guards `CASE WHEN EXCLUDED.<sentinel>
+  IS NOT NULL THEN ... ELSE existing.<field>` quando a fonte pode retornar
+  parcial. Defesa em profundidade.
+
 ### D-2026-05-06-14 — Writers auxiliares de fila precisam respeitar invariantes de índice unique partial
 
 **Contexto:** Sprint 3 introduziu `idx_seg_eval_queue_pending_unique_party
