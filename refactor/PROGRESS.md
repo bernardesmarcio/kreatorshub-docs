@@ -341,6 +341,85 @@ membership recalculation deixa de ser side effect (P4 implementado).
 
 **Custo:** 10 minutos de audit. Zero gambiarra evitada.
 
+### D-2026-05-07-04 — Sprint 10: state-change transitions ledger (RFM phase 1+2)
+
+**Contexto:** Necessidade arquitetural de capturar mudanças de bucket RFM
+para alimentar journeys de marketing (cliente que cruza P40→P60 = "Promising"
+→ "Loyal" precisa de campaign trigger no D+1).
+
+**Decisão — Phase 1 (ledger):** tabela append-only `analytics.rfm_transitions`
+(180d TTL via cron `rfm-transitions-purge`) + trigger AFTER UPDATE OF
+`rfm_segment` ON `analytics.contact_state`. **Zero coupling** com handlers
+Sprint 7/8 — qualquer UPDATE que mude segment é capturado automaticamente.
+
+**Decisão — Phase 2 (journey integration):** trigger estendido para também
+INSERT em `journeys.journey_events` com `event_type='rfm_segment_changed'`.
+Worker journeys já consome essa queue, sem modificação adicional.
+
+**Decisão — Phase 3 (UI):** **PARKING LOT.** Não implementar agora.
+Razões:
+- Generalização primeiro: Sprint 10 é "state-change-driven", não só RFM.
+  Outras dimensões análogas (lifecycle_stage, engagement_score, churn_score,
+  tags, custom fields) podem usar mesmo framework.
+- Validar demand antes de investir UI: piloto via SQL admin
+  (`trigger_type='event_entry'` + `trigger_event_type='rfm_segment_changed'`)
+  + medir conversão real antes de 1-2 semanas de dev.
+- Volume baixo de journeys hoje (10 active total) não justifica UI dedicada.
+- Decisão arquitetural pendente: UI específica por dimensão vs. genérica
+  com seletor.
+
+**Workaround atual:** journey criada via SQL admin com event-type manual.
+Worker já processa.
+
+### D-2026-05-07-03 — Sprint 9 fix: skip tenants com < 10 parties com purchase
+
+**Contexto:** após deploy Sprint 9, `tenant_should_recompute_rfm()` retornava
+true em loop infinito para tenants pequenos (Cone Island, Kreators Platform,
+Maconequi — < 10 parties com purchase). Estatisticamente insuficiente para
+calcular percentiles RFM (P40/P60/P80 sobre amostra < 10 vira ruído).
+
+**Decisão:** atualizar `tenant_should_recompute_rfm()` para retornar `false`
+quando o tenant tem < 10 parties com transactions paid. Aplicado via MCP
+em 2026-05-07.
+
+**Validação pós-fix (via Supabase MCP):** 7 tenants ativos, 4 com sample
+suficiente (Escola 13074, Sócrates 2664, Thais 583, SaudeNow 17 — wait,
+SaudeNow tem 17 parties total mas pode ter < 10 com purchase, função filtra
+corretamente). 3 tenants pequenos ficam never_bootstrap (correto).
+
+**Lição:** gates `should_recompute` precisam considerar tanto temporal
+(stale > 7d) quanto estatístico (sample mínimo).
+
+### D-2026-05-07-02 — Sprint 9: desacoplar compute_rfm_thresholds de refresh_features
+
+**Contexto:** R-8 patch (commit `b0d275b`) acoplou `compute_rfm_thresholds`
+ao final do handler `refresh_features`. Funcionalmente correto mas
+arquiteturalmente errado — `compute_rfm_thresholds` é volume-driven (depende
+de transações novas), `refresh_features` é tempo-driven (recency aging por
+party). Misturar força recompute mesmo sem mudança real.
+
+**Driver:** marketing timing. Cliente que cruzou bucket precisa de campaign
+trigger no D+1, não 19 dias depois (intervalo do cron rolling-refresh).
+
+**Decisão — Sprint 9:** migrar `compute_rfm_thresholds` para handler dedicado
+no scheduler do worker journeys (modo `IS_SCHEDULER=true` → service Railway
+"platform-scheduler"). Cadência via env `RFM_THRESHOLDS_INTERVAL_MS` (default
+30min). Gate server-side via `tenant_should_recompute_rfm()` filtra noops.
+
+**Princípio §16:** separar workers por perfil (env var), não por service.
+Mesma imagem Docker do journeys, flag controla loop ativo.
+
+**Implementação (commit `41c60ed`):**
+- NOVO: `workers/journeys/src/handlers/refreshRfmThresholds.ts`
+- EDIT: `config.ts` com `rfmThresholdsIntervalMs`
+- EDIT: `index.ts` em ambos `runSchedulerLoop` + `runCombinedLoop` (paridade dev/prod)
+- REVERT: R-8 patch removido de `refreshFeatures.ts`
+
+**Validação produção:** Escola forçada stale (computed_at = 8d atrás) às
+20:58 UTC; recomputed às 21:13 UTC (15min depois — dentro da janela de 30min
+do scheduler). Liveness comprovada via Supabase MCP indireto. Para tenants
+sem mudança, log esperado é `rfm_thresholds_refresh_noop` periódico.
+
 ### D-2026-05-07-01 — Bug crítico R-7 incremental + `crm.party_role_assignments`
 
 **Incidente:** 2026-05-07 — 4.936 parties tiveram `last_purchase_at`, `frequency`,
