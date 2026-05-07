@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 8.2 — D-2026-05-06-14: writers de fila com índice unique partial precisam ser idempotentes (§22.10 + §22.11)*
+*Versão 8.3 — D-2026-05-06-18: workers Edge Function precisam filtrar claim_jobs por handlers conhecidos quando sem provider (§22.10)*
 
 ---
 
@@ -2214,6 +2214,44 @@ Para adicionar dimensão nova: editar `analytics.is_segmentation_relevant_dimens
 - [ ] Tudo dentro de `sql.begin()` — atomicidade total
 - [ ] Sem `try/catch` envolvendo Decision API (atomicity > resilience local — D-2026-05-03-02)
 - [ ] Producer registrado nesta seção §22.10 (lista de producers ativos abaixo)
+
+### Workers Edge Function que processam `integrations.jobs` — filtro por handlers
+
+Lição D-2026-05-06-18: `worker.claim_jobs(p_provider=NULL, p_handlers=NULL)`
+captura QUALQUER job pendente, independentemente do worker que invoca.
+Workers que registram só um subconjunto de handlers (`integrations-worker`
+trata só Eduzz/Sendgrid; `apidozap` Edge Function trata só apidozap, etc.)
+DEVEM passar lista de handlers conhecidos quando `provider` não vem
+explícito na URL.
+
+Pattern correto:
+
+```typescript
+const handlers: Record<string, JobHandler> = {};
+registerEduzzHandlers(handlers);
+registerSendgridHandlers(handlers);
+
+const REGISTERED_HANDLER_KEYS = Object.keys(handlers);
+
+async function processJobs(provider?: string) {
+  const jobs = await claimJobs(
+    WORKER_ID,
+    DEFAULT_BATCH_SIZE,
+    provider,
+    // Se vem provider explícito, claim_jobs já filtra por ele.
+    // Se NÃO vem, filtra por handlers conhecidos (defesa em profundidade).
+    provider ? undefined : REGISTERED_HANDLER_KEYS,
+  );
+  // ...
+}
+```
+
+Sem isso, worker captura jobs de outros providers (`apidozap:*`,
+`nylas:*`, `doare:*`) → "No handler found" → 10 retries → DLQ.
+
+Pattern derivado do registry, não hardcoded — adicionar handler novo
+ao worker registra automaticamente no filtro. Aplicar em qualquer
+Edge Function nova que invoque `claim_jobs`.
 
 ### Antes de criar UNIQUE INDEX partial em fila/tabela quente — checklist obrigatório
 
