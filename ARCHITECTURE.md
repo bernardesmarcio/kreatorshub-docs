@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 8.6 — Sprint 9+10 closure: RFM-driven state-change marketing automation (§22.12 — pipeline event→ledger→journey, transitions framework, performance comprovada).*
+*Versão 8.7 — §22.12 atualizada: trigger types A/B/C documentados, Phase 3 (UI builder) descartada, validação overnight 2026-05-08 (74 transições reais).*
 
 ---
 
@@ -2533,11 +2533,23 @@ Email sent / tag applied / segment update / etc.
 | Journey event emit | INSERT `journeys.journey_events` `'rfm_segment_changed'` | Sprint 10 P2 | <1ms INSERT |
 | Worker consume | worker journeys (worker mode) | pré-existente, sem mudança | — |
 
+### Trigger types disponíveis para journeys reagirem
+
+Sistema atual já cobre 100% dos casos via 3 trigger types existentes:
+
+| Caminho | `trigger_type` | Quando usar |
+|---|---|---|
+| **A — Segment-based** | `segment` | Cliente está em cluster X. Cobre 80% dos casos sem código novo. |
+| **B — Event-based** | `event_entry` + `event_type='rfm_segment_changed'` | Quando timing da transição importa (campaign "Welcome Loyal" só faz sentido no momento da promoção). Permite filtrar por `event_data.from_segment` / `to_segment`. |
+| **C — Form** | `form` | Submissão de formulário (não relacionado a RFM diretamente). |
+
+UI builder Phase 3 **não foi implementada**. Decisão: **não construir UI específica** — admin pode criar journeys via SQL com Caminho B se necessário, e Caminho A já cobre 80% dos casos via UI existente.
+
 ### Decisões arquiteturais relacionadas
 
 - **D-2026-05-07-02:** Sprint 9 — desacoplar `compute_rfm_thresholds` do handler `refresh_features`. Features são tempo-driven (recency aging diário); thresholds são volume-driven (compras). Migrado para platform-scheduler com gate condicional via `tenant_should_recompute_rfm`.
 - **D-2026-05-07-03:** Sprint 9 fix — gate retorna false se tenant tem < 10 parties com purchase (sample estatisticamente insuficiente para RFM). Evita loop infinito de no-op em tenants pequenos.
-- **D-2026-05-07-04:** Sprint 10 — append-only state transitions ledger via trigger AFTER UPDATE. Phase 1 (rfm_transitions ledger) + Phase 2 (journey_events emit). Phase 3 (UI builder) em parking lot pendente decisão de generalização.
+- **D-2026-05-07-04:** Sprint 10 — append-only state transitions ledger via trigger AFTER UPDATE. Phase 1 (rfm_transitions ledger) + Phase 2 (journey_events emit). Phase 3 (UI builder) **descartada** — Caminho A + Caminho B existentes já cobrem casos.
 
 ### Generalização (parking lot)
 
@@ -2579,16 +2591,21 @@ Cada dimensão seguiria pattern similar com trigger separado e `event_type` espe
 | `tenant_should_recompute_rfm` | <1ms (indexed) | OK escala 50k tenants |
 | `trg_record_rfm_transition` | <1ms (1 INSERT × 2 tabelas) | OK escala milhões/dia |
 
-### Validação operacional 2026-05-07
+### Validação operacional
 
-- **Test 1 Escola:** stale forçada 20:58 UTC → recomputed 21:13 UTC (15min) ✅
-- **Test 2 Sócrates:** stale forçada 21:59 UTC → recomputed 22:11 UTC (12min) ✅
-- **Sprint 10 Phase 1+2:** validated E2E via smoke tests com transitions reais
+- **Test 1 Escola** (2026-05-07): stale forçada 20:58 UTC → recomputed 21:13 UTC (15min) ✅
+- **Test 2 Sócrates** (2026-05-07): stale forçada 21:59 UTC → recomputed 22:11 UTC (12min) ✅
+- **Sprint 10 Phase 1+2** (2026-05-07): validated E2E via smoke tests com transitions reais
+- **Overnight 2026-05-08:** **74 transições reais** capturadas em produção, 53 unique parties (atividade real, sem testes sintéticos)
 - **0 failed jobs** últimas 24h durante toda implementação
 
-### Workaround Phase 3 pendente
+### Phase 3 (UI builder) — descartada
 
-Admin pode criar journey via SQL direto com `trigger_type='event_entry'` + `trigger_event_type='rfm_segment_changed'`. Worker já processa esses events sem modificação. UI builder específica é opcional e em discussão arquitetural (generalização para state-change-driven antes de UI dedicada por dimensão).
+Caminhos A + B existentes cobrem 100% dos casos:
+- **Caminho A (segment-based):** UI atual já permite criar journey reagindo a presença em cluster RFM (cobre 80% dos casos)
+- **Caminho B (event-based):** admin cria journey via SQL com `trigger_type='event_entry'` + `trigger_event_type='rfm_segment_changed'`. Worker já processa sem modificação. Permite filtrar por `event_data.from_segment`/`to_segment` para timing-sensitive campaigns.
+
+Construir UI específica para Phase 3 não justifica investimento — duplicaria UI da Caminho A sem ganho funcional, e Caminho B é admin-only por design (low volume).
 
 ---
 
