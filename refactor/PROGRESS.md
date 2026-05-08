@@ -513,6 +513,59 @@ até cenário disparar; pode demorar dias/semanas para manifestar.
 **Custo:** ~3h workers parados (sistema sobreviveu via coalescing
 acumulando pending). ~3min diagnóstico + ~3min fix via MCP.
 
+### D-2026-05-06-21 — Cleanup imports não-usados em Edge Functions
+
+**Status:** PENDENTE — não-blocking, low priority.
+
+**Contexto:** lint pre-existing em diversas Edge Functions (`supabase/functions/`)
+reporta imports não usados. Comportamento histórico — não introduzido por
+sessão recente. Não causa erro de runtime, apenas warnings de build.
+
+**Decisão:** cleanup batch em sessão dedicada de manutenção. Não bloqueia
+features novas.
+
+### D-2026-05-06-20 — Constraint `triggered_by` estendida para 3 queues
+
+**Status:** ✅ RESOLVIDO em sessão anterior.
+
+**Contexto:** durante refactor de Decision Write API + coalescing, constraint
+`triggered_by_check` precisou aceitar valores novos (`'coalesced'`, nomes
+camelCase de producers, `'recordEmailEngagement'`, `'autoPopulateContactState'`,
+etc.) em 3 queues distintas.
+
+**Aplicado:** `analytics.segment_eval_queue`, `analytics.processing_jobs`,
+`integrations.jobs` agora aceitam o conjunto canônico de `triggered_by`
+strings.
+
+### D-2026-05-06-19 — Cleanup `tx: any` em refreshFeatures.ts
+
+**Status:** PENDENTE — endereçado em sessão 2026-05-08 (ver commit
+correspondente desta sessão).
+
+**Contexto:** `workers/analytics/src/handlers/refreshFeatures.ts` tem
+`async (tx: any) => ...` em chamadas `sql.begin()` (introduzido em R-2.5,
+commit `befc80e`). Lint detecta como `@typescript-eslint/no-explicit-any`
+mas é warning, não erro. Pattern foi propagado via copy/paste em outros
+handlers (linkProducts, refreshRfm, refreshReactivation, recordTagChange).
+
+**Decisão:** substituir por type correto do `postgres` package
+(`TransactionSql<{}>` ou similar) quando o ciclo permitir cleanup
+focado de tipagem.
+
+### D-2026-05-06-18 — Filtro de handlers no `claim_jobs` (workers)
+
+**Status:** ✅ RESOLVIDO em commit `6817087` (APIDOZAP-1).
+
+**Contexto:** worker `integrations` capturava jobs de outros handlers
+(ex: `apidozap`) mesmo não tendo o handler registrado, devido à ausência
+de filtro server-side em `claim_jobs`. Bug latente — quando job de tipo
+desconhecido era claimed, worker logava erro e retentava em loop até
+max_retries.
+
+**Fix:** `REGISTERED_HANDLER_KEYS` agora derivado do registry e passado
+como 4º argumento de `claim_jobs(tenant_id, worker_id, batch_size,
+allowed_types)`. Worker só claim os jobs que sabe processar.
+
 ### D-2026-05-06-15 — RPCs do dashboard com defesa em profundidade
 
 **Contexto:** durante DASH-1 backend, as 4 RPCs de observabilidade
