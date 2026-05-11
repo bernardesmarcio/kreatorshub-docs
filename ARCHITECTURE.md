@@ -1258,6 +1258,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R52 | **Observability de plataforma reside em camada própria desacoplada do mecanismo observado.** Telemetria (Camada A — `analytics.event_health_metrics`), view de saúde (Camada B — `analytics.v_event_driven_health`) e alerta (Camada C — handler em worker) são entidades separadas. View e handler leem APENAS a tabela de telemetria — NUNCA tabelas operacionais (`fallback_log`, `segment_eval_queue`, etc). Mudança no mecanismo observado (ex: substituir cron por worker em D-CRON-4) afeta APENAS quem POPULA a métrica, não quem consome. **Como identificar violação:** PR adicionando `JOIN analytics.fallback_log` ou similar dentro de `v_event_driven_health` ou do handler de alerta = violação. Caminho correto: novo emissor escreve em `event_health_metrics` via `analytics.emit_health_metric()`. | D-CRON-3 (v7.25) — primeira camada de observability arquitetural; precedente para futura observabilidade de outros paths (workers, integrações, journey throughput). |
 | R51 | **Campos de domínio separado fora de `contact_state` e `v_segment_unified` são avaliados como optimistic (`true`) no worker in-memory; a filtragem definitiva acontece no SQL path via subquery em `eval_condition_v2`.** Extensão operacional de R36: campos 1:N (oportunidades, tickets, etc.) NÃO devem ser denormalizados em `contact_state`. No fast-path do worker (planner/evaluator de jornadas e segmentação), quando o campo não tiver resolver disponível na avaliação in-memory, retornar `true` (optimistic) e deixar o SQL path do `eval_condition_v2` aplicar o filtro real via subquery indexada. Nunca adicionar coluna em `contact_state` para "facilitar" — isso reintroduz o drift entre snapshot stale e regra fresh que motivou R36. **Como identificar violação:** PR adicionando `has_*` ou `*_count` em `contact_state` para resolver gap de avaliação no worker = violação. Caminho correto: criar/ajustar resolver no SQL path. | Sprint de Performance v7.23 — `has_open_opportunity` resolvia false em CRM conditions porque o worker in-memory não conhecia oportunidades; fix correto foi optimistic no worker + subquery no SQL path, não materialização. |
 | R53 | **Trigger enrichment via COUNT in-transaction.** Triggers de jornada podem enriquecer `event_data` com campos derivados na mesma transação SQL (ex: `purchase_sequence_number`). O campo é instantâneo (zero pipeline delay) e determinístico para condition nodes. Usar `party_id` como chave de agregação (party-first). Best-effort sob concorrência (READ COMMITTED — dois inserts simultâneos do mesmo party podem ambos receber sequence=N). | Sprint 19 — purchase_sequence_number |
+| R54 | **Cast de jsonb para UUID em RPC de ingestão deve usar `public.safe_cast_uuid()`.** Toda RPC que consome `NormalizedTransaction` ou payload externo e precisa extrair `uuid` de campo jsonb deve usar `public.safe_cast_uuid(p_text text) → uuid` (returns NULL se não casar com regex de UUID canônico). Cast direto `(jsonb->>'field')::uuid` aborta a linha inteira com `22P02` quando o provider envia ID não-UUID (numeric, slug, etc.) e o batch inteiro vai para retry/DLQ — mesmo que o fallback de resolução (mapping table) cobrisse o caso. **Como identificar violação:** PR adicionando `(v_tx->>'something_id')::uuid` em RPC `process_*_batch` = violação. Caminho correto: `public.safe_cast_uuid(v_tx->>'something_id')`. Mappers de provider também NÃO devem enviar IDs nativos do provider em campos contratuais UUID — preservar em `extra.{provider_id}`. | Sprint 5 — Sympla mapper enviava `event_id` numérico ("3416371") em `product_id`; 10 vendas da tenant `thais-zacharias` ficaram presas (3 retry + 2 dead-lettered) entre 14/04 e 10/05. Fix: helper `safe_cast_uuid` + remover `product_id: eventId` dos 3 mappers Sympla (sympla-sync edge, pull-sync, historical-sync). |
 
 ---
 
@@ -2606,6 +2607,122 @@ Caminhos A + B existentes cobrem 100% dos casos:
 - **Caminho B (event-based):** admin cria journey via SQL com `trigger_type='event_entry'` + `trigger_event_type='rfm_segment_changed'`. Worker já processa sem modificação. Permite filtrar por `event_data.from_segment`/`to_segment` para timing-sensitive campaigns.
 
 Construir UI específica para Phase 3 não justifica investimento — duplicaria UI da Caminho A sem ganho funcional, e Caminho B é admin-only por design (low volume).
+
+---
+
+## 22.13 Email Importer — Render parity invariant
+
+**Plan ref:** P-IMPORT v3.2, Sprint 3 (PRs #6, #7, #8, #11).
+
+O importer de HTML (`src/import/`) recebe HTML externo (Anima, Figma, Mailchimp), converte em `design_json` via rules determinísticas, e persiste como campanha rascunho que o user edita no `CampaignEditor` normal.
+
+### Invariante: Import preview rendering
+
+> O preview do split-view do importer (`src/import/ui/steps/ImportPreviewStep.tsx`)
+> renderiza usando o **mesmo BlockRenderer** do `CampaignEditor` —
+> via `getBlockComponent(block.type)` em `src/components/email-editor/blocks/index.ts`.
+>
+> Importer **NÃO** introduz path de render adicional. O save final
+> (`ImportFinalizingStep`) também usa `designToHtml()` existente —
+> mesmo MJML pipeline que campanhas criadas do zero.
+
+### Por que esse invariante existe
+
+Render parity entre 3 momentos é crítico pra confiança do user:
+1. **Preview no importer** — o que o user vê no split-view
+2. **Editor canvas** — o que o user vê no `CampaignEditor`
+3. **HTML enviado** — o que chega no inbox
+
+Manter os 3 paths usando o mesmo renderer elimina a chance de "preview diferente do enviado". Importer puxa os mesmos block components (TextBlock, ImageBlock, etc.) e os mesmos extractors MJML do editor existente.
+
+### Hard requirement
+
+Nenhum PR do importer pode introduzir lógica de render de HTML email. Apenas chama os renderers existentes via:
+- `getBlockComponent(type)` para preview interativo
+- `designToHtml(design)` para HTML final
+
+### P-NEXT (não-bloqueante)
+
+`email-render-parity-audit` — projeto separado pra consolidar/auditar os 3 paths de render. Não bloqueia entrega do importer; apenas formaliza o que já é prática.
+
+### Handoff: send gates
+
+Worker de envio (`workers/email-campaign/`) deve, antes de enviar:
+1. Ler `design_json.importMetadata.sendBlocked` — se true, abort job
+2. Re-rodar `validateRenderedEmailLinks(rendered_html)` — defense in depth
+3. Verificar `validateUnsubscribePresence` no design — compliance gate
+
+Worker integration está catalogado como **P-IMPORT-FOLLOWUP**: as funções (`validateRenderedEmailLinks`, `validateUnsubscribePresence` do `src/import/validators/`) estão exportadas e prontas pra worker importar; só falta o wire-up no Railway-side.
+
+### Acknowledge semântica
+
+`importMetadata.acknowledgedAt` + `acknowledgedBy` SÓ limpam `requiresReview`. **Nunca** desbloqueiam `sendBlocked` — corrigir o erro no design é o único caminho. Implementação em `src/import/acknowledgeImportReview.ts`.
+
+### Sprint 4 — Robustez (2026-05-10)
+
+Após smoke test em produção (campanha `24c7840b-...`), identificadas e corrigidas 6 issues:
+
+1. **Inline CSS no fallback** (`src/import/utils/cssInliner.ts` + `rules/fallbackHtml.ts`). Blocos `type=html` em fallback agora recebem `<style>` global do source inlineado (juice-like sem deps externas). Substitui o caso onde blocos cru apareciam sem estilo (ex.: "Pílula de Sabedoria" do template Cadu).
+
+2. **Hero overlay preserved** (`src/import/rules/heroOverlayPreserved.ts`). Nova rule com precedência sobre `hero-stacked-decomposition`. Detecta padrão "img + `hero-card` + textos sobrepostos" e emite UM bloco HTML com `<table background=...>` + `text-shadow`, preservando overlay visualmente. Confidence: high (vs medium do stacked).
+
+3. **Dedupe `blockReasons`** (`converter.ts` + `ImportFinalizingStep.tsx`). Antes: 8 `href="#"` viravam 8 frases idênticas. Agora: agrupa por `(field, value, reason)` com prefixo `"N ocorrências: ..."`. Banner amarelo mostra hint quando `sendBlocked=true`: "botão Aprovar disponível depois de corrigir erros vermelhos".
+
+4. **JWT fix em `import-assets`** (`supabase/functions/import-assets/index.ts:269-276`). `auth.getUser()` precisa receber JWT explicitamente em vez de depender de `global.headers`. Resolve 401 spurious.
+
+5. **SVG + background-image extraction** (`assetMigration.ts`). Adiciona `<image href>`, `<image xlink:href>` e `background-image: url()` dentro de `<style>` blocks à extração de assets.
+
+6. **Charset detection no upload** (`src/import/utils/charsetDecoder.ts`). Detecta UTF-8/latin-1/windows-1252 via BOM, `<meta charset>`, `<meta http-equiv>` e heurística (3+ bytes inválidos em UTF-8). Substitui `file.text()` no `ImportUploadStep`. Fix mojibake ("ImersÃ£o" → "Imersão") em exports antigos.
+
+### Sprint 4.5 — AI visual diff (validação opt-in)
+
+**Plan ref:** `import-visual-diff` Edge Function + `ImportReviewStep` UI.
+
+Após convert, antes de salvar, AI compara screenshots do source HTML vs design final renderizado:
+
+```
+Upload → Detect → Converting → Preview → Review (AI) → Finalizing (save)
+                                              ↑
+                          Snapshots (html2canvas) → Claude Vision (haiku-4-5)
+                          → Lista estruturada de divergências
+                          → User aprova/ignora cada uma
+                          → Decisões persistidas em importMetadata.visualDiff
+```
+
+**Invariante crítico mantido:** AI **NÃO** auto-aplica correções. Cada `VisualDivergence` tem `status: pending|accepted|ignored` decidido pelo user na tela `ImportReviewStep`. Render parity preservado — caminho do converter permanece determinístico.
+
+**Onde a AI fica:**
+- Validação visual pós-convert (Edge Function `import-visual-diff`)
+- Vision usa imagens (não vê o design_json) — comparação puramente visual
+- Custo ~$0.005/import (Haiku 4.5)
+- Falha gracefully — botão "Pular análise" sempre disponível
+
+**Schema persistido em `email_campaigns.design_json.importMetadata.visualDiff`:**
+
+```ts
+{
+  divergences: [{
+    id: string,
+    severity: 'high' | 'medium' | 'low',
+    section: string,
+    issue: string,
+    suggestion: string | null,
+    limitationOfEmail?: boolean,
+    status: 'pending' | 'accepted' | 'ignored',
+    decidedAt?: string,
+    decidedBy?: string,
+  }],
+  overallScore: number, // 0-100
+  summary: string,
+  modelUsed: string,
+  computedAt: string,
+}
+```
+
+**Roadmap AI (Sprint 5+, não implementado):**
+- Sugestões de URL para botões com `href="#"` (a partir de `aria-label`)
+- AI generation de patches de correção (com user approval — nunca auto-aplica)
+- Padrões recorrentes detectados pela AI → viram rules determinísticas no backlog
 
 ---
 
