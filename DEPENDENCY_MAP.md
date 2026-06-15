@@ -169,6 +169,8 @@ Antes de implementar qualquer novo pipeline, responder:
   - `generate-export` Edge Function — export de segmentos
   - `src/lib/segmentStorage.ts:555` — `getSegmentPartiesForCampaign()` → envio de campanha
   - `src/pages/admin/CampaignSend.tsx` — via `getSegmentRecipientsFailClosed()` (R38)
+  - `api.get_segments_recipient_count(tenant_id, segment_ids[], exclude_segment_ids[])` — COUNT DISTINCT lower(email) entre múltiplos segmentos, descontando segmentos de exclusão; `segment_ids NULL` = todos os contatos do tenant. Usado por `CampaignSend.tsx` para exibir contagem exata de destinatários únicos no botão de envio (somente leitura, mesma semântica de `get_segment_parties_for_campaign`)
+  - `CampaignSend.tsx` — `getExclusionEmailSet()` lê membros de segmentos marcados como EXCLUSÃO no disparo (fail-closed: exclusão com regras e 0 membros bloqueia o envio). IDs auditados em `email.campaign_sends.excluded_segment_ids`
   - `supabase/functions/check-journey-entries/index.ts:213` — enrollment de journey
   - UI — counts, listagens (`get_segment_parties_preview`)
   - Views: `analytics.v_segment_unified` (preview)
