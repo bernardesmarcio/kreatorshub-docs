@@ -2006,7 +2006,7 @@ Ações que geram audit log obrigatório:
 ### 2026-08-06 — Módulo Chat (Whaticket + IA)
 - 4 tabelas novas em `public` (`chat_contatos`, `chat_mensagens`, `chat_config`, `chat_agentes`), todas com RLS: select por `tenant_id = app_auth.active_tenant_id()`; escrita de mensagens só via service role; `chat_config` (carrega token Whaticket em coluna — mesmo gap G-003 dos providers) e `chat_agentes` admin-only via `app_auth.is_admin_or_above()`
 - RPCs: `chat_incrementa_nao_lidas` (execute só service_role), `chat_zerar_nao_lidas` (authenticated, `app_auth.assert_tenant_access`)
-- Edge Functions: `chat-enviar` (JWT ON + checagem de papel em `core.tenant_users`), `chat-webhook` (JWT OFF em config.toml; autenticação por segredo `?t=` — secret `CHAT_WEBHOOK_SEGREDO`, fail-closed sem env; webhook nunca cria contato — número desconhecido é descartado sem gravar nada)
+- Edge Functions: `chat-enviar` (JWT ON + checagem de papel em `core.tenant_users`), `chat-webhook` (JWT OFF em config.toml; autenticação por segredo `?t=` por tenant em `chat_config.webhook_segredo`, com env `CHAT_WEBHOOK_SEGREDO` como mestre; desde 2026-08-07 mensagem de número desconhecido auto-cria contato — comportamento de inbox)
 - Migration: `20260806300000_chat_module.sql` (aplicada via Management API; registrada em `supabase_migrations.schema_migrations`)
 
 ### 2026-03-10 — v1.4

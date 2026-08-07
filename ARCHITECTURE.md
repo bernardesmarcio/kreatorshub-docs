@@ -2729,7 +2729,7 @@ Upload → Detect → Converting → Preview → Review (AI) → Finalizing (sav
 
 ## 22.14 Módulo Chat (Whaticket + IA) — port do Carreta Oftalmo
 
-Módulo **separado** do WhatsApp/Apidozap (decisão de produto 2026-08-06: não misturar — o chat Whaticket já roda validado no Carreta Oftalmo e foi portado como está). Escopo desta fase: só conversas + IA (sem disparo em massa, sem tela de contatos).
+Módulo **separado** do WhatsApp/Apidozap (decisão de produto 2026-08-06: não misturar — o chat Whaticket já roda validado no Carreta Oftalmo e foi portado como está). Escopo desta fase: só conversas + IA (sem disparo em massa, sem tela de contatos). Diferença deliberada da origem (decisão 2026-08-07): mensagem de número desconhecido **auto-cria o contato** (comportamento de inbox; o Carretas descartava por privacidade do número pessoal). O contato nasce sem tag — IA só atende após etiquetar.
 
 - **Tabelas:** `public.chat_contatos`, `public.chat_mensagens`, `public.chat_config`, `public.chat_agentes` (exceção consciente à regra "domínio em schema próprio": prefixo `chat_*` em `public` mantém o diff 1:1 com a origem para sincronizar atualizações futuras).
 - **Edge Functions:** `chat-enviar` (JWT ON; autorização por `core.tenant_users.role != viewer`; envia via Whaticket e grava com service role) e `chat-webhook` (JWT OFF; segredo `?t=` + `&tenant=` na URL; secret `CHAT_WEBHOOK_SEGREDO`).
