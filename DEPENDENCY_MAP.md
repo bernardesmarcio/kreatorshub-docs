@@ -491,6 +491,17 @@ Antes de implementar qualquer novo pipeline, responder:
 
 ---
 
+## Chat (Whaticket) — módulo separado do WhatsApp/Apidozap
+
+### public.chat_contatos / chat_mensagens / chat_config / chat_agentes
+
+- **Writers:** `chat-webhook/index.ts` (mensagens recebidas + resposta IA, service role), `chat-enviar/index.ts` (envio humano, service role), frontend `src/lib/data/chat.ts` (contatos/config/agentes via RLS)
+- **Readers:** `src/pages/admin/Chat.tsx` via hooks de `src/lib/data/chat.ts`; realtime na publication `supabase_realtime`
+- **RPCs:** `public.chat_incrementa_nao_lidas` (service_role only), `public.chat_zerar_nao_lidas` (authenticated, valida `app_auth.assert_tenant_access`)
+- **Regra:** port 1:1 do módulo campanhas do Carreta Oftalmo — mudanças estruturais devem preservar o mapeamento `campanhas_*` → `chat_*` (ver ARCHITECTURE §22.14)
+
+---
+
 ## RPCs Críticas
 
 ### analytics.refresh_segment_parties(segment_id)

@@ -2,7 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
-*Versão 8.7 — §22.12 atualizada: trigger types A/B/C documentados, Phase 3 (UI builder) descartada, validação overnight 2026-05-08 (74 transições reais).*
+*Versão 8.8 — §22.14 nova: Módulo Chat (Whaticket + IA), port do Carreta Oftalmo — módulo separado do WhatsApp/Apidozap, tabelas public.chat_*, exceções conscientes documentadas.*
 
 ---
 
@@ -2724,6 +2724,21 @@ Upload → Detect → Converting → Preview → Review (AI) → Finalizing (sav
 - Sugestões de URL para botões com `href="#"` (a partir de `aria-label`)
 - AI generation de patches de correção (com user approval — nunca auto-aplica)
 - Padrões recorrentes detectados pela AI → viram rules determinísticas no backlog
+
+---
+
+## 22.14 Módulo Chat (Whaticket + IA) — port do Carreta Oftalmo
+
+Módulo **separado** do WhatsApp/Apidozap (decisão de produto 2026-08-06: não misturar — o chat Whaticket já roda validado no Carreta Oftalmo e foi portado como está). Escopo desta fase: só conversas + IA (sem disparo em massa, sem tela de contatos).
+
+- **Tabelas:** `public.chat_contatos`, `public.chat_mensagens`, `public.chat_config`, `public.chat_agentes` (exceção consciente à regra "domínio em schema próprio": prefixo `chat_*` em `public` mantém o diff 1:1 com a origem para sincronizar atualizações futuras).
+- **Edge Functions:** `chat-enviar` (JWT ON; autorização por `core.tenant_users.role != viewer`; envia via Whaticket e grava com service role) e `chat-webhook` (JWT OFF; segredo `?t=` + `&tenant=` na URL; secret `CHAT_WEBHOOK_SEGREDO`).
+- **Exceção consciente ao princípio "nunca processar na hora de receber":** o `chat-webhook` processa inline (responde 200 imediato e segue em `EdgeRuntime.waitUntil`) porque o pull-wait de 30s que agrupa rajadas antes da resposta da IA é parte do design validado na origem. Não usar como referência para novos receivers de integração.
+- **IA:** Claude via `ANTHROPIC_API_KEY` (structured output JSON: resposta, encaminhar_humano, motivo, confirmacao_presenca). Agente por tag (`chat_agentes`); contato sem tag não é atendido. Anti-corrida: dedup determinística (`dedup_key`, janela 2 min), revalidação pós-pull-wait e pós-geração.
+- **Realtime:** `chat_mensagens` (INSERT) e `chat_contatos` (*) na publication `supabase_realtime`; frontend invalida React Query (`src/lib/data/chat.ts`).
+- **Feature gate:** `core.features.code = 'chat'` (concedido via `core.tenant_features`, espelhando quem tem `whatsapp`). Rota `/admin/chat`.
+- **Origem do port:** repo `carreta-oftalmo-estoque` (módulo campanhas, versão local 2026-08-06). Ao sincronizar atualizações de lá, mapear `campanhas_*` → `chat_*`.
+- **API Whaticket/AGPT:** referência validada (endpoints, webhooks primário/secundário, formatos de evento, gotchas) em `docs/chat-whaticket-api.md`.
 
 ---
 
