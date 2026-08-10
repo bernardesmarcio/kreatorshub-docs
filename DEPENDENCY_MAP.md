@@ -491,6 +491,15 @@ Antes de implementar qualquer novo pipeline, responder:
 
 ---
 
+## email.campaign_sends — agendamento e cancelamento
+
+- **Writers:** `CampaignSend.tsx` (insert do envio; reagendar chama `email.cancel_campaign_scheduled_sends` antes), `workers/email-campaign` (prepare/send batch: `scheduled|pending` → `sending` → `completed`), `email.cancel_scheduled_send` (→ `cancelled`), `reconcile-sendgrid` (contadores), `process-journey` (insert com status `pending`)
+- **Readers:** `Campaigns.tsx` (agendados + em andamento, com botão cancelar/parar), `CampaignSend.tsx` (Envios Recentes), `CampaignResults.tsx`
+- **Invariante (R49):** índice `campaign_sends_one_scheduled_per_campaign` — no máximo UM envio `scheduled` não-teste por campanha. Jornadas criam `pending`, então não colidem.
+- **Cancelamento (R50):** `email.cancel_scheduled_send(send_id, tenant_id)` aceita `scheduled|pending|sending`; marca recipients `pending`→`skipped`, remove jobs pendentes do envio em `journeys.processing_jobs` (por `payload->>'send_id'`) e devolve a campanha para `ready` (nada enviado) ou `sent` (envio parcial). Recipients `processing` são deixados em paz — o lote em voo termina e os seguintes abortam pela checagem de status em `sendEmailBatch.ts`.
+
+---
+
 ## Chat (Whaticket) — módulo separado do WhatsApp/Apidozap
 
 ### public.chat_contatos / chat_mensagens / chat_config / chat_agentes
