@@ -491,6 +491,20 @@ Antes de implementar qualquer novo pipeline, responder:
 
 ---
 
+## email.email_events.party_id — engajamento na segmentação
+
+- **Writers:** trigger `trg_resolve_event_party_id` (BEFORE INSERT, resolve o party pelo e-mail na escrita). Backfill único em 2026-08-11: 884.448/884.573.
+- **Readers:** `analytics.build_email_engagement_clause` (subconsulta dos 4 filtros de engajamento), servido por `idx_email_events_seg_period` e `idx_email_events_seg_send` (índices COBERTOS — index-only scan, heap intocada).
+- **Regra (R52):** a subconsulta SEMPRE correlaciona `ee.tenant_id = v_segment_unified.tenant_id`. Todos os call sites usam `FROM analytics.v_segment_unified` sem alias — se algum passar a usar alias, a correlação quebra e a query volta a varrer todos os tenants.
+- **Campos atendidos:** `last_email_opened_at`, `last_email_clicked_at` (qualquer email) e `campaign_opened`, `campaign_clicked` (send_ids específicos, com `url_contains`/`url_exact`).
+
+### analytics.contact_matches_segment(tenant, party, segment)
+
+- **Callers:** `workers/analytics/src/segment-eval-worker.ts` (segmentos em `diff.deferred`)
+- **Contrato:** `true`/`false` = decisão; `null` = indecidível → o chamador PRESERVA a associação atual (R53). Reusa `build_unified_where_clause_v2`, então nunca diverge do refresh em lote.
+
+---
+
 ## email.campaign_sends — agendamento e cancelamento
 
 - **Writers:** `CampaignSend.tsx` (insert do envio; reagendar chama `email.cancel_campaign_scheduled_sends` antes), `workers/email-campaign` (prepare/send batch: `scheduled|pending` → `sending` → `completed`), `email.cancel_scheduled_send` (→ `cancelled`), `reconcile-sendgrid` (contadores), `process-journey` (insert com status `pending`)
