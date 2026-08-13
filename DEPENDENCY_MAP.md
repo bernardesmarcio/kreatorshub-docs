@@ -498,6 +498,18 @@ Antes de implementar qualquer novo pipeline, responder:
 - **Regra (R52):** a subconsulta SEMPRE correlaciona `ee.tenant_id = v_segment_unified.tenant_id`. Todos os call sites usam `FROM analytics.v_segment_unified` sem alias — se algum passar a usar alias, a correlação quebra e a query volta a varrer todos os tenants.
 - **Campos atendidos:** `last_email_opened_at`, `last_email_clicked_at` (qualquer email) e `campaign_opened`, `campaign_clicked` (send_ids específicos, com `url_contains`/`url_exact`).
 
+### email.campaign_recipients.party_id — pertencimento à campanha
+
+- **Writers:** trigger `trg_resolve_recipient_party_id` (BEFORE INSERT). Backfill 2026-08-13: 348.761/348.789.
+- **Readers:** `analytics.build_campaign_membership_clause`, via índice coberto `idx_campaign_recipients_seg_send`.
+- **Semântica:** "está na campanha" = consta na lista de destinatários com `status <> 'skipped'` — `skipped` é supressão explícita (descadastrado/suprimido), nunca recebeu o e-mail.
+
+### Campo unificado `campaign` (segmentação)
+
+- Seis operadores: `in` / `not_in` (destinatários) e `opened` / `not_opened` / `clicked` / `not_clicked` (eventos), mais `url_contains` / `url_exact`.
+- Substitui `campaign_opened` / `campaign_clicked`, que seguem funcionando no SQL para compatibilidade (os 4 segmentos que os usavam foram migrados em 2026-08-13).
+- **Regra (R54):** subconsultas de segmentação usam `EXISTS` / `NOT EXISTS`, nunca `IN` / `NOT IN`. Com correlação de tenant, `NOT IN` vira SubPlan reexecutado por linha — medido 5,3 s vs 107 ms com anti-join no filtro "recebeu e não abriu".
+
 ### analytics.contact_matches_segment(tenant, party, segment)
 
 - **Callers:** `workers/analytics/src/segment-eval-worker.ts` (segmentos em `diff.deferred`)
