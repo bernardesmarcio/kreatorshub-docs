@@ -510,6 +510,13 @@ Antes de implementar qualquer novo pipeline, responder:
 - Substitui `campaign_opened` / `campaign_clicked`, que seguem funcionando no SQL para compatibilidade (os 4 segmentos que os usavam foram migrados em 2026-08-13).
 - **Regra (R54):** subconsultas de segmentação usam `EXISTS` / `NOT EXISTS`, nunca `IN` / `NOT IN`. Com correlação de tenant, `NOT IN` vira SubPlan reexecutado por linha — medido 5,3 s vs 107 ms com anti-join no filtro "recebeu e não abriu".
 
+### journeys.journey_enrollments — campo `journey` (segmentação)
+
+- **Readers:** `analytics.build_journey_clause`, via índice coberto `idx_journey_enrollments_seg`.
+- **`party_id` já existia preenchido** (4.452/4.454) — diferente de `email_events` e `campaign_recipients`, não precisou desnormalização.
+- **Operadores:** `in` (tem enrollment, qualquer status — `exited` é o estado normal de quem percorreu), `not_in`, `completed`, `not_completed` (= entrou E não concluiu; sem a primeira metade quem nunca entrou cairia no filtro), `active`.
+- Campo temporal: o intervalo do grupo filtra `enrolled_at` ("entrou na automação em julho").
+
 ### analytics.contact_matches_segment(tenant, party, segment)
 
 - **Callers:** `workers/analytics/src/segment-eval-worker.ts` (segmentos em `diff.deferred`)
