@@ -2003,6 +2003,13 @@ Ações que geram audit log obrigatório:
 
 ## 26. Changelog
 
+### 2026-08-14 — Chat: RLS por participação no tenant
+- As policies do chat exigiam apenas `tenant_id = app_auth.active_tenant_id()` (claim do JWT). O claim não está presente para todos os usuários — na Escola do Fluxo, 2 de 9 membros o tinham correto — e sem ele a função devolve NULL, zerando o resultado. Sintoma: aba Chat visível (o gate de feature usa outro caminho, com tenant explícito) e nenhuma conversa carregando.
+- Corrigido para o padrão majoritário do produto (104 policies): `public.is_tenant_member` / `public.is_tenant_admin`, que validam `core.tenant_users` e já contemplam `core.system_admins`. O claim permanece como atalho.
+- Vale para `chat_contatos`, `chat_mensagens`, `chat_config`, `chat_agentes`, `chat_conexoes` e o upload no bucket `chat-media` (com guarda de regex antes do cast para uuid).
+- Isolamento verificado após a mudança: membro da Escola do Fluxo vê 54 conversas do próprio tenant e 0 da SaudeNow; usuário de tenant sem chat vê 0.
+- **Pendente (fora do chat):** outras 23 tabelas ainda dependem só do claim — em sua maioria internas (`analytics.*`, `journeys.*`, `sympla.*`), não consultadas direto pela UI, mas o mesmo sintoma pode aparecer se alguma passar a ser. Ver R55.
+
 ### 2026-08-06 — Módulo Chat (Whaticket + IA)
 - 4 tabelas novas em `public` (`chat_contatos`, `chat_mensagens`, `chat_config`, `chat_agentes`), todas com RLS: select por `tenant_id = app_auth.active_tenant_id()`; escrita de mensagens só via service role; `chat_config` (carrega token Whaticket em coluna — mesmo gap G-003 dos providers) e `chat_agentes` admin-only via `app_auth.is_admin_or_above()`
 - RPCs: `chat_incrementa_nao_lidas` (execute só service_role), `chat_zerar_nao_lidas` (authenticated, `app_auth.assert_tenant_access`)
@@ -2139,3 +2146,23 @@ Ações que geram audit log obrigatório:
 - [SOC 2 Trust Services Criteria](https://www.aicpa.org/soc)
 - [ISO 27001 Controls](https://www.iso.org/isoiec-27001-information-security.html)
 - [OWASP Top 10](https://owasp.org/www-project-top-ten/)
+
+
+## Platform Billing (edge fn `platform-billing`) — 2026-08-25
+
+- `core.tenant_billing`: RLS habilitada com ZERO policies + REVOKE de anon/authenticated → acesso exclusivamente via service role (edge fn). Verificado na criação.
+- **`verify_jwt = true`** (corrigido na auditoria 2026-08-26): o gateway do Supabase valida a assinatura do JWT ANTES de invocar — fecha o bypass crítico de `role=service_role` forjado. O caminho público `/cobranca/:token` continua: o navegador envia a anon key (JWT válido) e a auth real é via token HMAC no corpo. `decodeCaller` só LÊ claims já verificadas pelo gateway (nunca confia em claim de token não verificado).
+- CADA ação também faz sua própria autorização:
+  - `admin_*`: JWT sub ∈ `core.system_admins`.
+  - `generate_share_link`: system admin OU `core.tenant_users.role ∈ (owner, admin)` do tenant.
+  - `get_billing`/`get_payment_artifacts`: token HMAC (verificação timing-safe, multi-secret, `exp` OBRIGATÓRIO) ou JWT com membership owner/admin.
+- Data minimization no caminho público: resposta não contém CPF/CNPJ, e-mail ou endereço — apenas nome/logo do tenant, valores, vencimentos e artefatos de pagamento.
+- Guard IDOR em `get_payment_artifacts`: o payment consultado deve pertencer ao `asaas_customer_id` vinculado ao tenant do token (403 caso contrário).
+- Rate limiting best-effort em memória (~30 req/min por token/IP) — isolates são efêmeros, proteção suave; erros do Asaas retornam `ASAAS_UNAVAILABLE` sem vazar corpo.
+- Segredos: `PLATFORM_BILLING_HMAC_SECRET` (rotacionável por lista), `PLATFORM_TENANT_ID`. Chave Asaas reutiliza `commerce.asaas_config` do tenant plataforma (campo `api_key_encrypted`, mesma postura do checkout).
+- Dívida: tokens stateless sem revogação individual (mitigação: exp curto padrão 30d; desvincular tenant invalida; rotação de secret revoga todos).
+
+
+### Auditoria whitelabel (cartão nativo) — 2026-08-26
+Três revisores (código, API Asaas, segurança). Corrigidos: C1 crítico (verify_jwt=true), AWAITING_RISK_ANALYSIS não-pagável, User-Agent Asaas, injeção no `.or()` do PostgREST (sanitização da busca), mensagem de recusa de cartão preservada, timezone São Paulo em vencimento/expiração PIX, race no sheet de artefatos, reset do form de cartão entre cobranças (dado sensível não persiste), validação de validade do cartão, TTL no cache de credencial Asaas.
+Card data (PAN/CVV) trafega browser→edge fn→Asaas, NUNCA persiste nem é logado (verificado). **Follow-ups pendentes (decisão de produto):** (1) rate limiting DURÁVEL por cobrança no `pay_with_card` (anti card-testing — hoje é best-effort em memória); (2) avaliar tokenização de cartão do Asaas para sair de escopo PCI SAQ A-EP; (3) revogação individual de token de cobrança (hoje só via rotação de secret) + considerar token no fragment (#) da URL.

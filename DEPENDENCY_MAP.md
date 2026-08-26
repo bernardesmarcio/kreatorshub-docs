@@ -544,6 +544,30 @@ Antes de implementar qualquer novo pipeline, responder:
 
 ---
 
+## Domínios Customizados
+
+### core.custom_domains
+
+- **Writers:**
+  - `src/lib/customDomains.ts` — CRUD via RLS (add/toggle/delete pelo `DomainSettingsDialog`)
+  - `supabase/functions/domain-delegation/index.ts` (`handleValidate`) — upsert automático do `forms.<fqdn>` com `status='active'` quando a delegação NS valida
+  - `supabase/functions/domain-delegation/index.ts` (`handleRecheckAllDomains`/`handleRecheckDomain`) — re-verificação de DNS: seta `dns_broken` (2 falhas consecutivas no cron; imediato no check manual), restaura `active`, mantém `last_dns_check_at`/`dns_failure_count`
+- **Readers:**
+  - `src/lib/customDomains.ts` (`getActiveDomainByService`) — links de forms/lp/app na UI (FormBuilder, FormsDashboard, SmartFormsDashboard, EmbedFormBuilder, CheckoutOffers). Filtra `status='active'`
+  - `workers/email-campaign/src/handlers/sendEmailBatch.ts` — URL do preference center (`app.%`, `status='active'`)
+- **Status:** `pending` → `active` (verificado) | `failed` (verificação inicial falhou) | `disabled` (desligado pelo usuário — nunca reativado automaticamente) | `dns_broken` (estava ativo, cron `custom-domains-recheck` não encontra mais o DNS; volta a `active` sozinho quando o registro reaparece)
+- **Regra:** `dns_broken` REMOVE o domínio dos readers acima (filtram `active`) — links gerados voltam ao domínio da plataforma até o DNS ser restaurado. CNAME esperado: `cname.vercel-dns.com` (constante `VERCEL_CNAME` no Edge Function; espelhada em `DomainSettingsDialog.tsx`).
+
+### core.delegated_subdomains
+
+- **Writers:**
+  - `supabase/functions/domain-delegation/index.ts` — ciclo de vida completo (create/validate/delete); re-check NS periódico atualiza `observed_nameservers` e flaga `metadata.dns_broken`/`metadata.ns_failure_count` sem tocar `status`
+- **Readers:**
+  - `src/components/settings/DomainDelegationTab.tsx` via action `status` — UI de delegação (alerta destrutivo quando `metadata.dns_broken`)
+- **Regra:** o state machine de `status` (`pending_delegation` → `validating` → `active`) pertence ao fluxo de onboarding; saúde pós-ativação vive em `metadata` para não regredir a UI de setup.
+
+---
+
 ## RPCs Críticas
 
 ### analytics.refresh_segment_parties(segment_id)
@@ -721,3 +745,16 @@ Ao resolver uma dívida D[N]:
 1. Buscar `D[N]` no código: `grep -rn "D[N]" workers/ src/ supabase/`
 2. Remover comentários de workaround marcados com `// D[N] WORKAROUND`
 3. Manter comentários de regra R[N] (são permanentes)
+
+
+## core.tenant_billing (Platform Billing)
+
+Vínculo tenant ↔ cliente Asaas da plataforma (conta do tenant Kreators Platform).
+
+| Papel | Quem |
+|---|---|
+| Writer | edge fn `platform-billing` (service role): `admin_link_customer` (upsert), `admin_unlink_customer` (is_active=false) |
+| Reader | edge fn `platform-billing`: `generate_share_link`, `get_billing`, `get_payment_artifacts` |
+| Frontend | `src/lib/platformBilling.ts` → `TenantBillingTab` (/system/tenants/:id), `AccountBilling` (/admin/account), `PlatformBillingPage` (/cobranca/:token) |
+
+Leitura adicional: `platform-billing` lê `commerce.asaas_config` e `commerce.checkout_orders` APENAS do tenant `PLATFORM_TENANT_ID` (credencial + sugestão de vínculo).

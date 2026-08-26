@@ -2,6 +2,9 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
+*Versão 9.3 — Platform Billing (§ nova ao final): cobrança da plataforma aos tenants via tenant Kreators Platform + edge fn `platform-billing` (token HMAC com expiração, PIX/boleto nativos). Dívida: tokens stateless sem revogação individual.*
+*Versão 9.2 — §11: cron `custom-domains-recheck` (re-verificação periódica de DNS — `core.custom_domains` ganha status `dns_broken`; delegações ativas flagadas via `metadata.dns_broken`). Incidente: forms.alemdaescuridao.org ficou "ativo" após cliente remover o CNAME.*
+*Versão 9.2 — R55 nova (RLS por participação, não só claim do JWT).
 *Versão 9.1 — R54 nova (EXISTS vs IN em segmentação) e campo unificado `campaign` com seis operadores.
 *Versão 9.0 — R51/R52/R53 novas (auditoria 2026-08-11: segmentação por engajamento de email nunca funcionou; motor vivo esvaziava segmentos v2). R49/R50 (incidente 2026-08-10: campanha duplicada e impossível de cancelar). §22.14: Módulo Chat (Whaticket + IA).*
 
@@ -492,6 +495,7 @@ sem registro = violação arquitetural.
 | `sweep-orphan-enrollments` | `*/10 * * * *` | Re-enqueue de enrollments órfãos LIMIT 100 | `journeys.sweep_orphan_enrollments` | **A** | Safety net pós D18 (fanout não-atômico). Sem lógica de domínio. **TODO:** alarmar quando `count > 0` indica bug em fanout. |
 | `rfm-rolling-refresh` | `0 * * * *` | Enqueue `refresh_features` para 1/24 dos tenants/hora com threshold 20h via `MOD(HASHTEXT(t.id), 24) = HOUR(NOW())` | `analytics.enqueue_job_internal` | **B** | Loop bloqueante de tenants no banco (viola §2.4). Lógica de sharding e threshold em SQL. **D-CRON-2** — migrar para worker. |
 | `segment-eval-fallback` | `*/5 * * * *` | Itera tenants ativos, detecta contatos com `state_updated_at < 15min` sem job pending, enqueue na `segment_eval_queue` | `analytics.run_segment_eval_fallback` | **B** | Safety net pro event-driven path. Loop bloqueante de tenants (viola §2.4). Mascara bugs do path event-driven sem alarme. **D-CRON-3** (instrumentar `analytics.fallback_log`) é pré-requisito de **D-CRON-4** (migrar para worker). |
+| `custom-domains-recheck` | `20 */6 * * *` | Pulse → Edge Function `domain-delegation` action `recheck_domains` (re-valida DNS de `core.custom_domains` ativos + NS de delegações ativas) | `core.invoke_domain_recheck` | **A** | v9.2. SQL é pulse puro (`net.http_post`); toda a lógica de DNS vive no Edge Function (mesmo padrão de `integrations.invoke_worker`). Domínio ativo vira `dns_broken` após 2 checks consecutivos falhos; volta a `active` quando o CNAME (`cname.vercel-dns.com`) reaparece. Delegações quebradas são flagadas em `metadata.dns_broken` sem tocar o status. |
 
 > **Pull-based providers (Sympla, Doare):** sync periódico gerenciado pelo pull-sync-worker via `integrations.sync_schedules`. Não usam pg_cron.
 
@@ -1254,6 +1258,7 @@ Cada regra foi extraída de um incidente real. Sem narrativa — apenas o que o 
 | R45 | **Frequency guard em nós de comunicação.** Nós `send_email`, `webhook`, `notify` devem respeitar limite de frequência por contato configurável no journey settings. Default: max 1 email por contato por 24h na mesma jornada. Guard consultável em `journey_executions` (contagem de executions do mesmo node_type para o mesmo enrollment nas últimas N horas). | Requisito Etapa 2 — proteção contra spam |
 | R46 | **Workers separados por SLA.** journeys-event-worker (< 5s, push-based) e journeys-worker (minutos, batch) devem permanecer separados. Condition engine pesado (queries em contact_state) não deve rodar no event-worker. Se condition evaluation for necessária no fanout, delegar para journeys-worker via processing_job. | Confirmado Sprint 14 — audit comprovou separação necessária |
 | R47 | **Email engagement via subquery, não snapshot.** Campos `campaign_opened`/`campaign_clicked` usam resolver `email_engagement` com EXISTS em `email.email_events`. Engagement data é per-campaign — nunca materializar em `contact_state`. Condition node usa pre-enrichment (`__email_engagement` injetado pelo conditionEngine). Padrão replicável para futuros campos relacionais (ex: `opened_journey_email_X`). | Sprint 19 |
+| R55 | **RLS de tabela consultada pela UI valida PARTICIPAÇÃO (`is_tenant_member`/`is_tenant_admin`), não apenas o claim `active_tenant_id`.** O claim não está presente em todos os JWTs; sem ele `app_auth.active_tenant_id()` devolve NULL e a policy zera silenciosamente o resultado — sem erro, sem log. Usar o claim só como atalho, sempre com o `OR` de participação. | 2026-08-14: usuários viam a aba Chat mas nenhuma conversa carregava; 2 de 9 membros da Escola do Fluxo tinham o claim correto. 23 tabelas internas seguem só com o claim (dívida aberta). |
 | R54 | **Subconsulta de segmentação usa `EXISTS`/`NOT EXISTS`, nunca `IN`/`NOT IN`.** Com correlação de tenant/party, `NOT IN` não pode virar anti-join (o Postgres precisaria provar ausência de NULL) e degrada para SubPlan reexecutado por linha. Correlacionar por `party_id` **e** `tenant_id` é o que habilita semi/anti-join. Após backfill em massa, rodar `VACUUM ANALYZE` — sem isso o índice coberto perde o index-only scan. | Medido 2026-08-13 no filtro "recebeu a campanha e não abriu": 5,3 s (SubPlan, 8.975 loops) → 107 ms (Hash Anti Join). |
 | R51 | **Campo oferecido na UI de segmentação DEVE ter tradutor correspondente em `analytics.eval_condition_v2`.** Sem tratamento explícito, o campo cai no template genérico `campo operador valor` e gera SQL inválido — que só falha em runtime, no preview e no refresh. Ao adicionar campo em `fieldConfig.ts`, adicionar o branch no plpgsql E um caso na varredura de regressão (gerar a cláusula de todos os segmentos ativos e executá-la). | Auditoria 2026-08-11: os 4 filtros de engajamento de email (`last_email_opened_at`, `last_email_clicked_at`, `campaign_opened`, `campaign_clicked`) existiam na UI desde sempre e **nunca** funcionaram — geravam `last_email_opened_at >= 7` (timestamptz vs int) e `campaign_opened = NULL` (coluna inexistente). 2 segmentos em produção com 0 membros. |
 | R52 | **Filtro por período sobre engajamento usa o EVENTO (`email.email_events`), nunca o snapshot (`contact_state.last_email_*_at`).** O snapshot guarda só a última ocorrência: quem abriu em junho e de novo em agosto não apareceria em "abriu em junho". Os campos de engajamento são temporais (`is_temporal_field`) e herdam o intervalo do grupo. Escala: `party_id` desnormalizado em `email_events` + índices cobertos (`INCLUDE (party_id)`) + correlação obrigatória `ee.tenant_id = v_segment_unified.tenant_id` — sem o filtro de tenant a subconsulta varre os eventos de todos os tenants (custo 19× maior medido com 884k eventos). | Auditoria 2026-08-11 |
@@ -3258,3 +3263,20 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 - Removidas colunas órfãs `has_open_opportunity` e `open_opportunity_count` de `analytics.contact_state`
 - Criado índice `idx_opportunities_party_tenant_status` em `crm.opportunities`
 - R36 expandido: campos 1:N nunca denormalizados em contact_state, modo BULK_ONLY documentado, lista completa de 10 campos implementados
+
+
+## Platform Billing — cobrança da plataforma aos tenants (v9.3)
+
+A plataforma cobra seus tenants pelo MESMO Asaas usado pelo tenant especial **Kreators Platform** no módulo de checkout (`commerce.asaas_config` desse tenant; assinaturas criadas via painel de ofertas). O módulo Platform Billing NÃO cria cobranças — apenas exibe e permite pagar as cobranças existentes no Asaas.
+
+**Contrato:**
+- `core.tenant_billing` (tenant_id PK → asaas_customer_id): vínculo explícito tenant↔cliente Asaas. RLS ligada, zero policies/grants — acesso somente via edge fn com service role.
+- Edge fn `supabase/functions/platform-billing/index.ts` (verify_jwt=false; auth por ação):
+  - `admin_search_asaas_customer` / `admin_link_customer` / `admin_unlink_customer` — exige `core.system_admins`. Busca local-first em `commerce.checkout_orders` do tenant plataforma, fallback API Asaas.
+  - `generate_share_link` — system admin OU owner/admin do tenant. Token HMAC-SHA256 `payloadB64.sigB64`, payload `{v:1, t:tenant_id, iat, exp}` (default 30d, máx 90d), secret `PLATFORM_BILLING_HMAC_SECRET` (lista rotacionável). Diferente do preference center, `exp` é OBRIGATÓRIO.
+  - `get_billing` / `get_payment_artifacts` — token HMAC (página pública `/cobranca/:token`) ou JWT de owner/admin (página `/admin/account`). Dados live da API Asaas (`GET /v3/payments?customer=`, cap 300); PIX/boleto sob demanda; guard IDOR: `payment.customer === asaas_customer_id` vinculado.
+- Env: `PLATFORM_TENANT_ID` (tenant Kreators Platform), `PLATFORM_BILLING_HMAC_SECRET`. Credencial Asaas vem do `asaas_config` do tenant plataforma — NUNCA de secret separado, NUNCA do asaas_config de outro tenant.
+
+**Regra:** `commerce.asaas_config` dos demais tenants é do checkout DELES (eles cobrando os clientes deles). Platform Billing só lê o config do `PLATFORM_TENANT_ID`.
+
+**Dívida técnica:** tokens de cobrança são stateless — sem revogação individual antes do `exp`; rotação do secret revoga todos. Desvincular o tenant (`is_active=false`) também invalida os links (o `get_billing` deixa de resolver).
