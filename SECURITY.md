@@ -2003,6 +2003,42 @@ Ações que geram audit log obrigatório:
 
 ## 26. Changelog
 
+### 2026-08-22 — Auditoria de segurança + correções de vazamento cross-tenant
+
+Motivada pelo achado de uma policy PUBLIC em `analytics.contact_state`. Duas
+auditorias por agente (RLS/banco e estilo-Aikido de código) mais os advisors
+do Supabase. Corrigido e VALIDADO em produção:
+
+- **CRÍTICO — PII legível por `anon` (sem login):** `analytics.v_segment_unified`
+  (47k contatos/8 tenants), `_segment_parties_audit_20260430` (79k linhas) e
+  `api.list_all_users()` (22 usuários) tinham grant para `anon`. Migration
+  `20260822130000`: revogado `anon` de tudo; tabela de auditoria e `list_all_users`
+  também fora de `authenticated`; `list_all_users` ganhou guarda `is_system_admin`.
+  `authenticated` mantido nas views de segmentação (a UI depende) — a exposição a
+  usuário LOGADO fica como HIGH aberto (fix: `security_invoker` + auditoria de
+  policy das tabelas-base, com teste).
+- **CRÍTICO — `whatsapp-broadcast`:** rodava com service_role aceitando `tenant_id`
+  do body sem autenticar (a anon key passava o `verify_jwt`), virando relay de
+  spam cross-tenant; token `SAUDENOW_TOKEN` hardcoded e versionado. Agora exige
+  `auth.getUser` + membership não-viewer em `core.tenant_users`; token movido para
+  `SAUDENOW_BROADCAST_TOKEN` (env). **Ação pendente do dono: ROTACIONAR o token no
+  Whaticket — vazou no histórico do git.** Ataque com chave pública → 401 (testado).
+- **ALTO — `checkout-process` ações admin** (`cancel_subscription`,
+  `list_subscriptions_status`, `test_connection`): sem checagem de identidade
+  ("admin — no identity check"). Agora exigem membership. Ataque → 401 (testado).
+- **contact_state:** ver entrada anterior (policy PUBLIC → service_role).
+
+Relatórios completos: `docs/security-audit-2026-08-22.md` (RLS/banco) e
+`docs/aikido-style-scan-2026-08-22.md` (código/deps/secrets, com funil de triagem).
+
+**Pendências priorizadas (não aplicadas — exigem teste/decisão):** (1) HIGH:
+`security_invoker` nas views `v_segment_*` para fechar cross-tenant a usuário
+logado; (2) MÉDIO: ~30 policies dependem só do claim `active_tenant_id` e há 1
+usuário em produção (`diegostetner@gmail.com`) com o claim apontando para tenant
+do qual não é membro — leitura real de PII; migrar essas policies para
+`is_tenant_member`; (3) higiene: 11 funções SECURITY DEFINER sem `search_path`,
+grants excessivos a `anon`, `state` não assinado em `eduzz-oauth-callback`.
+
 ### 2026-08-14 — Chat: RLS por participação no tenant
 - As policies do chat exigiam apenas `tenant_id = app_auth.active_tenant_id()` (claim do JWT). O claim não está presente para todos os usuários — na Escola do Fluxo, 2 de 9 membros o tinham correto — e sem ele a função devolve NULL, zerando o resultado. Sintoma: aba Chat visível (o gate de feature usa outro caminho, com tenant explícito) e nenhuma conversa carregando.
 - Corrigido para o padrão majoritário do produto (104 policies): `public.is_tenant_member` / `public.is_tenant_admin`, que validam `core.tenant_users` e já contemplam `core.system_admins`. O claim permanece como atalho.
