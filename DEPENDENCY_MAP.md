@@ -3,7 +3,7 @@
 > **REGRA R37**: Antes de alterar qualquer item listado aqui, verificar TODOS os readers/writers.
 > Atualizar este arquivo sempre que adicionar novo consumidor.
 >
-> Gerado em: 2026-03-19 · Última atualização: 2026-05-01
+> Gerado em: 2026-03-19 · Última atualização: 2026-08-27
 
 ---
 
@@ -18,7 +18,7 @@
 |---|---|---|---|
 | `integrations.jobs` | ingestion-worker | `worker.claim_jobs(worker_id, handler_list)` | `commerce:process_batch`, `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment` |
 | `integrations.jobs` | historical-sync-worker | `worker.claim_jobs(worker_id, handler_list)` | `eduzz:import_sales_page`, `eduzz:import_products`, `eduzz:enrich_sales`, `eduzz:enrich_invoice`, `eduzz:get_sales_count`, `sympla:historical_sync`, `typeform:sync_forms`, `typeform:sync_responses`, `typeform:enrich_themes`, `typeform:promote_forms`, `typeform:promote_responses`, `typeform:backfill_settings` |
-| `integrations.jobs` | email-sync-worker | `worker.claim_jobs(worker_id, handler_list)` | `nylas:deep_sync`, `nylas:deep_sync_folder`, `nylas:initial_sync`, `cache_attachments_scan`, `cache_attachment_batch`, `cleanup_jobs` |
+| `integrations.jobs` | email-sync-worker | `worker.claim_jobs(worker_id, handler_list)` | `nylas:deep_sync`, `nylas:deep_sync_folder`, `nylas:initial_sync`, `nylas:apply_message_ops`, `nylas:sync_folders`, `cache_attachments_scan`, `cache_attachment_batch`, `cleanup_jobs` |
 | `integrations.sync_schedules` | pull-sync-worker | `integrations.claim_sync_schedules(worker_id, providers)` | N/A (schedule-based por provider: `sympla`, `doare`, `typeform`) |
 | `analytics.processing_jobs` | analytics-worker APENAS | `analytics.claim_next_jobs(worker_id, batch)` | `refresh_features`, `refresh_rfm`, `refresh_reactivation`, `refresh_segments`, `compute_clusters`, `compute_lookalikes`, `compute_cluster_subgroups`, `sync_customers`, `compute_lookalike_audience`, `link_products`, `project_traits`, `sync_field_definitions` |
 | `journeys.processing_jobs` | journeys-worker | `journeys.claim_next_job(worker_id)` | `check_segment_entries`, `check_form_entries`, `check_event_entries`, `process_enrollment`, `link_submission_to_lead` |
@@ -313,6 +313,10 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/historical-sync/src/handlers/webhook/processInvoice.ts:113` — invoice processing
 - **Producers (DB triggers):**
   - `trg_enqueue_field_sync` — smart_forms publish → `forms:sync_field_definitions`
+- **Producers (RPCs SECURITY DEFINER — inbox outbox/folders):**
+  - `inbox.enqueue_message_op` (inline) e `inbox.enqueue_ops_drainer` — job drenador `nylas:apply_message_ops` (dedupe: máx 1 pending/running por conta)
+  - `inbox.enqueue_folder_sync_job` — `nylas:sync_folders` via `mark_inbox_active` (throttle 15min) e `api.request_folder_sync` (refresh manual da sidebar)
+  - Handlers do email-sync se re-enfileiram: drainer com `run_after` = próximo retry; `sync_folders` +1h e após cada folder op aplicada
 - **Consumers:** ingestion-worker, email-sync-worker, historical-sync-worker, pull-sync-worker — via `claim_next_jobs` (SKIP LOCKED)
 - **Job types principais:** `commerce:process_batch`, `eduzz:enrich_invoice`, `nylas:deep_sync`, `sympla:sync_responses`, `typeform:sync_responses`
 
@@ -541,6 +545,45 @@ Antes de implementar qualquer novo pipeline, responder:
 - **Readers:** `src/pages/admin/Chat.tsx` via hooks de `src/lib/data/chat.ts`; realtime na publication `supabase_realtime`
 - **RPCs:** `public.chat_incrementa_nao_lidas` (service_role only), `public.chat_zerar_nao_lidas` (authenticated, valida `app_auth.assert_tenant_access`)
 - **Regra:** port 1:1 do módulo campanhas do Carreta Oftalmo — mudanças estruturais devem preservar o mapeamento `campanhas_*` → `chat_*` (ver ARCHITECTURE §22.14)
+
+---
+
+## Inbox (Nylas/IMAP) — outbox, labels e pastas
+
+### inbox.ops — Outbox local-first (FIFO por conta, ver ARCHITECTURE §22.15)
+
+- **Writers:**
+  - `api.enqueue_message_op` RPC — frontend `src/lib/inboxStorage.ts` (`updateMessageFlags`, `moveMessageToFolder`): INSERT do op + mutação otimista + job drenador na mesma transação
+  - `api.create_folder` / `api.rename_folder` / `api.delete_folder` RPCs — frontend `src/lib/inboxStorage.ts` + `src/components/inbox/InboxSidebar.tsx`: folder ops (delete com mensagens gera ops `move` em massa ANTES do `folder_delete` — FIFO por `seq`)
+  - `api.retry_folder_op` / `api.discard_folder_op` RPCs — badge "falhou" da sidebar (re-enfileira op failed / cancela e reverte estado local)
+  - `workers/email-sync/src/handlers/applyMessageOps.ts` + `folderOps.ts` — UPDATE de status (applying/applied/failed/cancelled, backoff, rollback com cascata)
+- **Readers:**
+  - email-sync-worker handler `nylas:apply_message_ops` — drena FIFO (`ORDER BY seq`): coalescing por mensagem; folder ops como barreiras individuais
+  - `src/lib/inboxStorage.ts` `getOutboxStatus` — chip "Sincronizando N…" (SELECT count, RLS read-only)
+  - `inbox.upsert_message` — blindagem de campo: op pending/applying vence sync/webhook
+- **Regra:** frontend NUNCA muda status de op (só INSERT via RPC + SELECT); status é exclusivo do worker/RPCs de retry-discard.
+
+### inbox.labels / inbox.message_labels — labels 100% locais
+
+- **Writers:** RPCs `api.create_label` / `update_label` / `delete_label` / `set_message_labels` — frontend `src/lib/inboxStorage.ts` (sem outbox, sem worker, sem sync IMAP)
+- **Readers:** `api.get_labels_with_counts` (contagem on-demand — nunca materializar), `api.get_inbox_messages_v2` (filtro `p_label_id`), SELECT direto em `inbox.message_labels` (picker/lista)
+- **Regra:** nunca sincronizar labels com IMAP (decisão §8.1 do INBOX_REVAMP_PLAN).
+
+### crm.get_contact_context (RPC — painel CRM do inbox)
+
+- **Reader:** frontend `src/lib/inboxStorage.ts` `getContactContext` → `ContactContextPanel` (via wrapper `api.get_contact_context`, 1 round-trip jsonb)
+- **Fontes lidas:** `crm.parties`/roles/tags, `analytics.contact_state`, `commerce.transactions`, `journeys.journey_enrollments`, `crm.opportunities`
+
+### inbox.link_message_to_crm (reescrita 2026-08-27)
+
+- **Callers:** `inbox.upsert_message` (todo sync/webhook de mensagem) e `inbox.batch_link_messages_to_crm`
+- **Regras:** customer supersede lead (badge não fica stale após conversão); o endereço da PRÓPRIA conta nunca linka (recebido → casa só o remetente; enviado → casa destinatários exceto a conta); leads via `crm.parties` + role ativa (`crm.leads` não existe mais)
+
+### Handlers email-sync `nylas:apply_message_ops` / `nylas:sync_folders`
+
+- **Producers:** ver "Producers (RPCs SECURITY DEFINER)" em `integrations.jobs`; ambos com dedupe de 1 job pending/running por conta
+- **`apply_message_ops`** (`applyMessageOps.ts` + `folderOps.ts`): escreve em `inbox.ops`, `inbox.messages` (remap de folders pós-rename, restore em rollback), `inbox.folders` (adota nylas_folder_id no create, remap, hard-delete no delete confirmado, `sync_status='error'` em falha permanente); enfileira `nylas:sync_folders` após folder op aplicada
+- **`sync_folders`** (`syncFolders.ts`): reconcilia `inbox.folders` com GET /folders — blindagem (linha com `sync_status != 'active'` intocada), soft-delete com mensagens MANTIDAS, eleição canônica SPECIAL-USE (1 pasta por papel de sistema), `parent_id` derivado do path; atualiza `inbox.accounts.last_folder_sync_at`
 
 ---
 
