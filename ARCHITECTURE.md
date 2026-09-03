@@ -23,7 +23,7 @@ Antes de qualquer detalhe técnico, estes princípios governam toda decisão arq
 
 **Nunca processar na hora de receber.** Todo evento externo é salvo primeiro, processado depois. Receber é O(1). Processar pode levar o tempo que precisar.
 
-**Idempotência em toda entrada — em duas camadas.** Camada 1: `ON CONFLICT DO UPDATE` na transação com chave `(tenant_id, source_name, external_id)` — atualiza status apenas em transições válidas (ex: pending → paid), nunca retrocede (paid permanece paid exceto para refunded). Camada 2: analytics pipeline só roda na transição para `paid` — novo insert paid ou mudança pending → paid. Status igual ao anterior = skip. Evento duplicado não duplica ledger nem state.
+**Idempotência em toda entrada — em duas camadas.** Camada 1: `ON CONFLICT DO UPDATE` na transação com chave `(tenant_id, source_name, external_transaction_id)` — atualiza status apenas em transições válidas (ex: pending → paid), nunca retrocede (paid permanece paid exceto para refunded). Camada 2: analytics pipeline só roda na transição para `paid` — novo insert paid ou mudança pending → paid. Status igual ao anterior = skip. Evento duplicado não duplica ledger nem state.
 
 **Falha isolada por tenant.** Um tenant com automação em loop não pode degradar os outros. Filas e rate limiting garantem isso.
 
@@ -292,7 +292,7 @@ O banco nunca vê além deste contrato. O mapper de cada provider é responsáve
 
 **Campos obrigatórios de identidade:**
 - `_version: 1` e `_schema: 'normalized_transaction_v1'` — versão desconhecida = erro por item, batch continua
-- `external_id` — ID único no provider, chave de idempotência
+- `external_transaction_id` — ID único no provider, chave de idempotência. **Atenção:** o nome do campo no JSON é `external_transaction_id` (é o que `process_transactions_batch` lê via `v_tx->>'external_transaction_id'`). Enviar `external_id` faz o campo ser silenciosamente ignorado e a transação entra sem ID — perdendo a idempotência.
 - `source_name` — `'doare'` | `'eduzz'` | `'hotmart'` | `'stripe'`
 - `source_type` — `'webhook'` | `'integration'` | `'manual'`
 - `email` — chave de upsert do contato
