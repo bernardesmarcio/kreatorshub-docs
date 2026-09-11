@@ -2626,6 +2626,14 @@ Construir UI específica para Phase 3 não justifica investimento — duplicaria
 
 ---
 
+## Email builder — contrato de edição e renderização (2026-09-10)
+
+O builder mantém `design_json` como fonte de verdade. Campos textuais de título, hero, produto e CTA aceitam strings antigas ou HTML sanitizado; labels de CTA permitem somente elementos inline, com URL separada. `block.props.mobile` é opcional e aditivo (`fontSize`, `padding`, `stackColumns`); ausência preserva os valores desktop. `designToHtml` emite classes estáveis por bloco. `renderEmail`/`renderEmailSync` reaplicam CSS responsivo validado após o hardener, garantindo sua presença no HTML de envio.
+
+O callback de salvamento retorna a Promise da API; o editor serializa requisições, captura o conteúdo inline antes da compilação e exibe “Salvo” somente após confirmação. Biblioteca de blocos e recuperação de versões usam localStorage separado por tenant (e entidade para versões), sem nova tabela. Não representam histórico compartilhado no servidor. A revisão editorial não altera os gates de envio.
+
+Renderer compartilhado atualizado para `1.1.0`, mantendo `MIN_ACCEPTED_RENDERER_VERSION` e suporte a campanhas anteriores. Frontend e worker devem publicar a constante compartilhada juntos; o worker continua consumindo o HTML compilado e registra drift de versão. Detalhes e validação: `docs/EMAIL_BUILDER_UX_PLAN.md`.
+
 ## 22.13 Email Importer — Render parity invariant
 
 **Plan ref:** P-IMPORT v3.2, Sprint 3 (PRs #6, #7, #8, #11).

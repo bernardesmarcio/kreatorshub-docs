@@ -7,6 +7,17 @@
 
 ---
 
+## Email builder — contrato aditivo (2026-09-10)
+
+| Contrato | Writers | Readers / compatibilidade |
+|---|---|---|
+| Rich text em título/hero/produto/CTA | IframeCanvas, Inspector | `mjmlRenderer` aceita texto antigo e HTML sanitizado; CTA conserva URL separada |
+| `block.props.mobile` opcional | Inspector | `mobileOverrides`, `designToHtml`, `renderEmail`/`renderEmailSync`; ausência usa desktop; CSS reaplicado após hardener |
+| HTML compilado / renderer `1.1.0` | CampaignEditor e TemplateEditor via renderer canônico; exports do editor | email-campaign worker consome HTML e compara constante compartilhada; versão mínima aceita permanece inalterada |
+| Biblioteca e versões locais | BlockPalette, useDesignPersistence | Biblioteca por tenant; recuperação por tenant/entidade; sem alteração de schema nem sincronização entre dispositivos |
+
+Frontend e worker compartilham `workers/shared/src/email-renderer-version.ts`. Publicar ambos ao promover esta alteração. O formato `design_json` mantém versão e propriedades anteriores; não há remoção de campos.
+
 ## Queue Routing Map
 
 > **REGRA R33**: Job enfileirado na tabela/worker errado fica pending infinitamente sem erro.
