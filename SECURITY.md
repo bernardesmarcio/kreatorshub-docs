@@ -1,8 +1,8 @@
 # KreatorsHub — Security Architecture & Compliance Roadmap
 
 ## Estado: Sprint 5 — Completo ✅ | Auditoria factual: 2026-03-20
-## Última atualização: 2026-03-20
-## Versão: 1.5
+## Última atualização: 2026-10-22
+## Versão: 1.8
 
 ---
 
@@ -601,6 +601,59 @@ Todos: INSERT + UPDATE + DELETE → `audit.log_change()`
 | Audit (actions) | 7 anos | Compliance |
 | Application logs | 90 dias | Debugging |
 | Access logs | 1 ano | Security |
+
+### 9.6 Trilha de consentimento de email — `email.consent_audit_log` (2026-10-20)
+
+**Status:** ✅ Implementado (Onda 1 de `docs/EMAIL_UNSUBSCRIBE_AUDIT.md`; ver ARCHITECTURE §22.16 e R59).
+
+| Controle | Implementação |
+|----------|---------------|
+| Imutabilidade | Trigger `trg_consent_audit_log_append_only` (BEFORE UPDATE/DELETE) + `trg_consent_audit_log_no_truncate` levantam `42501` para qualquer papel. Retenção só por migration explícita. |
+| RLS | Habilitado, **sem policies** (deny-all). `REVOKE ALL` de `PUBLIC`/`anon`/`authenticated`; `service_role` só `SELECT` (BYPASSRLS). |
+| Escrita | Apenas funções SECURITY DEFINER (`search_path=''`): `email.apply_consent_change`, `email.apply_consent_changes`, `email.log_consent_error` — EXECUTE só `service_role`. Helpers internos (`consent_normalize_input`, `consent_state_snapshot`, `consent_audit_write`, `consent_upsert_unsubscribe`, `consent_cancel_journey_enrollments`, `hash_ip`) sem EXECUTE para nenhum papel de API. |
+| Leitura pela UI | `api.get_consent_history(p_tenant_id, p_email, p_limit)` — `app_auth.assert_tenant_access` (R56) + `core.is_tenant_admin` (owner/admin ou system admin). Member/viewer recebe `42501`; outro tenant recebe `tenant_access_denied`. Testado em 2026-10-20. |
+| IP | Nunca em claro na trilha: `ip_hash` = HMAC-SHA256 (`email.hash_ip`) com segredo no Supabase Vault `consent_ip_hash_secret` (gerado no banco; fallback GUC `app.ip_hash_secret`; sem segredo → NULL). `request_payload` tem `ip`/`ip_address`/`token` removidos. |
+| Payload | `user_agent` ≤ 512, `error_message` ≤ 2000, email `lower(btrim())` por CHECK. |
+| Isolamento | `send_id`/`recipient_id`/`campaign_id`/`group_id` de outro tenant são descartados (warning) antes de gravar. |
+
+**Onda 2.5 (2026-10-21, migration `20261021120200_consent_rls_and_ip_cleanup`, aplicada):**
+
+| Controle | Implementação |
+|----------|---------------|
+| RLS `email.unsubscribes` | Removida "Tenants can manage their own unsubscribes" (`ALL`, sem `with_check`). Restam 2 policies `SELECT` por membership (`core.tenant_users`) — duplicadas, inofensivas. GRANT de `authenticated`: só `SELECT`. Testado como `authenticated` member: SELECT vê só o próprio tenant; INSERT/UPDATE/DELETE → `42501`. |
+| RLS `email.suppression_list` | Removida "Tenants can manage their own suppression list". Resta `SELECT` por membership, mas `authenticated` não tem GRANT na tabela (já era assim; nenhuma tela lê direto). INSERT/UPDATE → `42501`. |
+| Escrita | Só `service_role` via `email.apply_consent_change` (R59) ou as RPCs `api.*` abaixo. |
+| IP bruto | `email.consent_normalize_input` não emite mais `ip_raw` e `email.consent_upsert_unsubscribe` ignora `p_ip`: `apply_consent_change` grava `NULL` em `unsubscribes.ip_address`, `unsubscribe_feedback.ip_address` e `email_events.ip_address`. `ip_hash` continua na trilha. Históricos anonimizados: 1.592 (`unsubscribes`), 210 (`unsubscribe_feedback`), 3 (`email_events` de consentimento: unsubscribe/group_unsubscribe/group_resubscribe/spamreport). Colunas mantidas (deprecated) porque a UI legada ainda as seleciona. |
+
+**RPCs novas da Onda 2 (2026-10-21)** — `SECURITY DEFINER`, `search_path=''`, EXECUTE `authenticated`+`service_role` (sem `anon`), `app_auth.assert_tenant_access` (R56) + `core.is_tenant_admin` (owner/admin ou system admin; member → `42501`, outro tenant → `tenant_access_denied`). Testadas em transação com rollback.
+- `api.set_campaign_message_type(p_tenant_id, p_campaign_id, p_message_type, p_reason, p_group_id default null)` — trilha em `email.campaign_type_changes` (RLS sem policies, sem grants a anon/authenticated).
+- `api.deactivate_unsubscribe_group(p_tenant_id, p_group_id, p_strategy, p_target_group_id default null)` — conversões via `email.apply_consent_changes` (`channel=admin_manual`, `actor_user_id=auth.uid()`), auditadas em `consent_audit_log`.
+- Trigger `email.campaign_sends_validate_message_type()` (SECURITY DEFINER só para ler o motivo da campanha; sem EXECUTE para papéis de API).
+
+**Dívida aberta:** `email.email_events.ip_address` e `raw_payload.ip` de open/click continuam com IP bruto vindo do webhook SendGrid (`integrations-worker/handlers/sendgrid.ts`, `insertEmailEventOnce`). `UnsubscribeGroupDetail.tsx` ainda seleciona `ip_address` (agora sempre NULL; remoção da exibição em andamento na Onda 2). Política "manage" `ALL` sem `with_check` também existe em `email.unsubscribe_groups` (fora do escopo; a UI grava grupos direto). Advisor: `api.get_consent_history`, `api.set_campaign_message_type` e `api.deactivate_unsubscribe_group` aparecem como "SECURITY DEFINER executável por authenticated" e `email.campaign_type_changes` como "RLS sem policy" — intencionais (padrão dos wrappers `api.*` / deny-all).
+
+**Onda 3 (2026-10-22) — token, rate limit e Sentry (edge functions não deployadas; migrations aplicadas):**
+
+| Controle | Implementação |
+|----------|---------------|
+| Validade do token de preferências | `_shared/preferenceCenter.ts` (`PREFERENCES_TOKEN_MAX_AGE_SECONDS = 90 dias`, campo `i` do token HMAC). Descadastrar **nunca** expira: `global_unsubscribe`, `save_groups` só com `subscribed=false`, one-click e POST legado de `unsubscribe` aceitam token de qualquer idade (compliance: o link de descadastro tem de funcionar sempre). `load`, `preferences_view`, `global_resubscribe`, `save_groups` com algum `subscribed=true` e `feedback` exigem token ≤ 90 dias; senão `400 token_expired` com `message` ("Este link é antigo; use o link de um email recente.") e `unsubscribe_allowed:true`, nada gravado. Token sem `i` conta como expirado. Feedback junto com descadastro em token expirado é descartado (`feedback_saved:false`). Reativação continua exigindo double opt-in fora da janela de 7 dias / origem `preference_center` (Onda 2.3). |
+| Rate limit do email de confirmação | ≤ 3 por email+tenant em 24 h (`MAX_RESUBSCRIBE_REQUESTS`), contados na própria trilha: `email.count_recent_resubscribe_requests(p_tenant_id, p_email, p_hours)` (linhas `preferences_view` com `request_payload.double_opt_in.status='requested'`). A partir do 4º: `429 too_many_requests`, nada aplicado, nenhum email. Falha da contagem → 500 (fail-closed). |
+| Rate limit do `load` | ≤ 60/h por IP (`LOAD_RATE_LIMIT_PER_HOUR`) via `email.count_recent_preference_loads_by_ip(p_ip, p_minutes)`: o IP bruto só entra como argumento e é hasheado dentro do banco (`email.hash_ip`), conta `preferences_view`/`preference_center` do mesmo `ip_hash`. Fail-open (contagem falhou ou sem segredo de hash → não bloqueia). Índice `idx_consent_audit_ip_time`. Não cobre `unsubscribe` GET/POST (descadastro não pode ser bloqueado). |
+| Privilégios | As duas funções de contagem: SECURITY DEFINER, `search_path=''`, EXECUTE só `service_role` (anon testado → `42501`). |
+| Sentry nas edge functions | `_shared/sentry.ts`: envelope HTTP direto (sem SDK), `SENTRY_DSN` (opcional `SENTRY_ENVIRONMENT`, `SENTRY_RELEASE`); sem DSN = no-op. Tag `feature:email-consent`. Captura: exceções/500 inesperados em `save-preferences`, `unsubscribe`, `webhooks-sendgrid` e no handler `sendgrid:suppression_event` do `integrations-worker`; rejeições da RPC com `invalid_group`/`invalid_tenant`; toda chamada de `email.log_consent_error` (`_shared/consent.ts`, um evento por lote). **Nunca** envia token, email completo ou IP: `scrubText` mascara emails, troca `token=`/`confirm=`/Bearer/tokens HMAC e literais IPv4/IPv6; chaves de `extra` com cara de dado sensível (`token`, `email`, `ip`, `authorization`, `secret`, `password`, `cookie`, `key`) são descartadas — só `email_masked`. Nenhum request, header ou usuário é anexado. Entrega com timeout de 2 s via `EdgeRuntime.waitUntil`; falha de entrega é engolida. |
+| Advisors | Só o padrão conhecido: `api.get_campaign_unsubscribe_stats` e `api.get_tenant_consent_summary` como "SECURITY DEFINER executável por authenticated" (wrappers `api.*` com `app_auth.assert_tenant_access`; outro tenant → `tenant_access_denied`, anon → `42501`, testado). |
+
+### 9.7 Webhook SendGrid — assinatura obrigatória (2026-10-20)
+
+**Status:** 🟡 Código pronto, **não deployado**; depende de configuração manual (Onda 1b de `docs/EMAIL_UNSUBSCRIBE_AUDIT.md`, P2).
+
+| Controle | Implementação |
+|----------|---------------|
+| Verificação | `supabase/functions/_shared/sendgridSignature.ts`: ECDSA P-256/SHA-256 sobre `timestamp + corpo bruto`; aceita chave base64 SPKI com ou sem PEM; converte assinatura DER (formato da SendGrid) para P1363 antes do `crypto.subtle.verify` (a versão anterior passava DER direto e rejeitaria toda assinatura real). |
+| Política | Com `SENDGRID_WEBHOOK_VERIFICATION_KEY` definido: cabeçalho `x-twilio-email-event-webhook-signature`/`-timestamp` ausente ou assinatura inválida → **403**, nada é gravado nem enfileirado, log `sendgrid_webhook_rejected`. Sem a env (transição): aceita como antes, loga `sendgrid webhook unsigned (verification key not configured)` uma vez por request e grava `integrations.webhook_events.signature_valid=false` (antes ficava NULL). |
+| Escrita de consentimento | Supressões do webhook passam por `email.apply_consent_change` (`channel=webhook_sendgrid`, R59) com trilha em `email.consent_audit_log`; `request_payload` sem IP/user-agent/URL. |
+| Pendente (manual) | Ligar "Signed Event Webhook" na SendGrid (Settings → Mail Settings → Event Webhook → Security features → Enable Signed Event Webhook), copiar a Verification Key e configurar o secret `SENDGRID_WEBHOOK_VERIFICATION_KEY` nas envs da Edge Function `webhooks-sendgrid`; depois deployar a função. Sem isso, qualquer um que conheça um UUID de tenant pode forjar bounce/spamreport. |
+| Não coberto | Janela anti-replay por timestamp (SendGrid reenvia por até 72h; a deduplicação é pela `idempotency_key` `sendgrid:<tenant>:<sg_event_id>`). |
 
 ---
 
@@ -2002,6 +2055,17 @@ Ações que geram audit log obrigatório:
 # PARTE G — HISTÓRICO
 
 ## 26. Changelog
+
+### 2026-10-22 — Consentimento de email, Onda 3 (backend)
+- §9.6: token do centro de preferências vale 90 dias para ver/reativar/feedback (descadastro nunca expira); ≤ 3 emails de confirmação de reativação por email+tenant/24 h e `load` ≤ 60/h por `ip_hash`, contados em `email.consent_audit_log` (funções `email.count_recent_*`, só `service_role`).
+- Sentry nas edge functions de consentimento (`_shared/sentry.ts`, `SENTRY_DSN`, `feature:email-consent`) sem token, email completo ou IP.
+- RPCs de leitura `api.get_campaign_unsubscribe_stats` / `api.get_tenant_consent_summary` (membros do tenant via `assert_tenant_access`).
+- Edge functions e worker não deployados.
+
+### 2026-10-20 — Webhook SendGrid assinado + consentimento via RPC
+- §9.7: `webhooks-sendgrid` exige assinatura quando `SENDGRID_WEBHOOK_VERIFICATION_KEY` existe (403 sem cabeçalho/assinatura inválida); sem a env grava `signature_valid=false`. Verificação DER→P1363 corrigida. Não deployado.
+- `public.cancel_enrollments_on_global_unsubscribe`: EXECUTE revogado de `PUBLIC`/`anon`/`authenticated` (só `service_role`) ao corrigir a função (antes quebrada, agora delega a `email.consent_cancel_journey_enrollments`).
+- Removido `supabase/functions/eduzz-processor-worker/handlers/sendgrid.ts` (código morto).
 
 ### 2026-08-22 — Auditoria de segurança + correções de vazamento cross-tenant
 

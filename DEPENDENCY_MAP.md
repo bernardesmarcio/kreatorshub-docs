@@ -3,7 +3,7 @@
 > **REGRA R37**: Antes de alterar qualquer item listado aqui, verificar TODOS os readers/writers.
 > Atualizar este arquivo sempre que adicionar novo consumidor.
 >
-> Gerado em: 2026-03-19 · Última atualização: 2026-08-27
+> Gerado em: 2026-03-19 · Última atualização: 2026-10-22
 
 ---
 
@@ -35,6 +35,7 @@ Frontend e worker compartilham `workers/shared/src/email-renderer-version.ts`. P
 | `journeys.processing_jobs` | journeys-worker | `journeys.claim_next_job(worker_id)` | `check_segment_entries`, `check_form_entries`, `check_event_entries`, `process_enrollment`, `link_submission_to_lead` |
 | `journeys.processing_jobs` | email-campaign-worker | `journeys.claim_next_job(worker_id)` | `prepare_email_batch`, `send_email_batch`, `retry_soft_bounce` |
 | `journeys.event_processing_jobs` | journeys-event-worker APENAS | FOR UPDATE SKIP LOCKED direto | Status-based (`pending`/`retry`), sem job_type — processa todos os eventos disponíveis |
+| `journeys.backfill_jobs` | journeys-event-worker APENAS (loop de backfill, tick 5s) | `claimBackfillJobs` — UPDATE … FOR UPDATE SKIP LOCKED direto (pending/retry prontos + running com claim > 10 min) | N/A (1 job por jornada, UNIQUE `journey_id`); 1 lote de 500 por claim |
 | `analytics.segment_eval_queue` | segment-eval-worker (analytics) | `analytics.claim_next_jobs` | N/A (item-based, não job_type) |
 | `analytics.segment_refresh_queue` | DB-only (RPC) | `analytics.process_segment_refresh_queue()` | N/A (item-based) |
 
@@ -245,7 +246,12 @@ Antes de implementar qualquer novo pipeline, responder:
 - **Readers:**
   - `src/pages/admin/CampaignSend.tsx:426`, `CampaignResults.tsx:143`, `Campaigns.tsx:179`, `JourneyAnalytics.tsx:352`
   - `workers/email-campaign/src/handlers/sendEmailBatch.ts:119` — load send for processing
+  - `api.get_campaign_unsubscribe_stats` (Onda 3) — filtra `send_id`s do tenant; `delivered_count` como fallback de entregues
+  - `api.get_tenant_consent_summary` (Onda 3) — contagem de envios marketing/transacional e `sum(sent_count)` transacional na janela (`is_test` fora; status `cancelled/scheduled/pending/draft` fora; data `coalesce(started_at, created_at)`)
 - **Colunas de rastreabilidade (Guard 1):** `recipient_source` (segment/manual/all/test), `segment_ids` (uuid[]), `segment_parties_snapshot` (int), `recipient_count_at_send` (int). Adicionadas Sprint 12 para auditoria de blast radius.
+- **Validação no banco (R60, 2026-10-21, migration `20261021120000_campaign_message_type_validation`):** trigger `trg_campaign_sends_validate_message_type` (BEFORE INSERT OR UPDATE OF `message_type, group_id, transactional_reason`) → `email.campaign_sends_validate_message_type()`. Marketing sem `group_id` → `marketing_requires_group`; grupo de outro tenant → `invalid_group`; transacional → `group_id` forçado a NULL e `transactional_reason` obrigatório quando `is_test=false` (vem do send ou, se ausente, de `email_campaigns.transactional_reason`) → senão `transactional_requires_reason`. Todos SQLSTATE `23514`. Em UPDATE só valida quando essas colunas mudam de fato; SET NULL da FK de grupo é aceito. **Todo writer novo** de `campaign_sends` precisa mandar grupo (marketing) ou ter motivo na campanha (transacional).
+  - `workers/journeys/src/handlers/processJourneyNode.ts` passa `transactional_reason` da campanha e trata a rejeição (`sendValidationErrorCode`): nó falha uma vez com mensagem clara, sem retry (não deployado).
+  - `supabase/functions/process-journey/index.ts` (legado, sem callers conhecidos) insere sem `message_type`/`group_id` → seria rejeitado por `marketing_requires_group`.
 - **Regra:** NÃO contém lista de recipients. É apenas metadados (template, subject, status, counts). A lista real está em `campaign_recipients`.
 
 ### email.campaign_recipients — Lista congelada de envio (R38)
@@ -256,48 +262,118 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/journeys/src/handlers/processJourneyNode.ts:1652` — INSERT: single recipient (journey worker)
   - `workers/email-campaign/src/handlers/sendEmailBatch.ts:376,393,408` — UPDATE status → `skipped` (suppressed/unsubscribed)
   - `workers/email-campaign/src/handlers/sendEmailBatch.ts:503,520,561` — UPDATE status → `sent`/`pending`/`failed`
-  - `workers/email-campaign/src/handlers/retrySoftBounce.ts:126,301,333` — UPDATE status (bounce retry)
+  - `workers/email-campaign/src/handlers/retrySoftBounce.ts` — UPDATE status (bounce retry; `skipped` quando marketing e descadastrado global/grupo, mesmo `error_message` do lote — 2026-10-20)
   - `supabase/functions/integrations-worker/handlers/sendgrid.ts:82,99` — UPDATE tracking fields via `sendgrid_message_id`
-  - `supabase/functions/unsubscribe/index.ts:280` — UPDATE status on unsubscribe
+  - ~~`supabase/functions/unsubscribe/index.ts` UPDATE direto no one-click~~ — desde a Onda 1b (2026-10-20, não deployado) o one-click passa por `email.apply_consent_change` (`channel=one_click`)
+  - `email.apply_consent_change` — UPDATE `unsubscribed_at` (1ª vez vence) em todo descadastro com destinatário resolvido; `status='unsubscribed'` só no one-click global
+  - `workers/email-campaign/src/handlers/sendEmailBatch.ts` / `retrySoftBounce.ts` — UPDATE `status='failed'`, `error_message='preference_center_url_unavailable'` em marketing quando o tenant não tem domínio e `PREFERENCE_CENTER_FALLBACK_URL` não existe (P18, Onda 3, não deployado)
+  - Migration `20261022120300_consent_backfill_d3_d4` (D4, aplicada) — preencheu `unsubscribed_at` em 1.607 linhas a partir de `unsubscribes.send_id` (sem tocar `status`)
 - **Readers:**
   - `workers/email-campaign/src/handlers/prepareEmailBatch.ts:76` — COUNT pending recipients
   - `workers/email-campaign/src/handlers/sendEmailBatch.ts:616,650,677,684` — COUNT by status (completion checks)
   - `workers/email-campaign/src/handlers/retrySoftBounce.ts:90` — SELECT single recipient for retry
   - `supabase/functions/webhooks-sendgrid/index.ts:131` — lookup `tenant_id` by `sendgrid_message_id`
   - `src/pages/admin/CampaignSend.tsx:502` — SELECT failed/bounced for display
-  - `src/pages/admin/CampaignResults.tsx:186` — SELECT all (non-skipped) for results view
+  - `src/pages/admin/CampaignResults.tsx:186` — SELECT all (non-skipped) for results view; desde a Onda 3 a tabela "Contatos que cancelaram" e o fallback do card "Descadastros" usam `unsubscribed_at` (não mais `status='unsubscribed'`, que só o one-click grava)
   - `workers/journeys/src/handlers/processJourneyNode.ts:1615` — SELECT dedup guard (already sent?)
+  - `api.get_campaign_unsubscribe_stats` (Onda 3) — `delivered_at`, `unsubscribed_at`, `spam_reported_at` por envio (métrica de descadastro/spam da UI de resultados)
+    - UI (Onda 3, não deployado): `src/lib/email/consentMetrics.ts` `fetchCampaignUnsubscribeStats()` (lotes de 500 `send_id`s = limite da RPC; taxas recalculadas no front a partir das contagens) → `CampaignResults.tsx` (cards "Descadastros"/"Reclamações de spam" + banner de alerta) e `Campaigns.tsx` (uma chamada com todos os envios das campanhas `sent`; taxa na linha e no painel "Metricas"). Alerta > 0,5% descadastro / > 0,1% spam com ≥ 100 entregues.
 - **Regra R38:** Lista CONGELADA de recipients. O email-campaign-worker é blind sender — só processa o que está aqui. Nunca re-avaliar segmento no momento do envio. Se 0 rows para um `campaign_send_id`, o envio não acontece (fail-closed by design).
 
 ### email.suppression_list — Bounce/spam suppression
 
-- **Writers:**
-  - `supabase/functions/integrations-worker/handlers/sendgrid.ts:173-201` — INSERT/UPDATE: soft_bounce, hard_bounce, spam, blocked
-  - `supabase/functions/eduzz-processor-worker/handlers/sendgrid.ts:173-201` — (duplicate handler)
+- **Writer canônico (R59, 2026-10-20):** `email.apply_consent_change` (action `suppress`/`unsuppress`; tipos `hard_bounce|spam_report|invalid|unsubscribe|manual`). `spam_report`/`unsubscribe` também gravam descadastro global.
+- **Via RPC (Onda 1b, 2026-10-20 — não deployado):** `supabase/functions/integrations-worker/handlers/sendgrid.ts` `handleSuppression()` — hard_bounce (`bounce` type=bounce), invalid (`dropped`), spam_report (`spamreport`), unsubscribe (`unsubscribe`) via `applyConsentChange` (`_shared/consent.ts`, `channel=webhook_sendgrid`); erro da RPC lança e o job é re-tentado.
+- **Writers diretos (exceções da R59):**
+  - `supabase/functions/integrations-worker/handlers/sendgrid.ts` `handleSoftBounceCounter()` — INSERT/UPDATE soft_bounce (contador/threshold; `bounce` não-hard e `blocked`). Erros agora lançam (antes eram ignorados).
+  - `email.expire_soft_bounce_suppressions()` (pg_cron/worker) — UPDATE is_active=false de soft bounce expirado (housekeeping, exceção documentada na R59)
 - **Readers:**
-  - `workers/email-campaign/src/handlers/sendEmailBatch.ts:214` — SELECT suppressed emails (pre-send gate)
-  - `workers/email-campaign/src/handlers/retrySoftBounce.ts:115` — SELECT before retry
-  - `workers/journeys/src/handlers/processJourneyNode.ts:1528` — SELECT before journey send
+  - `api.get_tenant_consent_summary` (Onda 3) — ativos por `suppression_type` (exclui soft bounce expirado). `suppression_list` não tem `send_id`: o spam por envio vem de `email_events`/`campaign_recipients`.
+    - UI: `TenantConsentSummaryCard` (suprimidos por tipo) e `estimateBlockedRecipients()` (soma de `suppressed_by_type` no "até N podem ser pulados" de `CampaignSend.tsx`). O front não tem GRANT em `suppression_list`; esta RPC é o único caminho.
+  - Migration `20261022120300_consent_backfill_d3_d4` (D3) — leu `spam_report` ativos sem global
+  - `workers/email-campaign/src/handlers/sendEmailBatch.ts:253` — SELECT suppressed emails (pre-send gate)
+  - `workers/email-campaign/src/handlers/retrySoftBounce.ts:120` — SELECT before retry
+  - `workers/journeys/src/handlers/processJourneyNode.ts:1883` — SELECT before journey send
+  - `email.consent_state_snapshot()` — before/after da trilha de consentimento
 - **Regra:** Check obrigatório antes de qualquer envio. Tripla camada: suppression + global unsub + group unsub.
 
 ### email.unsubscribes — Global/group unsubscribes
 
-- **Writers:**
-  - `supabase/functions/integrations-worker/handlers/sendgrid.ts:217` — UPSERT on SendGrid unsubscribe/spamreport event
-  - `supabase/functions/unsubscribe/index.ts:230` — UPSERT global unsubscribe (one-click link)
-  - `supabase/functions/save-preferences/index.ts:246,286,314,340` — UPSERT/UPDATE global + group unsub/resub
+- **Writer canônico (R59, 2026-10-20):** `email.apply_consent_change` / `email.apply_consent_changes` (SECURITY DEFINER, service_role) via `supabase/functions/_shared/consent.ts`. Upsert global usa o índice parcial `idx_unsubscribes_tenant_email_global`; grupo usa a constraint `unsubscribes_tenant_id_email_group_id_key`.
+- **Via RPC (Onda 1b, não deployado):** webhook SendGrid `spamreport`/`unsubscribe` → `email.apply_consent_change` `suppress` (`spam_report`/`unsubscribe`) grava também o global (`source=webhook`) — substitui o upsert quebrado (P3). `group_unsubscribe`/`group_resubscribe` da SendGrid só gravam `email_events` (grupo ASM não mapeia para `email.unsubscribe_groups`).
+- **Via RPC (Onda 1b — página e edge functions, 2026-10-20, não deployado):**
+  - `supabase/functions/unsubscribe/index.ts` → `_shared/unsubscribeEndpoint.ts` — POST one-click: `apply_consent_change` global `channel=one_click` (POST sem corpo one-click: `footer_get`); GET só `preferences_view`
+  - `supabase/functions/save-preferences/index.ts` → `_shared/preferenceCenter.ts` — `apply_consent_changes` `channel=preference_center` (actions `global_unsubscribe`/`global_resubscribe`/`save_groups`/`feedback`; contrato em `docs/EMAIL_UNSUBSCRIBE_AUDIT.md` "Execução — Onda 1b (página e edge functions)")
+- **Writers legados:** nenhum nas edge functions (o upsert direto foi removido de `unsubscribe` e `save-preferences`).
+  - ~~`supabase/functions/eduzz-processor-worker/handlers/sendgrid.ts`~~ — removido em 2026-10-20 (código morto, P19)
+- **Via RPC (Onda 2.2, 2026-10-21):** `api.deactivate_unsubscribe_group(...)` — `convert_to_global`/`migrate_to_group` geram unsubs via `email.apply_consent_changes` (`channel=admin_manual`, `request_payload.reason='group_deactivated'`).
+- **Via RPC (Onda 3, 2026-10-22):** `email.apply_consent_change` `resubscribe` global com `channel=preference_center` (inclui o `confirm_resubscribe` do double opt-in) também faz `is_active=false` nos unsubs ativos de grupos INATIVOS do mesmo email/tenant (ids em `request_payload.inactive_groups_cleared`, uma linha de auditoria). Migration `20261022120300_consent_backfill_d3_d4` (D3) criou 49 globais `source='manual'` (`channel=system`, `request_id='backfill_spam_report_D3_20261022'`) para spam_report ativos sem global.
+- **FK `unsubscribes_group_id_fkey`:** `ON DELETE RESTRICT` desde 2026-10-21 (antes CASCADE apagava o histórico). Grupo com unsubs não pode ser excluído; o caminho é desativar. Cascata de exclusão de tenant testada e funcionando.
+- **IP:** `ip_address` sempre NULL desde 2026-10-21 (Onda 2.5; históricos anonimizados). IP só como `ip_hash` em `consent_audit_log`.
 - **Readers:**
-  - `src/pages/admin/UnsubscribeGroupDetail.tsx:87` — SELECT for group detail
+  - `workers/email-campaign/src/unsubscribeFilter.ts` `loadActiveUnsubscribes()` — SELECT global + unsubs de grupo INATIVO (valem como global, R60) + grupo do envio; usado por `sendEmailBatch.ts` (pre-send gate, relido a cada lote) e por `retrySoftBounce.ts` (P11). Transacional não checa. Skip `inactive_group_unsubscribe` grava `error_message` próprio. Não deployado.
+  - `workers/journeys/src/handlers/processJourneyNode.ts` `executeSendEmailNode` — SELECT global + grupo inativo (R60, output `inactive_group_unsubscribed`) e depois grupo da campanha, antes do envio da jornada (não deployado)
+  - Mesma regra nas duas cópias: mudou uma, mude a outra.
+  - `email.get_preference_center_data()` — página de preferências (via save-preferences `action=load`; email devolvido mascarado)
+  - `src/pages/admin/UnsubscribeGroupDetail.tsx:87` — SELECT for group detail (sem `ip_address` desde a Onda 2.5)
   - `src/pages/admin/UnsubscribeGroups.tsx:87` — SELECT for group counts
+  - `src/lib/email/unsubscribeGroups.ts` `countActiveGroupUnsubscribes()` — count exato por `group_id` ativo no diálogo "Desativar grupo" (Onda 2.2)
+  - `supabase/functions/_shared/preferenceCenter.ts` `loadActiveUnsubscribesFromDb()` — SELECT `group_id, source` ativos + `unsubscribe_groups.is_active` dos grupos (service role) para o gate de double opt-in do save-preferences (Onda 2.3): reativação imediata só se `source='preference_center'` e token ≤ 7 dias. Desde a Onda 3 o `global_resubscribe` também considera as linhas de grupos INATIVOS. Mudar valores de `source` exige revisar `DIRECT_RESUBSCRIBE_SOURCES`.
+  - `api.get_campaign_unsubscribe_stats` (Onda 3) — emails distintos com `send_id` do envio (ativos ou não); índice parcial novo `idx_unsubscribes_send`
+  - `api.get_tenant_consent_summary` (Onda 3) — contagens de ativos (global / grupo ativo / grupo inativo / pessoas bloqueadas) e descadastros na janela por `unsubscribed_at`
+    - UI (Onda 3, não deployado): `src/components/email/TenantConsentSummaryCard.tsx` no topo de `UnsubscribeGroups.tsx` (7/30/90 dias; `42501` esconde o card) via `fetchTenantConsentSummary()` (`src/lib/email/consentMetrics.ts`)
+  - `src/lib/email/consentMetrics.ts` `estimateBlockedRecipients()` (Onda 3, P21) — count exato (head) de ativos global + grupo do envio + grupos inativos, para o "até N podem ser pulados" de `CampaignSend.tsx` (marketing; transacional não lê). Teto, não interseção com o segmento.
+  - `email.consent_state_snapshot()` — before/after da trilha de consentimento
+
+### email.unsubscribe_groups — Grupos de descadastro
+
+- **Writers:** UI `UnsubscribeGroups.tsx` (INSERT/UPDATE de nome/descrição direto por RLS; desativação só por `api.deactivate_unsubscribe_group` via `DeactivateUnsubscribeGroupDialog` desde a Onda 2 — UPDATE direto de `is_active` removido da UI, não deployado), `api.deactivate_unsubscribe_group` (UPDATE `is_active=false`).
+- **Readers que dependem de `is_active`:** `email.apply_consent_change` (rejeita descadastro/reativação de grupo inativo: `invalid_group`), `api.set_campaign_message_type` (marketing exige grupo ativo), `unsubscribeFilter.ts` e `processJourneyNode.ts` (unsub de grupo inativo = global, R60), `email.get_preference_center_data` (lista só ativos), `src/lib/email/consentMetrics.ts` `estimateBlockedRecipients()` (ids de grupos inativos entram na estimativa de pulados, R60).
+- **Lacuna conhecida:** quem tem unsub ativo num grupo inativo fica bloqueado para marketing, mas a página de preferências não mostra esse grupo nem o trata como global; "voltar a receber" (resubscribe global) não remove esse bloqueio.
+
+### email.campaign_type_changes — Trilha de troca de tipo de campanha (2026-10-21)
+
+- **Writer:** `api.set_campaign_message_type` (só quando algo muda). RLS sem policies, sem grants a anon/authenticated; service_role SELECT/INSERT.
+- **Readers:** nenhum na UI ainda (operacional via service_role).
+
+### email.email_campaigns.message_type / transactional_reason (R60)
+
+- **Writers:** `api.set_campaign_message_type` (owner/admin; transacional exige motivo e zera `group_id`; marketing exige grupo ativo). A UI legada ainda faz UPDATE direto de `message_type` (sem motivo) até o deploy da Onda 2 — campanha virada para transacional por esse caminho depois do backfill fica sem motivo e seus envios não-teste são rejeitados pela trigger de `campaign_sends` (`transactional_requires_reason`). Na Onda 2 (interface, não deployado) a UI passa a usar a RPC: `CampaignEditor.tsx` → `CampaignMessageTypeField` → `src/lib/email/messageType.ts` `setCampaignMessageType()`; os saves do editor não mandam mais `message_type` e só mandam `group_id` em marketing. `CampaignSend.tsx` duplica campanha copiando `transactional_reason` (transacional) e lê o motivo para o insert de `campaign_sends.transactional_reason`.
+- **Backfill 2026-10-21:** 139 campanhas transacionais receberam `transactional_reason='legacy: classificado antes da validação (2026-10-21)'` (tipo e `group_id` da campanha inalterados).
+- **Readers:** trigger de `campaign_sends` (fallback do motivo), `processJourneyNode.ts`.
+
+### email.unsubscribe_feedback — Motivo do descadastro
+
+- **Writer canônico:** `email.apply_consent_change` (action `feedback`; falha vira `result=error` na trilha sem derrubar a transação). CHECK `unsubscribe_feedback_reason_check` inclui `no_more` e `accidental` desde 2026-10-20 (P6).
+- **Writer legado:** nenhum — `save-preferences` grava feedback pela RPC desde a Onda 1b (2026-10-20, não deployado); falha → 200 `feedback_saved:false`.
+- **Readers:** UI admin de descadastros (RLS por membership).
+- **IP:** `ip_address` sempre NULL desde 2026-10-21 (Onda 2.5; 210 históricos anonimizados).
+
+### email.consent_audit_log — Trilha de consentimento (append-only, 2026-10-20)
+
+- **Writers (somente SECURITY DEFINER):** `email.apply_consent_change`/`apply_consent_changes` (via `email.consent_audit_write`), `email.log_consent_error` (caller grava erro quando a RPC lança), migration `20261020120400_consent_audit_baseline_snapshot` (`channel=system`, `request_id='baseline_snapshot_20261020'`).
+- **Readers:** `api.get_consent_history` (authenticated; membership + owner/admin), `email.get_consent_history` (service_role). Nenhum SELECT direto de anon/authenticated.
+  - Rate limit (Onda 3, 3.4): `email.count_recent_resubscribe_requests(p_tenant_id, p_email, p_hours=24)` conta `preferences_view` com `request_payload.double_opt_in.status='requested'` (save-preferences → 429 a partir do 4º pedido/24 h); `email.count_recent_preference_loads_by_ip(p_ip, p_minutes=60)` conta `preferences_view`/`preference_center` do mesmo `ip_hash` (save-preferences `load` → 429 a partir de 60/h). Ambas service_role. Quem mudar o formato de `request_payload.double_opt_in` ou o canal do `load` quebra o limite. Índice novo `idx_consent_audit_ip_time (ip_hash, occurred_at desc) where ip_hash is not null`.
+  - UI: `src/components/contacts/ConsentHistoryCard.tsx` (em `ContactDetail.tsx`, só owner/admin; `42501` esconde a seção) via `src/lib/email/consentHistory.ts` (Onda 2.2).
+- **Contrato:** UPDATE/DELETE/TRUNCATE bloqueados por trigger. `ip_hash` = `email.hash_ip()` (HMAC, segredo no Vault `consent_ip_hash_secret`). Enums de `action`/`channel`/`result` espelhados em `_shared/consent.ts` — mudar os dois juntos (R7/R31).
+
+### journeys.journey_enrollments — saída por descadastro global
+
+- `email.consent_cancel_journey_enrollments()` (chamado pela RPC de consentimento) — UPDATE `status='exited'`, `context_json.cancellation_reason='global_unsubscribe'`.
+- `public.cancel_enrollments_on_global_unsubscribe()` — corrigido em 2026-10-20 (migration `20261020130000`, aplicada): wrapper que delega a `email.consent_cancel_journey_enrollments()` (`exited`), mesma assinatura/retorno; EXECUTE só `service_role`. Sem callers nas edge functions desde a Onda 1b (2026-10-20, não deployado): `unsubscribe` e `save-preferences` usam a RPC, que já cancela as jornadas.
 
 ### email.email_events — Email engagement tracking
 
 - **Writers:**
   - `supabase/functions/integrations-worker/handlers/sendgrid.ts` — INSERT com campaign context via `resolveCampaignContext()` (open, click, delivered, bounce, etc.)
+  - `email.apply_consent_change` — INSERT `unsubscribe`/`group_unsubscribe` (`sendgrid_message_id='self:<recipient_id>'`) quando há `send_id` e o canal não é webhook
+  - ~~`supabase/functions/unsubscribe/index.ts` INSERT direto do one-click~~ — removido na Onda 1b (a RPC grava o evento)
 - **Readers:**
   - `workers/shared/src/segmentation/resolvers.ts` — `email_engagement` resolver compileSQL (EXISTS subquery por `send_id` + `event_type`)
   - `workers/analytics/src/segmentation/resolvers.ts` — mesma cópia do resolver
   - `workers/journeys/src/conditionEngine.ts` — pre-enrichment query (`extractEngagementSendIds` → `__email_engagement` no contactState)
+  - `api.get_campaign_unsubscribe_stats` (Onda 3) — `event_type='spamreport'` por envio: `send_id` da linha OU `raw_payload->>'send_id'` (custom_arg; o webhook grava spamreport sem `send_id` na coluna — só 1 de 69 tinha). Se o webhook passar a preencher a coluna, nada quebra.
+  - `api.get_tenant_consent_summary` (Onda 3) — `spamreport` distintos na janela
 - **Indexes:** `idx_email_events_send` (btree on `send_id` WHERE `send_id IS NOT NULL`)
 - **Regra R47:** Engagement data lida via subquery/enrichment, nunca materializada em `contact_state`.
 
@@ -343,7 +419,7 @@ Antes de implementar qualquer novo pipeline, responder:
 
 - **Producers:**
   - `workers/journeys-event/src/handlers/processEventJob.ts:221` — `process_enrollment`
-  - `workers/journeys-event/src/handlers/processBackfillJob.ts:332` — backfill enrollments
+  - `workers/journeys-event/src/handlers/processBackfillJob.ts` (`processBackfillJob`, CTE `jobs`) — `process_enrollment` priority 3 com `reason='backfill'` (no mesmo statement do INSERT da inscrição)
   - `supabase/functions/check-journey-entries/index.ts:364` — via `journeys.enqueue_job` RPC
   - `supabase/functions/trigger-form-journey/index.ts:319` — via `journeys.enqueue_job` RPC
 - **Consumers:** journeys-worker APENAS — via `journeys.claim_next_job` (SKIP LOCKED)
@@ -352,6 +428,35 @@ Antes de implementar qualquer novo pipeline, responder:
 
 - **Producers:** `trg_enqueue_event_processing` (trigger AFTER INSERT em journey events)
 - **Consumers:** journeys-event-worker APENAS — via claim/complete/fail cycle (SKIP LOCKED)
+
+### journeys.backfill_jobs (2026-10-16)
+
+Pedido de carga do histórico de uma jornada `event_entry` ativada com "Incluir toda a base existente" (`enroll_existing=true`) ou "a partir de uma data" (`settings_json.enroll_from_date`).
+
+- **Writers:**
+  - `journeys.request_journey_backfill(journey_id, from, to)` — UPSERT idempotente (UNIQUE `journey_id`; reativação reseta cursor/contadores). SECURITY DEFINER, EXECUTE só `service_role`.
+  - Trigger `trg_journey_enqueue_backfill` (AFTER UPDATE OF status em `journeys.journeys`, transição → `active`) — chama `request_journey_backfill`; em ativação "apenas novos" marca job anterior como `blocked` (`superseded_by_new_only_activation`).
+  - `workers/journeys-event/src/handlers/processBackfillJob.ts` — claim (`running`/`locked_by`), cursor + contadores (`events_processed`, `enrollments_created`, `skipped_*`) no MESMO statement do lote; `blocked` se jornada não está ativa; `retry`/`failed` em erro.
+  - `workers/journeys-event/src/index.ts` (`runBackfillLoop`) — devolve claims não processados no shutdown.
+  - pg_cron `cleanup-backfill-jobs` — DELETE `completed` > 30d.
+- **Readers:**
+  - `workers/journeys-event/src/handlers/processBackfillJob.ts` (`claimBackfillJobs`, CTE `bj`)
+  - `workers/journeys-event/src/monitoring.sql` — observabilidade
+- **FK:** `journey_id → journeys.journeys(id) ON DELETE CASCADE` (antes sem cascade — bloquearia DELETE de jornada).
+
+### journeys.backfill_batch_candidates() (2026-10-16)
+
+Fonte ÚNICA da seleção do backfill — mudar aqui muda worker, preview e dry-run juntos.
+
+- **Readers (callers):**
+  - `workers/journeys-event/src/handlers/processBackfillJob.ts` — CTE `c` (lote real)
+  - `api.preview_journey_backfill(tenant_id, journey_id, from)` — contagem do diálogo de ativação (`src/pages/admin/JourneyBuilder.tsx`, só jornadas por evento)
+- **Lê:** `journeys.journeys` (trigger_config.conditions), `commerce.products`, `commerce.transactions` (purchase: `status='paid'`), `journeys.journey_events` (demais eventos), `crm.parties` (party por email quando a fonte não tem), `journeys.journey_enrollments` (dedupe por email/party, qualquer status).
+
+### journeys.journeys.enroll_window_from (2026-10-16)
+
+- **Writer:** `journeys.trg_journey_status_lifecycle` (BEFORE UPDATE, transição → `active`): `enroll_from_date` > `1970-01-01` (enroll_existing) > `last_activated_at`.
+- **Readers:** `workers/journeys/src/handlers/checkFormEntries.ts`, `workers/journeys/src/handlers/checkEventEntries.ts` via `resolveEntryWindowStart()` (`workers/journeys/src/utils/enrollmentUtils.ts`). NULL (ativação anterior a 2026-10-16) = regra legada de cada handler.
 
 ---
 
@@ -364,7 +469,7 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/journeys/src/handlers/checkSegmentEntries.ts:224` — INSERT: segment-triggered enrollment
   - `workers/journeys/src/handlers/checkFormEntries.ts:166` — INSERT: form-triggered enrollment
   - `workers/journeys-event/src/handlers/processEventJob.ts:196` — INSERT: event worker enrollment
-  - `workers/journeys-event/src/handlers/processBackfillJob.ts:301` — INSERT: backfill enrollment
+  - `workers/journeys-event/src/handlers/processBackfillJob.ts` (CTE `ins`) — INSERT … SELECT FROM `journeys.backfill_batch_candidates()` ON CONFLICT DO NOTHING: backfill enrollment (`context_json.enrolled_via='backfill'`)
   - `supabase/functions/check-journey-entries/index.ts:309` — INSERT: edge function enrollment
   - `supabase/functions/trigger-form-journey/index.ts:238,253,269,285` — UPSERT: form-triggered edge function
   - `workers/journeys/src/handlers/processJourneyNode.ts:248,275,327,1717,1739` — UPDATE: status/state during node processing
@@ -373,6 +478,7 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/journeys/src/handlers/checkEventEntries.ts:97,239` — SELECT dedup (existing enrollment?)
   - `workers/journeys/src/handlers/checkSegmentEntries.ts:96,187` — SELECT dedup
   - `workers/journeys/src/handlers/checkFormEntries.ts:81` — SELECT dedup
+  - `journeys.backfill_batch_candidates()` — NOT EXISTS por `lower(customer_email)` (índice `idx_journey_enrollments_journey_email_lower`) e por `party_id`
   - `workers/journeys/src/handlers/processJourneyNode.ts:57,141,1707` — SELECT by id, status, context
   - `supabase/functions/check-journey-entries/index.ts:116` — SELECT dedup
   - `src/pages/admin/JourneyAnalytics.tsx:246-288` — SELECT for analytics display
