@@ -3,7 +3,7 @@
 > **REGRA R37**: Antes de alterar qualquer item listado aqui, verificar TODOS os readers/writers.
 > Atualizar este arquivo sempre que adicionar novo consumidor.
 >
-> Gerado em: 2026-03-19 · Última atualização: 2026-10-22
+> Gerado em: 2026-03-19 · Última atualização: 2026-10-22 (push: 2026-10-20, não aplicado)
 
 ---
 
@@ -662,6 +662,41 @@ Fonte ÚNICA da seleção do backfill — mudar aqui muda worker, preview e dry-
 - **Readers:** `src/pages/admin/Chat.tsx` via hooks de `src/lib/data/chat.ts`; realtime na publication `supabase_realtime`
 - **RPCs:** `public.chat_incrementa_nao_lidas` (service_role only), `public.chat_zerar_nao_lidas` (authenticated, valida `app_auth.assert_tenant_access`)
 - **Regra:** port 1:1 do módulo campanhas do Carreta Oftalmo — mudanças estruturais devem preservar o mapeamento `campanhas_*` → `chat_*` (ver ARCHITECTURE §22.14)
+
+---
+
+## Notificações push (Web Push) — port do Carreta Oftalmo (ARCHITECTURE §22.17; não aplicado)
+
+### push.fila / push.entregas / push.execucoes — fila própria do push
+
+- **Writers:**
+  - `push.enfileirar_evento` / `push.enfileirar` / `push.enfileirar_campanha` — chamados por gatilhos `SECURITY DEFINER` dos módulos (nenhum ainda; exemplo em `docs/push/APLICAR.md` §9) e por `api.push_testar_aparelho` (notificação de teste)
+  - Edge Function `supabase/functions/push-processador/` (`banco.ts`): `push.adotar_execucao`, `iniciar_residente`, `reservar_lote`, `renovar`, `resolver_destinatarios` (cria `entregas`), `entregas_validas` (descarta/expira), `finalizar`, `devolver_reservas`, `encerrar_execucao` — conexão postgres.js direta (`SUPABASE_DB_URL`)
+  - `push.sinalizar` (gatilho adiado `fila_sinalizar_commit` e cron) → INSERT em `execucoes` + `net.http_post`
+  - cron `kreators-push-recuperar` → `push.recuperar()` (reservas/execuções vencidas, expiração, reservas excedidas)
+  - `api.push_inbox_marcar_lida` / `_marcar_todas_lidas` / `_arquivar` / `_restaurar` (só `lida_em`/`arquivada_em` do próprio usuário); `api.push_confirmar_exibicao` / `api.push_registrar_clique` (anon, token por entrega)
+- **Readers:** `api.push_inbox_listar` / `api.push_inbox_nao_lidas` (front `src/lib/data/push.ts`), view `push.painel_adocao` (via `api.push_painel_adocao`, só system admin)
+- **Regra:** o processador só sai por `push.encerrar_execucao`; `finalizar` recebe todas as entregas de uma notificação numa chamada; estado final de fila/entregas/execuções é imutável (gatilho `23514`).
+
+### push.catalogo / push.preferencias / push.inscricoes
+
+- **Writers:** catálogo só por migração (nasce vazio); `api.push_preferencia_salvar` / `api.push_preferencia_restaurar_padrao`; `api.push_inscrever` / `api.push_desinscrever` / `api.push_desinscrever_outros`; `push.finalizar` (desativa inscrição em 404/410, `ultimo_sucesso_em`)
+- **Readers:** `api.push_catalogo_meu`, `api.push_aparelho_status`, `api.push_aparelhos_resumo`, `push.resolver_destinatarios`, `push._motivo_fila`, `push.enfileirar_evento`
+
+### Dependências do push em tabelas de OUTROS módulos (somente leitura)
+
+| Objeto lido | Onde | Para quê |
+|---|---|---|
+| `core.tenant_users` | `push._usuario_tem_acesso`, `_tem_feature`, `_motivo_fila`, `enfileirar_evento`, `enfileirar_campanha`, `painel_adocao`, `api.push_inscrever`, `api.push_testar_aparelho` | quem é membro (destinatário) e o papel (owner/admin vs member/viewer) |
+| `core.features` (`code`, `module`) | gatilho `catalogo_validar_permissao`, `_motivo_fila` (`permissao_inativa`), `api.push_catalogo_meu` (`module_key`/`grupo`) | `permissao_ref` do tipo e agrupamento da tela |
+| `core.tenant_features`, `core.user_features` | `push._tem_feature` | mesma regra de `core.has_feature_access` (D-PUSH-2) |
+| `core.system_admins` | `push._tem_feature`, `api.push_painel_adocao`, `api.push_inscrever`, `api.push_testar_aparelho` | acesso total a features; painel de adoção |
+| `core.tenants` (`is_active`, `archived_at`) | `_usuario_tem_acesso`, `_motivo_fila` (`tenant_inativo`), `enfileirar_evento` | tenant ativo |
+| `auth.users` (`deleted_at`, `banned_until`) | `push._usuario_ativo` | usuário ativo |
+| `app_auth.assert_tenant_access` | wrappers `api.push_*` com `p_tenant_id` | R56 |
+| Vault `service_role_key` (e opcional `push_processador_segredo`) | `push._chamar_processador` | Bearer do sinal pg_net → Edge Function |
+
+FKs com `on delete cascade` para `core.tenants(id)` e `auth.users(id)` (preferências, inscrições, fila, campanhas): apagar tenant/usuário limpa o push. Mudança de semântica em qualquer linha acima exige revisar `push._tem_feature`/`_usuario_ativo` e rodar `scripts/push/ambiente-teste/fumaca.sql`.
 
 ---
 

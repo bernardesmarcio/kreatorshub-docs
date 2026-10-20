@@ -1,8 +1,8 @@
 # KreatorsHub — Security Architecture & Compliance Roadmap
 
 ## Estado: Sprint 5 — Completo ✅ | Auditoria factual: 2026-03-20
-## Última atualização: 2026-10-22
-## Versão: 1.8
+## Última atualização: 2026-10-22 (push: 2026-10-20)
+## Versão: 1.9
 
 ---
 
@@ -2055,6 +2055,16 @@ Ações que geram audit log obrigatório:
 # PARTE G — HISTÓRICO
 
 ## 26. Changelog
+
+### 2026-10-20 — Notificações push (Web Push), port do Carreta Oftalmo — NÃO aplicado
+
+Migrações `20261023100000`–`20261023100500` + Edge Function `push-processador` validadas só no Postgres isolado (`docs/push/backend-port-2026-10-20.md`); roteiro em `docs/push/APLICAR.md`.
+
+- **Schema `push` fora de `pgrst.db_schemas`**; RLS ligada nas 8 tabelas. Grants: `service_role` tudo; `authenticated` só `select` em `catalogo` e `select/insert/update` em `preferencias`/`inscricoes` com policy `usuario_id = (select auth.uid())` (inscrição também exige `push.endpoint_permitido`). Fila, entregas, execuções, campanhas, config e a view: sem grant ao client. Funções `push.*`: EXECUTE só `service_role` (e o dono), exceto `push.endpoint_permitido` (usada na policy).
+- **19 wrappers `api.push_*`**: `SECURITY DEFINER`, `search_path=''`, `auth.uid()` na 1ª linha (`42501` sem usuário), `app_auth.assert_tenant_access` onde há `p_tenant_id` (R56), revogados de PUBLIC. `anon` executa só `push_vapid_chave_publica`, `push_confirmar_exibicao` e `push_registrar_clique` — os dois últimos gravam só se o `token_confirmacao` (16 bytes aleatórios por entrega) bater e não devolvem nada além de boolean. `push_painel_adocao` exige `core.system_admins`. `push_inscrever` aceita só endpoint https de serviço de push conhecido (FCM, Apple, Mozilla, WNS: anti-SSRF), usuário ativo e membro de algum tenant (ou system admin).
+- **Edge Function `push-processador`** (`verify_jwt=false`): autenticação no handler, `Authorization: Bearer` comparado EXATAMENTE com `SUPABASE_SERVICE_ROLE_KEY` em tempo constante (SHA-256 + XOR; JWT não é decodificado, então um token forjado com `role: service_role` não passa — diferente de `integrations-worker`); `x-push-segredo` = `PUSH_PROCESSADOR_SEGREDO` como alternativa opcional; nunca por query string; sem credencial configurada → 500. Secrets novos: `PUSH_VAPID_PUBLIC_KEY`, `PUSH_VAPID_PRIVATE_KEY`, `PUSH_VAPID_SUBJECT` (opcional `PUSH_PROCESSADOR_SEGREDO`). Logs nunca levam endpoint, chaves, token ou payload; endpoint é removido das mensagens de erro de rede.
+- **Sinal pg_net:** o header `Authorization` (service role, lido do Vault `service_role_key`) fica em `net.http_request_queue` até o worker do pg_net consumir — mesmo risco já aceito de `integrations.invoke_worker`. Observado em 20/10/2026 (somente leitura): `anon`/`authenticated` ainda têm USAGE em `net` e SELECT em `net.http_request_queue`/`_http_response` e EXECUTE em `net.http_post` por grant a PUBLIC de `supabase_admin` (o lockdown R57 não alcança grants desse dono); mitigação vigente: `net` fora do PostgREST.
+- **Payload:** título/corpo aparecem na tela bloqueada — tipos de aviso não devem levar dado pessoal de contato.
 
 ### 2026-10-22 — Consentimento de email, Onda 3 (backend)
 - §9.6: token do centro de preferências vale 90 dias para ver/reativar/feedback (descadastro nunca expira); ≤ 3 emails de confirmação de reativação por email+tenant/24 h e `load` ≤ 60/h por `ip_hash`, contados em `email.consent_audit_log` (funções `email.count_recent_*`, só `service_role`).
