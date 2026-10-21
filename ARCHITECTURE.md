@@ -2,6 +2,7 @@
 
 ## Guia de referência para escala: 50.000 tenants · 50M contatos · 1000 automações por tenant
 
+*Versão 10.0 — §25 nova: frontend mobile (redesign Ondas 3–12) — breakpoints e modos celular/tablet/desktop (D3), casca (`navConfig` como fonte única, `ShellProvider`/`PageHeader`/`BottomNav`/`/mais`, `FullBleedPage`/`ImmersiveScreen`, variáveis CSS da casca), kit de primitivas responsivas, regras M1–M3 do twMerge, guarda-corpos (ESLint para `confirm`/`alert`/`prompt`, `use-toast` e import estático de libs pesadas; teste de baseline `src/test/guardrails.test.ts`; detector de overflow em DEV; `npm run check:overflow`), PWA (`/app`, fontes self-hosted, status bar `black-translucent`, D8/D11 pendentes) e regras de validação com dados reais.*
 *Versão 9.9 — §22.17 nova: notificações push (Web Push) portadas do Carreta Oftalmo — schema `push` (fila própria, fora do PostgREST), wrappers `api.push_*`, Edge Function `push-processador` (Bearer service role), cron `kreators-push-recuperar` (30 s, categoria A em §11), fila `push.fila` em §10. Destinatário = membro de `core.tenant_users` com a feature (regra de `core.has_feature_access`). D-PUSH-1..3 novas. Migrações `20261023100000`–`20261023100500` validadas só no isolado; nada aplicado.*
 *Versão 9.8 — Adendo R59/R60 (Onda 3 do `docs/EMAIL_UNSUBSCRIBE_AUDIT.md`): resubscribe global confirmado pela pessoa (`channel=preference_center`, inclusive double opt-in) também desativa unsubs de grupos inativos; token do centro de preferências vale 90 dias para tudo exceto descadastrar; rate limit do email de reativação e do `load`; Sentry nas edge functions de consentimento; worker não envia marketing sem link de preferências (P18); RPCs `api.get_campaign_unsubscribe_stats` e `api.get_tenant_consent_summary` (§22.16).*
 *Versão 9.7 — R60 nova: `email.campaign_sends` valida tipo no banco (marketing exige grupo; transacional sem grupo e com motivo), unsub de grupo inativo vale como global nos workers; FK `unsubscribes_group_id_fkey` → RESTRICT; RPCs `api.set_campaign_message_type` e `api.deactivate_unsubscribe_group`; políticas "manage" removidas de `unsubscribes`/`suppression_list`; IP bruto não é mais gravado (§22.16, Onda 2 do `docs/EMAIL_UNSUBSCRIBE_AUDIT.md`).*
@@ -2925,6 +2926,183 @@ Traits projetados por submission. Índice por `(tenant_id, field_key, value_*)`.
 | `supabase/migrations/*_create_party_profile_traits.sql` | Schema das tabelas de traits e field_definitions |
 | `supabase/migrations/*_fix_trg_enqueue_trait_projection.sql` | Trigger de enqueue para `project_traits` |
 | `supabase/migrations/*_fix_processing_jobs_coalesced_index_scope.sql` | Scoping do unique index para excluir jobs per-entity |
+
+---
+
+## 25. Frontend mobile — casca, kit e guarda-corpos (2026-10-21)
+
+Resultado do programa de redesign mobile (`docs/mobile-redesign/PLANO-MESTRE.md`, Ondas 3 a 12). Esta seção é o
+contrato vigente; o plano e os `BRIEFS-ONDA-*.md` são o histórico das decisões. Regras próprias desta área usam o
+prefixo **M** (M1–M3) para não colidir com as R1–R60 da Parte C.
+
+### 25.1 Breakpoints e modos (D3)
+
+| Modo | Largura | Casca | Primitivas do kit | Builders (e-mail, jornada, formulário, LP, segmento) |
+|---|---|---|---|---|
+| Celular | `< 768` | header contextual de 56px + safe area, BottomNav (4 abas + Mais), sem sidebar/gaveta (o `/mais` substitui) | modo mobile (Drawer, lista, sheet) | leitura/resumo (D22) |
+| Tablet | `768–1023` | rail de 80px; "Expandir menu" abre a sidebar de 256px por cima do conteúdo; sem BottomNav | modo desktop | leitura/resumo (abaixo de `lg`) |
+| Desktop | `>= 1024` | sidebar de sempre (256/80, recolher, auto-recolher na Inbox) | modo desktop | completos |
+
+- Primitivas trocam de modo em `md` (768, igual ao `useIsMobile`); a casca troca em `lg` (1024).
+- Hooks síncronos no primeiro render (`useSyncExternalStore`, sem flash Dialog→Drawer): `useMediaQuery`,
+  `useBreakpoint`, `useIsMobile`, `useIsTouch` em `src/hooks/use-media-query.ts` (`use-mobile.tsx` reexporta).
+- Toque não se decide por largura: variantes Tailwind `touch:` (`pointer: coarse`), `hover-hover:` e `standalone:`;
+  `future.hoverOnlyWhenSupported` ligado (`hover:` só onde há hover de verdade).
+- CSS antes de JS: classe responsiva quando o DOM é o mesmo; hook só quando a árvore muda (Dialog ou Drawer, tabela
+  ou lista), para não montar as duas.
+
+### 25.2 Casca
+
+**`navConfig` é a fonte única de navegação** (`src/config/nav-config.ts`, arquivo puro, roda no vitest):
+`NAV_ITEMS`/`ACCOUNT_NAV_ITEMS` (rótulo, ícone, grupo, `access` por feature, `badge`, `desktopOnly`, `keywords`),
+`NAV_GROUPS`, `ROUTE_META` (título, `parent` para o voltar, `navId`, `layout: "fullbleed"`, `hideBottomNav`,
+`skeleton`), `resolveTabs` (abas da BottomNav por feature/papel, D1/D4), `getMobileMoreSections` (`/mais`),
+`getParentPath`/`getRouteTitle`. Rota nova = entrada em `ROUTE_META` (e `NavItem` se aparece no menu); nunca array
+solto no `AppLayout`. O teste `src/config/__tests__/nav-config.test.ts` garante que a sidebar gerada é a mesma de antes
+(grupos, itens, rótulos, ordem). Leitores no `DEPENDENCY_MAP.md` ("Casca e navegação").
+
+| Peça | Arquivo | Papel |
+|---|---|---|
+| `AppLayout` | `src/components/layout/AppLayout.tsx` | monta os três modos, mede header/BottomNav e passa `topInset`/`bottomNavHeight` ao `ShellProvider` |
+| `ShellProvider` / `useShell` / `useShellChrome` | `src/components/shell/shell-context.tsx` | contrato tela ↔ casca: registro do header, da `BottomActionBar` e do modo imersivo; publica as variáveis CSS. Sem provider (páginas públicas, `/__dev/kit`) é no-op com `hasShell: false` e as primitivas renderizam inline |
+| `PageHeader` + `ShellHeaderOutlet` | `src/components/shell/page-header.tsx` | no celular registra título/voltar/ações no header fixo (até 2 ícones, resto no ⋯); no desktop renderiza inline. Sem registro, o outlet mostra título e voltar do `ROUTE_META` |
+| `BottomNav` | `src/components/shell/bottom-nav.tsx` | 4 abas + Mais, badges (`useNavBadges`); some com teclado aberto, `BottomActionBar` montada, tela imersiva ou `hideBottomNav` da rota |
+| `/mais` | `src/components/shell/mobile-more-menu.tsx`, `src/pages/Mais.tsx` | destinos por feature, troca de tenant, Recentes, sair (com `useConfirm`) |
+| `CommandPalette` | `src/components/shell/command-palette.tsx` | busca global sobre o `navConfig` (⌘K) |
+| `FullBleedPage` / `ImmersiveScreen` | `src/components/shell/full-bleed-page.tsx` | `FullBleedPage`: altura exata entre header e BottomNav (`--app-height − --shell-top − --shell-bottom − safe area`), quem rola é o filho. `ImmersiveScreen` (conversa, builder): esconde header/BottomNav, `fixed inset-0`, `height: var(--app-height)`, trava o scroll do body, `overscroll-behavior: none` |
+| `MasterDetail` | `src/components/shell/master-detail.tsx` | seleção na query string com push (`?chat=`, `?contato=`, `?id=`); no celular uma tela por vez e o voltar fecha o detalhe; fora do celular lista e detalhe lado a lado, `aside` em `ResponsiveSheet` |
+| `ShellSkeleton` / `RouteSkeleton`, `RouteScrollManager` | `src/components/shell/*`, `src/components/routing/RouteScrollManager.tsx` | silhueta da casca no boot; skeleton por `ROUTE_META.skeleton`; restauração de scroll por rota |
+
+**Variáveis CSS da casca** (todas em `<html>`; padrões em `src/index.css`):
+
+| Variável | Quem grava | Significado |
+|---|---|---|
+| `--shell-top` | `ShellProvider` | altura total do header fixo (com safe area e faixa de impersonação); 0 fora do celular |
+| `--shell-bottom` | `ShellProvider` (ou a `BottomActionBar` registrada) | espaço ocupado embaixo SEM a safe area: barra de ação, senão BottomNav visível, senão 0 |
+| `--app-height`, `--app-offset-top`, `--kb-inset` | `useVisualViewport({ publishCssVars: true })`, montado só no `ShellProvider` | viewport visível (segue o teclado do iOS) e altura do teclado |
+| `--bottom-bar-h` | `BottomActionBar` (enquanto montada e visível) | altura total da barra, com safe area |
+| `--impersonate-h` | `ImpersonateBanner` (`src/components/system/ImpersonateBanner.tsx`) | altura da faixa "visualizando como" no `/system` |
+
+### 25.3 Kit de primitivas responsivas
+
+Catálogo completo (props, comportamento desktop × celular, consumidores): `PLANO-MESTRE.md` §2.1. Kit genérico em
+`src/components/ui/`, peças da casca em `src/components/shell/`, hooks em `src/hooks/`, utilitários em `src/lib/`.
+Bancada viva: `/__dev/kit` (só DEV).
+
+| Necessidade na tela | Use | Não use |
+|---|---|---|
+| Título, voltar, ações da página | `PageHeader` | `<h1>` + `flex justify-between` solto |
+| Tabela | `DataList` (`<Table>` no desktop, linhas de 64–72px no celular) | `<Table>`/`<table>` crus |
+| Formulário em modal | `ResponsiveDialog` (Drawer/tela cheia no celular, `dirty` pede "Descartar?") | `DialogContent` direto |
+| Painel lateral | `ResponsiveSheet` | `Sheet` lateral fixo |
+| Confirmação | `useConfirm()` / `ConfirmSwitch` (`ui/confirm-dialog.tsx`) | `confirm()`/`alert()`/`prompt()` (ESLint barra) |
+| Ações de linha / ⋯ | `ActionMenu` (DropdownMenu no desktop, action sheet no celular) | ação só no hover |
+| Abas | `ResponsiveTabs` | `TabsList grid grid-cols-N` |
+| Busca e filtros | `FilterBar` + `FilterSheet` + `SearchInput` (16px) | `<input>` cru de 14px |
+| KPIs / gráfico | `StatGrid` + `StatTile` / `ChartCard` | grade fixa de 4 colunas; informação só em tooltip |
+| CTA de formulário longo | `BottomActionBar` (ou `Fab` para criar) | botão no fim da página escondido pelo teclado |
+| Vazio / erro de tela | `EmptyState` / `StatusScreen` | texto solto |
+| Página pública | `PublicShell` (gutter 16px, `pt-safe`/`pb-safe`) | `min-h-screen` próprio |
+| Link interno em "nova aba" | `useOpenInApp()` (`navigate` no celular/PWA) ou `<Link>` | `target="_blank"` com rota interna (D15) |
+| Exportar/compartilhar | `shareOrDownload`, `ShareButton`, `CopyField` | download direto no PWA iOS |
+| Campos | `FormField` + `fieldPresets` + `masks` | `type`/`autoComplete`/`inputMode` à mão |
+| Tela que não cabe no celular | `DesktopOnlyNotice` | esconder a rota |
+| Botão-ícone | `IconButton` (`label` obrigatório) / `.hit-44` | ícone de 16px sem área de toque |
+| Toast | `toast` do `sonner` (bottom-center no celular, 4 s; erro 6 s) | `use-toast` do shadcn (removido na 12.2) |
+
+### 25.4 Regras M1–M3 (twMerge no `cn()`)
+
+Valem para toda edição em `src/components/ui/*` e `src/components/shell/*` (origem: `PLANO-MESTRE.md` §2.2, lá
+chamadas R1–R3).
+
+| # | Regra | Por quê |
+|---|---|---|
+| M1 | **Adicionar limites na base é seguro.** Classes sem prefixo que só limitam (`max-h-*`, `max-w-*`, `overflow-y-auto`, `overscroll-contain`) são vencidas por qualquer override do consumidor. | O consumidor com `max-h-[90vh]`/`w-[95vw]`/`p-0` continua vencendo. |
+| M2 | **Nunca acrescentar variante de largura mínima (`sm:`/`md:`/`lg:`) a propriedade que consumidores sobrescrevem** (padding, altura, largura, raio, fonte). Mudança só-celular usa `max-md:`, `touch:` ou `[@media(pointer:coarse)]:` e precisa ser aceitável mesmo com override sem prefixo. | `p-6` → `p-4 sm:p-6` no `CardContent` faria o `className="p-4"` de um consumidor perder o base e manter o `sm:p-6`: o desktop regride. Idem `h-10` → `h-11 md:h-10` no `Button`. |
+| M3 | **Safe area na base por valor arbitrário dentro do utilitário** (`pt-[max(1.5rem,env(safe-area-inset-top,0px))]`), nunca com `.pt-safe*`/`.pb-safe*` do `index.css`. | Essas classes ficam fora de `@layer` e venceriam o `p-0` de um consumidor (sheet com header próprio). |
+
+Observação: `cn()` (`src/lib/utils.ts`) usa `extendTailwindMerge` com o grupo `bg-brand-gradient`: `gradient-primary`
+e `bg-destructive` no mesmo `cn()` agora se resolvem (o último vence). Mudança de comportamento listada para veto no
+`RESUMO-EXECUTIVO.md`.
+
+### 25.5 Padrões proibidos e guarda-corpos
+
+Os dez padrões que explicavam ~80% dos defeitos no celular (PLANO-MESTRE §0) estão barrados em duas camadas.
+Guarda-corpo não é proibição retroativa: o estado de 2026-10-21 é o baseline; só **piorar** falha.
+
+**ESLint** (`eslint.config.js`, só `src/**/*.{ts,tsx}`):
+
+| Regra | Proíbe | Exceções (comentadas no config) |
+|---|---|---|
+| `no-restricted-globals` + `no-restricted-properties` | `confirm`/`alert`/`prompt` globais e `window.`/`globalThis.`/`self.` | `email-editor/IframeCanvas.tsx` ("Recomeçar" no card de erro de render) e `email-editor/RawHtmlPreviewFrame.tsx` ("Cole o link" na barra do iframe); os dois só montam no desktop |
+| `@typescript-eslint/no-restricted-imports` | `@/hooks/use-toast`, `@/components/ui/use-toast`; import **estático** de `exceljs`, `mjml-browser`, `jspdf`, `pptxgenjs` (`import type` e `await import()` passam) | `src/lib/excel.ts` (chamado só por `await import("@/lib/excel")`) e `email-editor/utils/mjmlRenderer.tsx` (renderizador canônico, só em chunks lazy) |
+
+**Teste de baseline** (`src/test/guardrails.test.ts` + `src/test/guardrails-baseline.json`): varre `src/**/*.tsx`
+(sem testes), conta por arquivo e falha se um arquivo aumentar ou se um arquivo novo aparecer com ocorrência.
+Variante de breakpoint para cima (`sm:`…`2xl:`, `min-[…]:`) e elemento `hidden … lg:block` não contam; `max-md:` conta.
+
+| Regra | Padrão | Baseline (arquivos / ocorrências) |
+|---|---|---|
+| `viewport-height` | `h-screen`, `min-h-screen`, `100vh`, `100dvh` fora da casca/kit/moldura pública (allowlist no teste) | 36 / 56 |
+| `internal-target-blank` | `target="_blank"` na mesma tag de `href`/`to` começando com `/` | 2 / 3 |
+| `hover-only-action` | elemento clicável (`button`/`a`/`Link`/`role="button"`/`onClick`) com `opacity-0` + `group-hover:opacity-100` sem `data-hover-only` e sem `touch:`/`max-md:opacity-100` | 4 / 5 |
+| `grid-cols-unprefixed` | `grid-cols-3`…`grid-cols-12` sem prefixo | 24 / 39 |
+| `fixed-width-px` | `w-[NNNpx]`/`min-w-[NNNpx]` ≥ 320px sem prefixo | 8 / 9 |
+| `tiny-text` | `text-[8px]`…`text-[10px]` | 61 / 138 |
+
+- `npm run guardrails` roda o teste; `npm run guardrails:update` regrava o baseline (só quando a contagem caiu ou com
+  justificativa no PR). Quando algo cai, o teste avisa para regravar.
+- Rede de segurança do hover (`src/index.css`, "Rede de segurança de hover"): sem hover real, `opacity-0` com revelação
+  `group-hover:opacity-100` fica visível. Decoração que deve continuar escondida no toque recebe `data-hover-only`.
+- Contêiner com rolagem horizontal intencional (carrossel, tabela) recebe `data-overflow-ok`: os detectores ignoram.
+
+**Detector em desenvolvimento** (`src/dev/overflow-detector.ts`, montado em `src/main.tsx` só com `import.meta.env.DEV`
+por import dinâmico): abaixo de 768px, quando `scrollWidth` passa da largura do viewport de layout
+(`documentElement.clientWidth`), faz `console.warn` com a rota e até 5 elementos culpados. Checa na carga, a cada
+navegação e a cada mudança do DOM (debounce de 400ms, um aviso por rota + culpados).
+
+**`npm run check:overflow`** (`scripts/check-overflow.ts`, Playwright, 375x812 com toque): abre cada rota contra
+`BASE_URL` (padrão `http://localhost:8080`, dev server já rodando) e mede overflow horizontal e quantidade de `<h1>`;
+sai com código 1 se alguma rota estourar (`STRICT_H1=1` também falha por h1 ≠ 1). Sem sessão, só as rotas públicas
+fixas; com `E2E_STORAGE_STATE` (arquivo gerado pelo Márcio com `npx playwright codegen --save-storage=…`, fora do
+repositório, mesma origem do `BASE_URL`), também os paths de `NAV_ITEMS`/`ACCOUNT_NAV_ITEMS` e os `ROUTE_META` sem
+parâmetro. Editores (`hideBottomNav`) ficam fora por padrão (`INCLUDE_EDITORS=1` inclui): abrir um editor pode
+disparar autosave. O script não clica nem digita e bloqueia escrita REST (PATCH/PUT/DELETE e POST fora de
+`/rest/v1/rpc/`). O Playwright não está no `package.json`: o script resolve `playwright`/`playwright-core` do projeto
+ou `PLAYWRIGHT_MODULE`; para instalar sem mexer no lockfile, `npm i --no-save playwright-core@1.53.2` (usa o Chromium
+do cache `~/Library/Caches/ms-playwright`).
+
+### 25.6 PWA
+
+| Item | Estado |
+|---|---|
+| Entrada do app instalado | `start_url: "/app?source=pwa"` (`public/manifest.webmanifest`) → `src/pages/AppEntry.tsx`: resolve a sessão e sai com `replace` (o `/app` nunca fica no histórico); logado vai à home (`getHomeRoute`; no celular, `/dashboard` "Hoje" quando há a feature); deslogado vai a `/login`. `?source=` vira a tag `app.launch_source` do Sentry |
+| Fontes | Inter self-hosted em `public/fonts/*.woff2`, `@font-face` no `src/index.css` e `preload` do subset latin no `index.html` (sem Google Fonts no caminho crítico) |
+| Status bar iOS | `black-translucent` (`index.html`): o conteúdo passa por baixo do notch e cada superfície usa `env(safe-area-inset-top)` (M3). O iOS congela as metas na instalação: quem já instalou precisa remover e adicionar o ícone de novo (texto ao cliente em `docs/mobile-redesign/PWA-PENDENTE-AVAL.md` §3.1) |
+| Nova versão (D9) | build grava `dist/version.json` e `__APP_VERSION__` (plugin `kh-app-version` no `vite.config.ts`); `src/lib/pwa/app-version.ts` compara ao voltar ao app (máx. 1x/5 min) e a cada 30 min, e oferece "Atualizar" |
+| Service worker | só push (`public/sw.js`, registrado por `registrarServiceWorker` no `main.tsx`); sem `fetch` e sem cache, então não interfere no stale-chunk recovery do `main.tsx` |
+| **Pendente D8** | offline no SW (`fetch` só para `navigate`, rede primeiro + `offline.html`): patch pronto em `PWA-PENDENTE-AVAL.md` §1, aguarda aval |
+| **Pendente D11** | host de produção (Vercel × Cloudflare Pages) e cabeçalhos de cache (`public/_headers` ou `vercel.json`): `PWA-PENDENTE-AVAL.md` §2 |
+
+### 25.7 Validação com dados reais
+
+O tenant "Escola do Fluxo" tem dados reais e é o mesmo usado na validação das telas. Regras para qualquer agente ou
+pessoa validando no app:
+
+1. **Exercitar até a confirmação e cancelar.** Não salvar/excluir/duplicar segmento, não exportar base, não
+   recalcular RFM/cluster/lookalike/pipeline de analytics, não publicar post/grupo, não salvar conexão/agente do Chat,
+   não disparar WhatsApp/e-mail, não mudar tag/transação/campanha/contato real. Registro "[TESTE]" só se
+   imprescindível e removido no fim.
+2. **Não abrir editor de registro real para "só olhar".** O builder de formulário grava ao abrir (autosave); o
+   `check:overflow` exclui editores por isso.
+3. **Um toque por ação irreversível.** Toque duplo em botão de disparo ("Recalcular agora") executou duas vezes;
+   validação de botão de disparo para no diálogo de confirmação.
+4. **Nenhum agente cria conta nem digita senha.** Sessão para automação só por `E2E_STORAGE_STATE` gerado pelo Márcio.
+5. **Desktop é sentinela**: toda frente confere as sentinelas de 1280x800 (`PLANO-MESTRE.md` §5.3) além de 375x812.
+
+Incidentes do programa (para não repetir): (a) contato regravado com os mesmos valores durante validação (só
+`updated_at` mudou); (b) formulário real regravado pelo autosave ao abrir o builder; (c) "Recalcular agora" do
+pipeline de analytics disparado por toque duplo. Detalhes em `docs/mobile-redesign/RESUMO-EXECUTIVO.md`.
 
 ---
 

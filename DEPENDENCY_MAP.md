@@ -3,7 +3,7 @@
 > **REGRA R37**: Antes de alterar qualquer item listado aqui, verificar TODOS os readers/writers.
 > Atualizar este arquivo sempre que adicionar novo consumidor.
 >
-> Gerado em: 2026-03-19 · Última atualização: 2026-10-22 (push: 2026-10-20, não aplicado)
+> Gerado em: 2026-03-19 · Última atualização: 2026-10-22 (push: 2026-10-20, não aplicado) · Frontend mobile: 2026-10-21 (casca e navegação, kit mobile, leitores novos; acompanha ARCHITECTURE v10.0 §25)
 
 ---
 
@@ -762,6 +762,79 @@ FKs com `on delete cascade` para `core.tenants(id)` e `auth.users(id)` (preferê
 - **Regra:** o state machine de `status` (`pending_delegation` → `validating` → `active`) pertence ao fluxo de onboarding; saúde pós-ativação vive em `metadata` para não regredir a UI de setup.
 
 ---
+
+## Casca e navegação (frontend mobile, ARCHITECTURE §25, 2026-10-21)
+
+### `src/config/nav-config.ts` — registro único de navegação
+
+Arquivo puro (sem React/Supabase). Mudar rótulo, ordem, `access`, `ROUTE_META` ou `resolveTabs` afeta todos os
+leitores abaixo; o teste de equivalência da sidebar tem que continuar passando.
+
+| Leitor | O que consome |
+|---|---|
+| `src/components/layout/AppLayout.tsx` | `getNavGroups` (sidebar desktop/tablet), `resolveTabs` (abas da BottomNav), `matchRouteMeta` (`layout`, `hideBottomNav`), `getParentPath` (passado ao `ShellProvider`), `isNavItemActive`, `isTabRoot` |
+| `src/components/shell/bottom-nav.tsx` | `getActiveTabId`, `MORE_PATH`, `TabItem`; badges por `NavItem.badge` (`useNavBadges`) |
+| `src/components/shell/mobile-more-menu.tsx` + `src/pages/Mais.tsx` (`/mais`) | `getMobileMoreSections`, `resolveTabs`, `getActiveNavItem` |
+| `src/components/shell/command-palette.tsx` | `NAV_ITEMS`/`ACCOUNT_NAV_ITEMS` com `keywords` (busca ⌘K) |
+| `src/components/shell/route-header.tsx` | `getRouteTitle`, `getParentPath`, `getParentLabel` (header automático sem `PageHeader`) |
+| `src/App.tsx`, `src/components/auth/FeatureRoute.tsx` | `matchRouteMeta` (skeleton da rota durante o carregamento) |
+| `src/lib/home-route.ts` | tipo `FeatureCtx` (`useFeatureCtx`, `getHomeRoute`/`useHomeRoute`: home do `/`, `/app` e do voltar) |
+| `src/lib/recent-routes.ts`, `src/lib/shell/recent-nav.ts` | `matchRouteMeta`, `getRouteTitle`, `getActiveNavItem`, `getNavItemById`, `isTabRoot`, `resolveTabs`, `NAV_ITEMS`/`ACCOUNT_NAV_ITEMS`, `MORE_PATH` (Recentes do `/mais`) |
+| `src/lib/shell/conversation-badges.ts` | tipo `NavItem["badge"]` |
+| `src/pages/Upgrade.tsx` | `NAV_ITEMS`, `getRouteTitle` (nome do recurso bloqueado) |
+| `src/pages/admin/AccountBilling.tsx` | `MORE_PATH` (voltar) |
+| Testes | `src/config/__tests__/nav-config.test.ts` (equivalência da sidebar), `src/lib/__tests__/home-route.test.ts`, `src/lib/__tests__/recent-routes.test.ts` |
+| Bancada | `src/pages/dev/kit/casca.demo.tsx` |
+| Script | `scripts/check-overflow.ts` (paths de `NAV_ITEMS`/`ACCOUNT_NAV_ITEMS` e `ROUTE_META` sem parâmetro; `hideBottomNav` = editor, fora por padrão) |
+
+### Variáveis CSS da casca (gravadas em `<html>`)
+
+| Variável | Writer | Readers |
+|---|---|---|
+| `--shell-top` | `ShellProvider` (`shell/shell-context.tsx`) | `index.css`, `shell/full-bleed-page.tsx`, `ui/{search-input,responsive-tabs,filter-bar,data-list}.tsx` (sticky sob o header), `layout/{AppLayout,SystemLayout}.tsx`, `system/DocLayout.tsx`, `contacts/detail/ContactDetailScreen.tsx`, `pages/admin/{Transactions,CampaignResults,Opportunities}.tsx` |
+| `--shell-bottom` | `ShellProvider`; `ui/bottom-action-bar.tsx` enquanto registrada | `index.css`, `ui/{sonner,fab,bottom-action-bar}.tsx`, `shell/full-bleed-page.tsx`, `layout/AppLayout.tsx`, `contacts/detail/NotesComposer.tsx` |
+| `--app-height`, `--app-offset-top`, `--kb-inset` | `hooks/use-visual-viewport.ts` (`publishCssVars`, montado só no `ShellProvider`) | `index.css`, `shell/full-bleed-page.tsx` (`FullBleedPage`/`ImmersiveScreen`), `conversation/chat-composer.tsx` |
+| `--bottom-bar-h` | `ui/bottom-action-bar.tsx` | `index.css`, `shell/shell-context.tsx` |
+| `--impersonate-h` | `system/ImpersonateBanner.tsx` (ResizeObserver; evento `impersonate-height-change`) | `layout/SystemLayout.tsx` |
+
+## Kit mobile — primitivas e principais consumidores (ARCHITECTURE §25.3)
+
+Contagem de arquivos de produção que importam a primitiva (sem `/__dev/kit` e testes), 2026-10-21. Mudança de props
+ou de comportamento padrão afeta todos; regras M1–M3 valem para qualquer edição.
+
+| Primitiva | Arquivo | Consumidores |
+|---|---|---|
+| `ResponsiveDialog` | `ui/responsive-dialog.tsx` | 88 arquivos (formulários e diálogos do app inteiro) |
+| `DataList` / `ListRow` | `ui/data-list.tsx` | 83 |
+| `PageHeader` | `shell/page-header.tsx` | 80 (toda tela com título) |
+| `useConfirm` / `ConfirmSwitch` | `ui/confirm-dialog.tsx` (host no `App.tsx`) | 78 |
+| `ActionMenu` | `ui/action-menu.tsx` | 77 |
+| `StatGrid` / `StatTile` | `ui/stat-grid.tsx` | 27 |
+| `StatusScreen` | `ui/status-screen.tsx` | 22 |
+| `FilterBar` | `ui/filter-bar.tsx` | 21 (Contatos, Transações, Pedidos, Assinaturas, Campanhas, Jornadas, Segmentação, Inbox, WhatsApp, Chat, Oportunidades, Atividades, Formulários, Analytics...) |
+| `BottomActionBar` | `ui/bottom-action-bar.tsx` | 17 (CampaignSend, WhatsAppBroadcast, OpportunityDetail, CheckoutPage, builders em modo celular, HomeEditor...) |
+| `EmptyState` | `ui/empty-state.tsx` | 16 |
+| `ResponsiveTabs` | `ui/responsive-tabs.tsx` | 13 (ContactDetailScreen, OpportunityDetail, Campaigns, Tags, SegmentationList, BaseRFM, SystemHealth, SystemTenantDetail...) |
+| `ChartCard` | `ui/chart-card.tsx` | 9 (Dashboard, Analytics, dashboards de CRM, produtos, saúde do sistema) |
+| `FullBleedPage` / `ImmersiveScreen` | `shell/full-bleed-page.tsx` | 8 (AppLayout, Inbox, MessageDetail, Chat, WhatsApp, ChatDetail, Opportunities, LandingPageBuilder) |
+| `MasterDetail` | `shell/master-detail.tsx` | 5 (Inbox, Chat, WhatsApp, LookalikePage, PipelineSettings) |
+
+Guarda-corpos que leem o código (não o banco): `eslint.config.js` (regras de §25.5), `src/test/guardrails.test.ts` +
+`src/test/guardrails-baseline.json`, `src/dev/overflow-detector.ts` (montado em `src/main.tsx` só em DEV).
+
+## Leitores novos do frontend mobile (Ondas 5–11, somente leitura)
+
+Nenhum cria objeto no banco: são leituras novas ou mais baratas de tabelas que já existiam. Quem mudar coluna, índice
+ou RLS destas tabelas precisa conferir estes leitores.
+
+| Leitor | Arquivo | Lê | Como | Consumidores |
+|---|---|---|---|---|
+| Vendas de hoje | `src/lib/data/sales-today.ts` (`useSalesToday`, `useRecentSales`) | `commerce.transactions` | `status='paid'` e `transaction_date` no dia LOCAL do navegador (`localDayStartISO`/`localDayEndISO`, as mesmas de Transações); páginas de 1000 até 20 (depois `truncated`); somas no cliente; `staleTime` 60 s; chaves `transactions-today`/`transactions-recent` (limpas na troca de tenant) | `components/dashboard/{TodayHero,RecentSales}.tsx` (`/dashboard` "Hoje") |
+| Badges da navegação | `src/lib/shell/conversation-badges.ts` (`useConversationsBadge`, `useNotificationsBadge`, `useNavBadges`) | `public.chat_contatos` (`nao_lidas > 0`, `count` com `head: true`); não lidas do push via `usePushInboxNaoLidas` (`lib/data/push.ts`) | só com a feature; sem realtime; `staleTime` 60 s; chave começa com `["chat","contatos"]` (invalidações do Chat atualizam o badge). E-mail e WhatsApp fora (contagem cara) | `shell/bottom-nav.tsx`, `shell/mobile-more-menu.tsx`, `dashboard/PendingCard.tsx` |
+| Canal realtime com ressincronização | `src/lib/realtime/use-realtime-channel.ts` (`useRealtimeChannel`) | `inbox.messages` (Inbox), `whatsapp.{messages,chats,instances}` (WhatsApp), `imports.import_runs` (Transactions, TransactionImportHistory), `integrations.accounts` (IntegrationHub), `public.chat_mensagens` (`lib/data/chat.ts`) | invalida as queries informadas ao reconectar (`CHANNEL_ERROR`/`TIMED_OUT`/`CLOSED` → `SUBSCRIBED`), ao voltar do background (> 30 s) e no `online`; recria o canal se caiu | `pages/admin/{Inbox,WhatsApp,Transactions,TransactionImportHistory}.tsx`, `settings/IntegrationHub.tsx`, `lib/data/chat.ts` |
+| Estatísticas de atividades | `src/lib/opportunityStorage.ts` (`getActivityStats`) | `crm.opportunity_activities` | 4 contagens no servidor (`count: "exact", head: true`): total, pendentes, atrasadas, concluídas hoje; atividades de CRM do tenant sem automação de jornada. Antes baixava as linhas e cortava em 1000 (PostgREST) | `pages/admin/Activities.tsx`, `dashboard/PendingCard.tsx` (chave `["activity-stats", tenant]`) |
+| Analytics de jornada | `src/components/journey-builder/journey-analytics-data.ts` (`fetchJourneyAnalytics`) | `journeys.journeys`, `journeys.journey_enrollments`, `journeys.journey_executions`, `email.campaign_sends` (métricas por envio) | `email.campaign_sends` lido em lotes por `selectInChunks` (`src/lib/supabase-chunk.ts`: 150 ids por lote, 4 lotes simultâneos); antes um `.in()` de ~800 ids estourava a URL (400) | `pages/admin/JourneyAnalytics.tsx`, `journey-builder/JourneyMobileView.tsx` |
+| Respostas de formulário paginadas | `src/lib/formStorage.ts` (`getFormResponsesPage`), `src/lib/smartFormStorage.ts` (`getSmartFormResponsesPage`) | `forms.form_submissions` (+ respostas), `smart_forms.form_submissions` | `.range()` de 30 por página (`RESPONSES_PAGE_SIZE`) em `useInfiniteQuery`; formulário descarta parciais sem resposta e emenda até 5 páginas do banco; exportação continua com `getFormResponses`/`getSmartFormResponses` (tudo) | `components/forms/responses/ResponsesView.tsx` via `pages/forms/FormResponses.tsx` e `pages/smart-forms/SmartFormResponses.tsx` |
 
 ## RPCs Críticas
 
