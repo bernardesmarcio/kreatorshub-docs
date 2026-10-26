@@ -104,8 +104,8 @@ Frontend e worker compartilham `workers/shared/src/email-renderer-version.ts`. P
 
 | Invariante | Onde verificar | O que acontece se violado |
 |---|---|---|
-| `segment_parties` não vazio se segmento tem regras | `CampaignSend.tsx:607` — `getSegmentRecipientsFailClosed()` | **R38:** membership vazia = refresh pendente, não "enviar para todos". Fail-closed retorna 0 recipients |
-| Blast radius ≤ 1.1× segment size | Guard de blast radius no frontend | Envio abortado se ratio excede threshold |
+| `segment_parties` não vazio se segmento tem regras | Envio: `email.create_campaign_send` (R61) → `segment_not_materialized`/`exclusion_segment_not_materialized`/`segment_empty`; preview: `CampaignSend.tsx` `getSegmentRecipientsFailClosed()` | **R38:** membership vazia = refresh pendente, não "enviar para todos". A UI mostra "Calcular agora e enviar" (`api.refresh_segment_customers` + 1 retentativa) |
+| Teto de destinatários (50.000) | `email.create_campaign_send` (R61) → `too_many_recipients` | Envio recusado sem gravar nada. O guard de blast radius do front (lista ≤ 1,1× segmento) saiu em 2026-10-26: a lista não é mais montada no cliente |
 | Segmento não deletado (`deleted_at IS NULL`) | Query de seleção de segmentos | Segmento fantasma retorna 0 members via `segment_parties` |
 
 ### Journey Node Execution
@@ -137,7 +137,7 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/analytics/src/handlers/refreshSegments.ts:64,73` — SELECT para passagem ao evaluator (fallback v1 nunca atingido — todos os rule-based têm v2)
   - `workers/analytics/src/segmentation/segmentEvaluator.ts:93-100` — fallback legado: chama `build_segment_where_clause` (DROPADA — dead code)
   - `supabase/functions/generate-export/index.ts:711` — SELECT para check de has-rules no guard fail-closed
-  - `src/pages/admin/CampaignSend.tsx:612` — check de has-rules no guard fail-closed
+  - `src/pages/admin/CampaignSend.tsx` `getSegmentRecipientsFailClosed()` — check de has-rules no guard fail-closed (só preview de destinatários desde 2026-10-26; o envio é `api.create_campaign_send`)
   - `src/lib/segmentStorage.ts:687,844` — passagem para `loadSegmentRules()` (display only)
 - **Status:** DEPRECATED. Nenhum reader depende de v1 para avaliação. Dead code confirmado (D37, 2026-03-20): `segmentEvaluator.ts:86-100` (chama `build_segment_where_clause` que foi dropada do banco — executar causaria erro SQL), `scripts/runEquivalenceGate.ts` (inteiro), e testes em `equivalence.test.ts`.
 
@@ -152,7 +152,7 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/analytics/src/handlers/refreshSegments.ts:64,73` — SELECT para compilação v2
   - `workers/analytics/src/segmentation/segmentEvaluator.ts:57,65` — compilação v2 → WHERE clause
   - `supabase/functions/generate-export/index.ts:711,812` — has-rules check (fail-closed)
-  - `src/pages/admin/CampaignSend.tsx:611` — has-rules check (fail-closed)
+  - `src/pages/admin/CampaignSend.tsx` — has-rules check (fail-closed; só preview desde 2026-10-26)
   - `src/lib/segmentStorage.ts:291,356` — passagem para preview RPCs
   - `src/lib/segmentation/astV2ToBuilder.ts:432` — hydrate builder UI (legado, não usado pela page atual)
   - `src/lib/segmentation/normalizeAstV2.ts` — adapter de shape no load (R48)
@@ -180,9 +180,10 @@ Antes de implementar qualquer novo pipeline, responder:
   - `journeys-worker` — segment-trigger journeys
   - `generate-export` Edge Function — export de segmentos
   - `src/lib/segmentStorage.ts:555` — `getSegmentPartiesForCampaign()` → envio de campanha
-  - `src/pages/admin/CampaignSend.tsx` — via `getSegmentRecipientsFailClosed()` (R38)
+  - `src/pages/admin/CampaignSend.tsx` — via `getSegmentRecipientsFailClosed()` (R38), só no preview "Ver destinatários" (UI 2026-10-26, não deployada)
   - `api.get_segments_recipient_count(tenant_id, segment_ids[], exclude_segment_ids[])` — COUNT DISTINCT lower(email) entre múltiplos segmentos, descontando segmentos de exclusão; `segment_ids NULL` = todos os contatos do tenant. Usado por `CampaignSend.tsx` para exibir contagem exata de destinatários únicos no botão de envio (somente leitura, mesma semântica de `get_segment_parties_for_campaign`)
-  - `CampaignSend.tsx` — `getExclusionEmailSet()` lê membros de segmentos marcados como EXCLUSÃO no disparo (fail-closed: exclusão com regras e 0 membros bloqueia o envio). IDs auditados em `email.campaign_sends.excluded_segment_ids`
+  - `CampaignSend.tsx` — `getExclusionEmailSet()` lê membros de segmentos marcados como EXCLUSÃO para o preview de destinatários (desde a UI de 2026-10-26 o disparo manda só `exclude_segment_ids` e o servidor aplica). IDs auditados em `email.campaign_sends.excluded_segment_ids`
+  - `email.create_campaign_send` (via `api.create_campaign_send`, R61, 2026-10-26) — materializa destinatários de campanha (`mode=segments`) e aplica segmentações de exclusão (`segments`/`all`/`resend_unopened`) com `INSERT … SELECT` no servidor; fail-closed igual ao front (segmento com regras e 0 membros → `segment_not_materialized`; exclusão idem → `exclusion_segment_not_materialized`; segmento sem regras e vazio → `segment_empty`). Substitui `getSegmentRecipientsFailClosed()`/`getExclusionEmailSet()` no envio na UI de 2026-10-26 (não deployada); o preview continua usando-os.
   - `supabase/functions/check-journey-entries/index.ts:213` — enrollment de journey
   - UI — counts, listagens (`get_segment_parties_preview`)
   - Views: `analytics.v_segment_unified` (preview)
@@ -238,7 +239,9 @@ Antes de implementar qualquer novo pipeline, responder:
 ### email.campaign_sends — Metadados do envio (1 row por disparo)
 
 - **Writers:**
-  - `src/pages/admin/CampaignSend.tsx:697` — INSERT: user triggers send from UI
+  - **`api.create_campaign_send(p jsonb)` → `email.create_campaign_send` (R61, 2026-10-26, migration `20261026120100_create_campaign_send_atomic`)** — INSERT do envio + destinatários + job numa transação; copia `message_type`/`group_id`/`transactional_reason` da campanha; agendado → marca a campanha `scheduled`. Único writer de envio direto da UI depois do deploy da UI nova.
+  - `src/pages/admin/CampaignSend.tsx` — **UI 2026-10-26 (não deployada):** não insere mais; `createSendMutation`/`sendTestMutation` → `src/lib/email/campaignSendRpc.ts` `submitCampaignSend()` → `api.create_campaign_send`. Até o deploy, o bundle em produção ainda faz o INSERT direto legado.
+  - `email.cancel_orphan_campaign_sends` / `api.cancel_orphan_campaign_sends` (R61) — UPDATE `pending` sem destinatários e sem job há > 30 min → `cancelled` (`error_message='orphan_send_without_recipients: …'`). Chamador: `CampaignSend.tsx` ao abrir a tela (uma vez por tenant, em background, só loga; UI 2026-10-26)
   - `supabase/functions/process-journey/index.ts:461` — INSERT: journey email node
   - `workers/journeys/src/handlers/processJourneyNode.ts:1629` — INSERT: journey worker email node
   - `workers/email-campaign/src/handlers/prepareEmailBatch.ts:24,47,58,85` — UPDATE status (sending/failed/completed)
@@ -248,7 +251,7 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/email-campaign/src/handlers/sendEmailBatch.ts:119` — load send for processing
   - `api.get_campaign_unsubscribe_stats` (Onda 3) — filtra `send_id`s do tenant; `delivered_count` como fallback de entregues
   - `api.get_tenant_consent_summary` (Onda 3) — contagem de envios marketing/transacional e `sum(sent_count)` transacional na janela (`is_test` fora; status `cancelled/scheduled/pending/draft` fora; data `coalesce(started_at, created_at)`)
-- **Colunas de rastreabilidade (Guard 1):** `recipient_source` (segment/manual/all/test), `segment_ids` (uuid[]), `segment_parties_snapshot` (int), `recipient_count_at_send` (int). Adicionadas Sprint 12 para auditoria de blast radius.
+- **Colunas de rastreabilidade (Guard 1):** `recipient_source` (segment/manual/all/test/resend_unopened — o último desde 2026-10-26, gravado só por `api.create_campaign_send`), `segment_ids` (uuid[]), `segment_parties_snapshot` (int), `recipient_count_at_send` (int). Adicionadas Sprint 12 para auditoria de blast radius.
 - **Validação no banco (R60, 2026-10-21, migration `20261021120000_campaign_message_type_validation`):** trigger `trg_campaign_sends_validate_message_type` (BEFORE INSERT OR UPDATE OF `message_type, group_id, transactional_reason`) → `email.campaign_sends_validate_message_type()`. Marketing sem `group_id` → `marketing_requires_group`; grupo de outro tenant → `invalid_group`; transacional → `group_id` forçado a NULL e `transactional_reason` obrigatório quando `is_test=false` (vem do send ou, se ausente, de `email_campaigns.transactional_reason`) → senão `transactional_requires_reason`. Todos SQLSTATE `23514`. Em UPDATE só valida quando essas colunas mudam de fato; SET NULL da FK de grupo é aceito. **Todo writer novo** de `campaign_sends` precisa mandar grupo (marketing) ou ter motivo na campanha (transacional).
   - `workers/journeys/src/handlers/processJourneyNode.ts` passa `transactional_reason` da campanha e trata a rejeição (`sendValidationErrorCode`): nó falha uma vez com mensagem clara, sem retry (não deployado).
   - `supabase/functions/process-journey/index.ts` (legado, sem callers conhecidos) insere sem `message_type`/`group_id` → seria rejeitado por `marketing_requires_group`.
@@ -257,7 +260,8 @@ Antes de implementar qualquer novo pipeline, responder:
 ### email.campaign_recipients — Lista congelada de envio (R38)
 
 - **Writers:**
-  - `src/pages/admin/CampaignSend.tsx:732` — INSERT bulk: congela lista de recipients ao disparar campanha
+  - **`api.create_campaign_send(p jsonb)` → `email.create_campaign_send` (R61, 2026-10-26)** — `INSERT … SELECT` no servidor, na mesma transação do `campaign_sends` e do job: `segments` (`analytics.segment_parties` ⋈ `crm.parties`), `all` (`crm.vw_parties_unified` cliente ou lead), `emails` (lista explícita/teste, minúsculas) e `resend_unopened` (destinatários `sent|delivered` sem abertura/clique/bounce/descadastro/spam de um envio anterior da mesma campanha). Dedupe por `lower(btrim(email))`; segmentações de exclusão aplicadas (exceto `emails`); `party_id` preenchido direto da fonte (no modo `emails` a trigger `trg_resolve_recipient_party_id` resolve). Teto 50.000. **O front nunca mais insere aqui (R61).**
+  - `src/pages/admin/CampaignSend.tsx` — INSERT bulk direto **removido na UI de 2026-10-26** (não deployada; causava envio órfão por timeout de 8 s). O bundle em produção ainda o faz até o deploy.
   - `supabase/functions/process-journey/index.ts:477` — INSERT: single recipient (journey node)
   - `workers/journeys/src/handlers/processJourneyNode.ts:1652` — INSERT: single recipient (journey worker)
   - `workers/email-campaign/src/handlers/sendEmailBatch.ts:376,393,408` — UPDATE status → `skipped` (suppressed/unsubscribed)
@@ -333,12 +337,13 @@ Antes de implementar qualquer novo pipeline, responder:
 
 ### email.campaign_type_changes — Trilha de troca de tipo de campanha (2026-10-21)
 
-- **Writer:** `api.set_campaign_message_type` (só quando algo muda). RLS sem policies, sem grants a anon/authenticated; service_role SELECT/INSERT.
+- **Writer:** `api.set_campaign_message_type` (só quando algo muda) e `email.duplicate_campaign` (cópia de transacional sem motivo convertida em marketing, 2026-10-26). RLS sem policies, sem grants a anon/authenticated; service_role SELECT/INSERT.
 - **Readers:** nenhum na UI ainda (operacional via service_role).
 
 ### email.email_campaigns.message_type / transactional_reason (R60)
 
-- **Writers:** `api.set_campaign_message_type` (owner/admin; transacional exige motivo e zera `group_id`; marketing exige grupo ativo). A UI legada ainda faz UPDATE direto de `message_type` (sem motivo) até o deploy da Onda 2 — campanha virada para transacional por esse caminho depois do backfill fica sem motivo e seus envios não-teste são rejeitados pela trigger de `campaign_sends` (`transactional_requires_reason`). Na Onda 2 (interface, não deployado) a UI passa a usar a RPC: `CampaignEditor.tsx` → `CampaignMessageTypeField` → `src/lib/email/messageType.ts` `setCampaignMessageType()`; os saves do editor não mandam mais `message_type` e só mandam `group_id` em marketing. `CampaignSend.tsx` duplica campanha copiando `transactional_reason` (transacional) e lê o motivo para o insert de `campaign_sends.transactional_reason`.
+- **Writer na duplicação (2026-10-26, migration `20261026120000_duplicate_campaign_copies_transactional_reason`):** `email.duplicate_campaign` (via `api.duplicate_campaign`; chamadores `Campaigns.tsx`, `CampaignResults.tsx`, `CampaignMobileSummary.tsx`) copia `transactional_reason`; transacional com motivo → cópia transacional sem grupo; transacional sem motivo → cópia **marketing** com o grupo da origem (se ativo) ou o padrão ativo do tenant, e uma linha em `email.campaign_type_changes` (`campaign_id` = cópia). Antes a cópia nascia sem motivo e o envio era recusado (`transactional_requires_reason`).
+- **Writers:** `api.set_campaign_message_type` (owner/admin; transacional exige motivo e zera `group_id`; marketing exige grupo ativo). A UI legada ainda faz UPDATE direto de `message_type` (sem motivo) até o deploy da Onda 2 — campanha virada para transacional por esse caminho depois do backfill fica sem motivo e seus envios não-teste são rejeitados pela trigger de `campaign_sends` (`transactional_requires_reason`). Na Onda 2 (interface, não deployado) a UI passa a usar a RPC: `CampaignEditor.tsx` → `CampaignMessageTypeField` → `src/lib/email/messageType.ts` `setCampaignMessageType()`; os saves do editor não mandam mais `message_type` e só mandam `group_id` em marketing. `CampaignSend.tsx` (UI 2026-10-26) duplica via `api.duplicate_campaign` e, no diálogo de próxima ação (`SendOutcomeDialog`), chama `setCampaignMessageType()` para converter para marketing, registrar o motivo ou trocar o grupo (owner/admin; editor troca só o grupo por UPDATE de `group_id` em campanha de marketing, como o editor).
 - **Backfill 2026-10-21:** 139 campanhas transacionais receberam `transactional_reason='legacy: classificado antes da validação (2026-10-21)'` (tipo e `group_id` da campanha inalterados).
 - **Readers:** trigger de `campaign_sends` (fallback do motivo), `processJourneyNode.ts`.
 
@@ -647,7 +652,7 @@ Fonte ÚNICA da seleção do backfill — mudar aqui muda worker, preview e dry-
 
 ## email.campaign_sends — agendamento e cancelamento
 
-- **Writers:** `CampaignSend.tsx` (insert do envio; reagendar chama `email.cancel_campaign_scheduled_sends` antes), `workers/email-campaign` (prepare/send batch: `scheduled|pending` → `sending` → `completed`), `email.cancel_scheduled_send` (→ `cancelled`), `reconcile-sendgrid` (contadores), `process-journey` (insert com status `pending`)
+- **Writers:** `api.create_campaign_send` (R61; com `cancel_previous_scheduled` — padrão `true` quando agendado — chama `email.cancel_campaign_scheduled_sends` na mesma transação; sem ele, conflito no índice R49 vira `error_code='already_scheduled'`), `CampaignSend.tsx` (legado em produção: insert do envio; reagendar chama `email.cancel_campaign_scheduled_sends` antes. UI 2026-10-26: só `api.create_campaign_send`, com `cancel_previous_scheduled=true` apenas quando a confirmação mostrou o agendamento vivo ou o usuário escolheu "Cancelar o agendamento anterior e agendar este" no diálogo de `already_scheduled`), `workers/email-campaign` (prepare/send batch: `scheduled|pending` → `sending` → `completed`), `email.cancel_scheduled_send` (→ `cancelled`; o front chama o wrapper `api.cancel_scheduled_send` em `CampaignSend.tsx` e `Campaigns.tsx` desde a UI de 2026-10-26), `reconcile-sendgrid` (contadores), `process-journey` (insert com status `pending`)
 - **Readers:** `Campaigns.tsx` (agendados + em andamento, com botão cancelar/parar), `CampaignSend.tsx` (Envios Recentes), `CampaignResults.tsx`
 - **Invariante (R49):** índice `campaign_sends_one_scheduled_per_campaign` — no máximo UM envio `scheduled` não-teste por campanha. Jornadas criam `pending`, então não colidem.
 - **Cancelamento (R50):** `email.cancel_scheduled_send(send_id, tenant_id)` aceita `scheduled|pending|sending`; marca recipients `pending`→`skipped`, remove jobs pendentes do envio em `journeys.processing_jobs` (por `payload->>'send_id'`) e devolve a campanha para `ready` (nada enviado) ou `sent` (envio parcial). Recipients `processing` são deixados em paz — o lote em voo termina e os seguintes abortam pela checagem de status em `sendEmailBatch.ts`.
