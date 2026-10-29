@@ -1051,13 +1051,37 @@ Leitura só (migration `20261028120000_account_overview_rpc`). Nenhum writer.
 
 Mudou coluna/semântica de qualquer tabela acima (ex.: limites novos em `core.plans`) → revisar a RPC e o contrato do front.
 
-## Isolamento de jornadas (26/10/2026 — implementação local, não publicada)
+## Fila de jornadas — espera por pré-condição (Fase 0, 29/10/2026, em produção)
 
-- `journeys.queue_tenant_policy`: writer `claim_next_jobs` (registro/último atendimento), operação service_role (limites/pausa); readers claim, worker antes de cada nó, scheduler de waits.
-- `journeys.campaign_waits`: writer `park_campaign_wait` chamado por `processJourneyNode`; reader/consumer `enqueue_ready_waits` (campanha pronta ou expirada); reader agregado `v_queue_isolation_health`.
-- `journeys.node_attempts`: writer `begin_node_attempt`, chamado antes de executar nó sem sucesso anterior; chave inscrição/nó, não job.
-- `journeys.failure_windows`: writer `record_node_failure`, chamado pelo worker e `fail_job`; pode pausar `journeys.journeys`.
-- `journeys.queue_alerts`: writers disjuntor, orçamento de nó, expiração de espera, `queueIsolationHealth`; reader/claimer `runQueueIsolationHealthCheck`, que envia Sentry a partir do scheduler (modos scheduler e combined).
-- `journeys.processing_jobs`: enqueue com dedupe atômico de pendente; claim com exclusão de inscrição já claimed/running; heartbeat do lote pelo worker; recovery e fail respeitam sucessor. Singular e batch compartilham seleção.
-- `journeys.journey_enrollments.next_execution_at`: park limpa; reconciliação de campanha pronta agenda; pausa concorrente preserva retomada; orçamento/expiração limpam e marcam error.
-- Configuração de réplicas e validação: `docs/JOURNEY_ISOLATION.md`. Não alterar readiness, estados ou chave de dedupe sem revisar todos esses consumidores.
+Contrato completo em `docs/JOURNEY_ISOLATION.md`. **Antes de mudar:** status enviáveis de campanha, valores de `wait_reason`, chave de dedupe `enrollment_<id>` ou a semântica de `next_execution_at` → revisar todos os readers e writers abaixo.
+
+**`journeys.journey_enrollments.wait_reason` / `wait_ref_id` / `waiting_since`**
+
+| Papel | Quem |
+|---|---|
+| Writers (espera) | `journeys.apply_enrollment_blocker`, chamada por `enqueue_ready_waits`, `sweep_orphan_enrollments` e pela trigger `trg_execution_campaign_not_ready` (AFTER INSERT em `journey_executions`, `send_email` + `campaign_not_ready`) |
+| Writers (limpeza) | `journeys.release_campaign_waits`, chamada pela trigger `trg_campaign_release_journey_waits` e pela rede de segurança do `enqueue_ready_waits`; `journeys.fail_campaign_waits`, chamada pela trigger `trg_campaign_delete_journey_waits` e pelo cron; trigger `trg_enrollment_clear_stale_wait`, quando o worker avança de nó ou encerra a inscrição |
+| Readers | `enqueue_ready_waits` e `sweep_orphan_enrollments` (ignoram quem tem espera); `journeys.enrollment_blocker` (diagnóstico); futuro "agora nesta etapa" do canvas (Fase 1) |
+
+**Portão `journeys.evaluate_enrollment_blocker`**
+- Lê `journeys.journeys.status`, o nó atual (versão congelada → grafo vivo) e `email.email_campaigns.status`.
+- O worker `journeys` (`processJourneyNode.ts`) mantém a própria lista `['ready','sent','automation']`. As duas listas precisam ser iguais.
+
+**`email.email_campaigns.status`** (reader novo)
+- As triggers `trg_campaign_release_journey_waits` (AFTER UPDATE OF status, WHEN inline) e `trg_campaign_delete_journey_waits` (AFTER DELETE) agora reagem a mudanças nesse campo.
+- Quem escreve: `CampaignEditor.tsx` (Salvar → `ready`), `CampaignSend.tsx` ("Salvar para Automação" → `automation`), `sendEmailBatch` (`ready` → `sent`) e `Campaigns.tsx` (DELETE físico).
+
+**`journeys.journeys.status`** (reader novo)
+- As triggers `trg_journey_cancel_pending_jobs` e `trg_journey_delete_cancel_pending_jobs` disparam ao sair de `active`.
+- Elas cancelam os `process_enrollment` pendentes, mas retêm os de entrada, que vão para `paused`/`draft` e são cancelados ao arquivar ou excluir.
+- O claim também filtra `process_enrollment` de jornada não ativa.
+
+**`journeys.processing_jobs`**
+- O claim (`claim_next_jobs`/`claim_next_job`) é compartilhado com o worker `email-campaign`, com a mesma assinatura e retorno.
+- A reserva anti-inanição vale por `job_type`.
+- A dedupe de `process_enrollment` usa a chave única `enrollment_<id>`, nos produtores `enqueue_ready_waits` e `sweep_orphan_enrollments`.
+
+**Permissões**
+- Todas as funções de `journeys` só têm EXECUTE para `postgres` e `service_role`.
+- Exceção: `journeys.safe_timestamptz`, usada pela trigger SECURITY INVOKER `trg_journey_status_lifecycle` na ativação pelo navegador.
+- Ver R63.

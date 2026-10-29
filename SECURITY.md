@@ -1,8 +1,8 @@
 # KreatorsHub — Security Architecture & Compliance Roadmap
 
 ## Estado: Sprint 5 — Completo ✅ | Auditoria factual: 2026-03-20
-## Última atualização: 2026-10-22 (push: 2026-10-20)
-## Versão: 1.9
+## Última atualização: 2026-10-29 (§12.6: SECURITY DEFINER expostas à anon key)
+## Versão: 2.0
 
 ---
 
@@ -1041,6 +1041,48 @@ Views agora executam com privilégios do **caller** (authenticated), respeitando
 | `core`, `eduzz`, `pgbouncer` são 100% DEFINER | **BAIXA** | Justificado: funções de sistema/infraestrutura | ✅ Sprint 3 — documentado |
 | ~~3 views sem `security_invoker` (dados cross-tenant)~~ | ~~**ALTA**~~ | ~~Adicionar `security_invoker = true`~~ | ✅ Sprint 1 |
 
+### 12.6 SECURITY DEFINER executáveis por anon/authenticated: auditoria e correção de 29/10/2026
+
+**Causa.**
+- O Postgres dá EXECUTE a PUBLIC em toda função nova.
+- Os schemas expostos (`pgrst.db_schemas`, como `public`, `journeys`, `analytics`, `email`, `inbox`, `crm`, `core`, `commerce`, `api`) dão USAGE a anon e authenticated.
+- Função SECURITY DEFINER com owner `postgres` ignora RLS.
+
+Resultado: qualquer pessoa com a anon key (pública, no bundle) chamava `POST /rest/v1/rpc/<fn>` com `Content-Profile: <schema>`. Como o signup é público, "só authenticated" também não protege. A regra que nasceu daqui é a R63 em `ARCHITECTURE.md`.
+
+**Achados e correções (todas aplicadas em 29/10/2026):**
+
+| Migration | Escopo | Gravidade |
+|---|---|---|
+| `20261029190718_revoke_public_secret_functions` | `public.read_secret` (devolvia qualquer segredo do Vault, inclusive `service_role_key` e `ANTHROPIC_API_KEY`), `public.create_secret` e `public.eduzz_get_integration` (tokens OAuth da Eduzz). Ficaram só para postgres/service_role. | **Crítica** |
+| `20261029184147_journeys_queue_function_grants` | Fila de jornadas: `claim_next_job`, `enqueue_job`, `complete_job`, `fail_job`, `release_stale_claims`, `cleanup_old_jobs`, `enqueue_*`. Antes dava para pegar ou criar jobs de qualquer tenant, devolver claims ou apagar o histórico. | Alta |
+| `20261029191215_queue_functions_grants_other_schemas` | 83 funções de fila e enfileiramento em `analytics`, `email`, `integrations`, `inbox`, `eduzz`, `doare`, `imports` e `public`. Antes dava, por exemplo, para resetar ou cancelar envios de qualquer tenant, ler `nylas_grant_id` ou disparar edge functions com a service key. Ganharam `search_path=''` em 4 funções. | Alta |
+| Onda 2: `20261029205501_security_definer_wave2_revokes` + `20261029205748_security_definer_wave2_tenant_checks` (modo público de `upsert_party_person` aceita só tenant, email, nome, telefone e `p_roles=['lead']`, e exige tenant ativo com landing publicada) | 167 funções de leitura/escrita de PII sem checagem: inbox, CSV de reativação, RFM, contexto do contato, upserts Eduzz/Doare/import, transações, merge de produtos, remetente padrão, lista de usuários. 127 ficaram só para backend. 15 ficaram para authenticated com `app_auth.assert_tenant_access` (ou exigência de system admin) no corpo. `crm.upsert_party_person` e `core.check_email_exists` têm modo público restrito. | **Crítica** |
+
+**Bypass de backend nas checagens novas.** As checagens deixam passar quando:
+- `auth.role()='service_role'`;
+- `current_setting('role')='service_role'`;
+- `session_user='postgres'` (workers e pg_cron).
+
+Nenhum desses é forjável pelo cliente sem já ter credencial de backend.
+
+**Evidência de abuso.** Nenhuma chamada a essas funções com chave anon ou JWT authenticated nos edge_logs de 31/07 a 29/10, nem em `pg_stat_statements` (zerado em 01/06, com 14 descartes). Antes de 31/07 não há log.
+
+**Rotação recomendada, por precaução:** `service_role_key` legada, `ANTHROPIC_API_KEY`, token do WhatsApp, `push_processador_segredo`, `consent_ip_hash_secret` e tokens OAuth da Eduzz.
+
+**Pendências.**
+- **Default privileges:** em `public`, `core` e `doare` as funções novas nascem executáveis por anon. Recriar `read_secret` com DROP + CREATE reexpõe o segredo. Toda migration de função precisa do REVOKE explícito (R63). Falta uma varredura em CI.
+- **`core.get_user_tenant_memberships` e `core.get_user_features`:** ainda executáveis por anon e não amarradas a `auth.uid()` (Onda 3).
+- **Enumeração por convite em `core.check_email_exists`:** continua possível de forma ruidosa. A correção é amarrar a consulta ao token do convite.
+- **`commerce.get_customer_billing_data` e `core.validate_activation_code`:** precisam de rate limit.
+- **Frontend que chama funções internas direto** em vez de `api.*`: `opportunityStorage.ts` (`crm.fn_*`), `ProductMerge.tsx`, `landingStorage.ts`, `SystemUsers.tsx`/`use-tenant-detail.ts`/`use-user-detail.ts` (`core.list_all_users`). Depois de migrar essas chamadas, as funções podem ir para backend-only.
+- **Bug antigo:** `src/lib/leadImportStorage.ts:921` chama `upsert_contact_tags` no schema `public`, onde a função não existe. A criação de tags no import falha hoje; a correção é `.schema('api')`.
+
+**Rollbacks** (não executados):
+- `supabase/scripts/2026-10-29_journeys_queue_function_grants_rollback.sql`
+- `supabase/scripts/2026-10-29_queue_functions_grants_other_schemas_rollback.sql`
+- `supabase/scripts/2026-10-29_security_definer_wave2_rollback.sql`
+
 ---
 
 ## 13. Dados Sensíveis (PII)
@@ -2059,6 +2101,12 @@ Ações que geram audit log obrigatório:
 # PARTE G — HISTÓRICO
 
 ## 26. Changelog
+
+### 2026-10-29 — SECURITY DEFINER expostas à anon key (§12.6, R63)
+- **Segredos do Vault e tokens:** `public.read_secret`, `create_secret` e `eduzz_get_integration` revogados de PUBLIC/anon/authenticated.
+- **Funções de fila:** 12 em `journeys` e 83 nos demais schemas ficaram restritas a `postgres`/`service_role`.
+- **Onda 2:** 167 funções de PII. Ficaram só para backend, ou para authenticated com `assert_tenant_access` no corpo.
+- **Investigação e próximos passos:** nenhum sinal de abuso nos logs disponíveis. Rotação de chaves recomendada; pendências em §12.6.
 
 ### 2026-10-20 — Notificações push (Web Push), port do Carreta Oftalmo — NÃO aplicado
 
