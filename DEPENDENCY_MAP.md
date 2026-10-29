@@ -219,6 +219,9 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/historical-sync/src/handlers/webhook/analytics-events.ts:185` — `import_ids` array append
 - **Writers — Purchase ingestion pipeline:**
   - `workers/ingestion/src/handlers/shared/analytics-pipeline.ts:42` — chama `analytics.process_purchase_analytics()` RPC (upsert interno)
+- **Writers — tag_ids (SQL triggers `trg_sync_tag_ids_customer` / `trg_sync_tag_ids_lead` em `crm.customer_tags` / `crm.lead_tags`):**
+  - `analytics.sync_tag_ids_to_contact_state()` — append/remove em `tag_ids` + `apply_contact_state_mutation('syncTagIds')`
+  - Writers de `crm.customer_tags`/`crm.lead_tags` que disparam o trigger: `workers/journeys/src/handlers/processJourneyNode.ts` `executeAddTagNode` (R62: `ON CONFLICT (party_id, tag_id)`; cliente sem `customer_id` grava só `party_id`), `executeRemoveTagNode` (DELETE)
 - **Writers — segment_ids (SQL triggers):**
   - `apply_segment_membership_diff()` — array_union/array_except em `segment_ids` (múltiplas versões nas migrations)
   - `trg_cleanup_segment_ids_on_delete` — `array_remove(segment_ids, segment.id)` ao soft-delete segmento
