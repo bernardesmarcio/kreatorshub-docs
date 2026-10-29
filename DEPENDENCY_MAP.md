@@ -3,7 +3,7 @@
 > **REGRA R37**: Antes de alterar qualquer item listado aqui, verificar TODOS os readers/writers.
 > Atualizar este arquivo sempre que adicionar novo consumidor.
 >
-> Gerado em: 2026-03-19 · Última atualização: 2026-10-22 (push: 2026-10-20, não aplicado) · Frontend mobile: 2026-10-21 (casca e navegação, kit mobile, leitores novos; acompanha ARCHITECTURE v10.0 §25)
+> Gerado em: 2026-03-19 · Última atualização: 2026-10-29 (consentimento manual: `api.set_email_consent` limpa grupos inativos; push: 2026-10-20, não aplicado) · Frontend mobile: 2026-10-21 (casca e navegação, kit mobile, leitores novos; acompanha ARCHITECTURE v10.0 §25)
 
 ---
 
@@ -254,6 +254,7 @@ Antes de implementar qualquer novo pipeline, responder:
   - `workers/email-campaign/src/handlers/sendEmailBatch.ts:119` — load send for processing
   - `api.get_campaign_unsubscribe_stats` (Onda 3) — filtra `send_id`s do tenant; `delivered_count` como fallback de entregues
   - `api.get_tenant_consent_summary` (Onda 3) — contagem de envios marketing/transacional e `sum(sent_count)` transacional na janela (`is_test` fora; status `cancelled/scheduled/pending/draft` fora; data `coalesce(started_at, created_at)`)
+  - `api.get_account_overview` (2026-10-28) — `count`/`sum(sent_count)`/`sum(delivered_count)` do tenant em mês (SP), 30 dias e total, mesmo filtro do `get_tenant_consent_summary`; consumidor `src/lib/accountOverview.ts` → `AccountBilling.tsx` (aba Visão geral)
 - **Colunas de rastreabilidade (Guard 1):** `recipient_source` (segment/manual/all/test/resend_unopened — o último desde 2026-10-26, gravado só por `api.create_campaign_send`), `segment_ids` (uuid[]), `segment_parties_snapshot` (int), `recipient_count_at_send` (int). Adicionadas Sprint 12 para auditoria de blast radius.
 - **Validação no banco (R60, 2026-10-21, migration `20261021120000_campaign_message_type_validation`):** trigger `trg_campaign_sends_validate_message_type` (BEFORE INSERT OR UPDATE OF `message_type, group_id, transactional_reason`) → `email.campaign_sends_validate_message_type()`. Marketing sem `group_id` → `marketing_requires_group`; grupo de outro tenant → `invalid_group`; transacional → `group_id` forçado a NULL e `transactional_reason` obrigatório quando `is_test=false` (vem do send ou, se ausente, de `email_campaigns.transactional_reason`) → senão `transactional_requires_reason`. Todos SQLSTATE `23514`. Em UPDATE só valida quando essas colunas mudam de fato; SET NULL da FK de grupo é aceito. **Todo writer novo** de `campaign_sends` precisa mandar grupo (marketing) ou ter motivo na campanha (transacional).
   - `workers/journeys/src/handlers/processJourneyNode.ts` passa `transactional_reason` da campanha e trata a rejeição (`sendValidationErrorCode`): nó falha uma vez com mensagem clara, sem retry (não deployado).
@@ -296,12 +297,14 @@ Antes de implementar qualquer novo pipeline, responder:
   - `email.expire_soft_bounce_suppressions()` (pg_cron/worker) — UPDATE is_active=false de soft bounce expirado (housekeeping, exceção documentada na R59)
 - **Readers:**
   - `api.get_tenant_consent_summary` (Onda 3) — ativos por `suppression_type` (exclui soft bounce expirado). `suppression_list` não tem `send_id`: o spam por envio vem de `email_events`/`campaign_recipients`.
+  - `api.get_email_consent_status` (2026-10-29) — supressões ativas e não expiradas de um email (`suppression_type`, `reason`, `suppressed_at`) → `effective=suppressed`.
     - UI: `TenantConsentSummaryCard` (suprimidos por tipo) e `estimateBlockedRecipients()` (soma de `suppressed_by_type` no "até N podem ser pulados" de `CampaignSend.tsx`). O front não tem GRANT em `suppression_list`; esta RPC é o único caminho.
   - Migration `20261022120300_consent_backfill_d3_d4` (D3) — leu `spam_report` ativos sem global
   - `workers/email-campaign/src/handlers/sendEmailBatch.ts:253` — SELECT suppressed emails (pre-send gate)
   - `workers/email-campaign/src/handlers/retrySoftBounce.ts:120` — SELECT before retry
   - `workers/journeys/src/handlers/processJourneyNode.ts:1883` — SELECT before journey send
   - `email.consent_state_snapshot()` — before/after da trilha de consentimento
+  - `api.get_email_consent_status(p_tenant_id, p_email)` (2026-10-29) — global (ativo ou não) + unsubs de grupo ativos com nome/`is_active` do grupo; unsub ativo em grupo inativo → `effective=global_unsubscribed` (R60). Qualquer membro do tenant.
 - **Regra:** Check obrigatório antes de qualquer envio. Tripla camada: suppression + global unsub + group unsub.
 
 ### email.unsubscribes — Global/group unsubscribes
@@ -314,7 +317,8 @@ Antes de implementar qualquer novo pipeline, responder:
 - **Writers legados:** nenhum nas edge functions (o upsert direto foi removido de `unsubscribe` e `save-preferences`).
   - ~~`supabase/functions/eduzz-processor-worker/handlers/sendgrid.ts`~~ — removido em 2026-10-20 (código morto, P19)
 - **Via RPC (Onda 2.2, 2026-10-21):** `api.deactivate_unsubscribe_group(...)` — `convert_to_global`/`migrate_to_group` geram unsubs via `email.apply_consent_changes` (`channel=admin_manual`, `request_payload.reason='group_deactivated'`).
-- **Via RPC (Onda 3, 2026-10-22):** `email.apply_consent_change` `resubscribe` global com `channel=preference_center` (inclui o `confirm_resubscribe` do double opt-in) também faz `is_active=false` nos unsubs ativos de grupos INATIVOS do mesmo email/tenant (ids em `request_payload.inactive_groups_cleared`, uma linha de auditoria). Migration `20261022120300_consent_backfill_d3_d4` (D3) criou 49 globais `source='manual'` (`channel=system`, `request_id='backfill_spam_report_D3_20261022'`) para spam_report ativos sem global.
+- **Via RPC (Onda 3, 2026-10-22; `admin_manual` desde 2026-10-29):** `email.apply_consent_change` `resubscribe` global com `channel=preference_center` (inclui o `confirm_resubscribe` do double opt-in) ou `channel=admin_manual` (`api.set_email_consent`, migration `20261029180000_manual_consent_rpcs_fixes`) também faz `is_active=false` nos unsubs ativos de grupos INATIVOS do mesmo email/tenant (ids em `request_payload.inactive_groups_cleared`, uma linha de auditoria). Demais canais não limpam. Migration `20261022120300_consent_backfill_d3_d4` (D3) criou 49 globais `source='manual'` (`channel=system`, `request_id='backfill_spam_report_D3_20261022'`) para spam_report ativos sem global.
+- **Via RPC (consentimento manual, 2026-10-29):** `api.set_email_consent(p_tenant_id, p_email, p_action, p_scope, p_group_id, p_reason)` — tela do tenant; `email.apply_consent_change` `channel=admin_manual` (`source=manual`), `actor_user_id=auth.uid()`, `request_payload {reason (≤ 500 chars), ui:'tenant_admin'}`. Unsubscribe: membro não-viewer; resubscribe: owner/admin. Resubscribe global também limpa unsubs ativos de grupos inativos (`inactive_groups_cleared`). Retorno **sem `before_state`/`after_state`** desde 2026-10-29 (consumidores não devem ler essas chaves; o estado vem de `api.get_email_consent_status`). Consumidores: `src/lib/email/manualConsent.ts` (`setEmailConsent`, `submitManualUnsubscribe` — 1 chamada global ou N por grupo) → `useManualConsentActions` → `ManualUnsubscribeDialog`/`EmailConsentStatusCard` (detalhe do contato via `ConsentSection`) e `UnsubscribeGroupDetail.tsx` ("Adicionar email" e "Reinscrever" por linha). Status lido por `api.get_email_consent_status` (`getEmailConsentStatus`, cache `["email-consent-status", tenantId, email]`).
 - **FK `unsubscribes_group_id_fkey`:** `ON DELETE RESTRICT` desde 2026-10-21 (antes CASCADE apagava o histórico). Grupo com unsubs não pode ser excluído; o caminho é desativar. Cascata de exclusão de tenant testada e funcionando.
 - **IP:** `ip_address` sempre NULL desde 2026-10-21 (Onda 2.5; históricos anonimizados). IP só como `ip_hash` em `consent_audit_log`.
 - **Readers:**
@@ -1034,3 +1038,26 @@ Vínculo tenant ↔ cliente Asaas da plataforma (conta do tenant Kreators Platfo
 | Frontend | `src/lib/platformBilling.ts` → `TenantBillingTab` (/system/tenants/:id), `AccountBilling` (/admin/account), `PlatformBillingPage` (/cobranca/:token) |
 
 Leitura adicional: `platform-billing` lê `commerce.asaas_config` e `commerce.checkout_orders` APENAS do tenant `PLATFORM_TENANT_ID` (credencial + sugestão de vínculo).
+
+
+## api.get_account_overview (Minha conta — Visão geral, 2026-10-28)
+
+Leitura só (migration `20261028120000_account_overview_rpc`). Nenhum writer.
+
+| Papel | Quem |
+|---|---|
+| Lê | `core.tenants` (id, name, slug, created_at), `core.tenant_plans` + `core.plans` (plano vigente), `email.tenant_config` (SÓ `monthly_send_limit`/`daily_send_limit`), `core.tenant_users` (por role, sem system admins), `core.team_invitations` (pendentes), `email.campaign_sends` (envios), `core.tenant_features` (ativas) |
+| Frontend | `src/lib/accountOverview.ts` → `src/pages/admin/AccountBilling.tsx` (/admin/account, aba Visão geral) |
+
+Mudou coluna/semântica de qualquer tabela acima (ex.: limites novos em `core.plans`) → revisar a RPC e o contrato do front.
+
+## Isolamento de jornadas (26/10/2026 — implementação local, não publicada)
+
+- `journeys.queue_tenant_policy`: writer `claim_next_jobs` (registro/último atendimento), operação service_role (limites/pausa); readers claim, worker antes de cada nó, scheduler de waits.
+- `journeys.campaign_waits`: writer `park_campaign_wait` chamado por `processJourneyNode`; reader/consumer `enqueue_ready_waits` (campanha pronta ou expirada); reader agregado `v_queue_isolation_health`.
+- `journeys.node_attempts`: writer `begin_node_attempt`, chamado antes de executar nó sem sucesso anterior; chave inscrição/nó, não job.
+- `journeys.failure_windows`: writer `record_node_failure`, chamado pelo worker e `fail_job`; pode pausar `journeys.journeys`.
+- `journeys.queue_alerts`: writers disjuntor, orçamento de nó, expiração de espera, `queueIsolationHealth`; reader/claimer `runQueueIsolationHealthCheck`, que envia Sentry a partir do scheduler (modos scheduler e combined).
+- `journeys.processing_jobs`: enqueue com dedupe atômico de pendente; claim com exclusão de inscrição já claimed/running; heartbeat do lote pelo worker; recovery e fail respeitam sucessor. Singular e batch compartilham seleção.
+- `journeys.journey_enrollments.next_execution_at`: park limpa; reconciliação de campanha pronta agenda; pausa concorrente preserva retomada; orçamento/expiração limpam e marcam error.
+- Configuração de réplicas e validação: `docs/JOURNEY_ISOLATION.md`. Não alterar readiness, estados ou chave de dedupe sem revisar todos esses consumidores.
