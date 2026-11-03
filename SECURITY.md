@@ -403,6 +403,7 @@ CREATE POLICY "service_role_all" ON schema.table
 **Estado atual:**
 - Env vars em Railway (não rotacionadas)
 - Supabase secrets em Edge Functions
+- `WINDSOR_API_KEY` (Windsor.ai, redes sociais): secret global do projeto, uma chave para todos os tenants; lida SÓ em edge function (`social-insights` e as de conexão), nunca gravada no banco, nunca logada nem devolvida ao cliente. O isolamento por tenant vem do `account_id` em `integrations.social_accounts` passado em `select_accounts` (ARCHITECTURE §22.18).
 - Algumas credenciais em `integrations.accounts.config` (JSONB)
 
 **Alvo:**

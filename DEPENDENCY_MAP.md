@@ -1085,3 +1085,15 @@ Contrato completo em `docs/JOURNEY_ISOLATION.md`. **Antes de mudar:** status env
 - Todas as funções de `journeys` só têm EXECUTE para `postgres` e `service_role`.
 - Exceção: `journeys.safe_timestamptz`, usada pela trigger SECURITY INVOKER `trg_journey_status_lifecycle` na ativação pelo navegador.
 - Ver R63.
+
+## Redes sociais — edge fn `social-insights` (leitura, 2026-11-02)
+
+Leitura só (ARCHITECTURE §22.18). Nenhum writer no banco: a função só consulta e repassa a Windsor.ai.
+
+| Papel | Quem |
+|---|---|
+| Lê | `core.tenant_users` (membership), `core.system_admins`, `integrations.social_accounts` (SÓ `account_id`, `account_name`, filtro `tenant_id` + `windsor_connector='instagram'` + `status='active'`) |
+| Externo | `GET https://connectors.windsor.ai/instagram` com `WINDSOR_API_KEY` (secret da edge function) e `select_accounts=<account_id>` |
+| Frontend | `src/lib/data/socialInsights.ts` → `src/pages/admin/Social.tsx` e `src/components/social/*` (/admin/social, feature `social`) |
+
+Mudou o nome/forma de `integrations.social_accounts` (colunas `account_id`, `windsor_connector`, `status`) ou os campos do conector da Windsor → revisar a função e os tipos de linha em `socialInsights.ts`.
