@@ -670,10 +670,22 @@ Fonte ÚNICA da seleção do backfill — mudar aqui muda worker, preview e dry-
 
 ### public.chat_contatos / chat_mensagens / chat_config / chat_agentes
 
-- **Writers:** `chat-webhook/index.ts` (mensagens recebidas + resposta IA, service role), `chat-enviar/index.ts` (envio humano, service role), frontend `src/lib/data/chat.ts` (contatos/config/agentes via RLS)
+- **Writers:** `chat-webhook/index.ts` (mensagens recebidas + resposta IA, service role), `chat-enviar/index.ts` (envio humano, service role), `chat-template-enviar/index.ts` (template, service role), **`chat-historico-importar/index.ts`** (importação do histórico do Whaticket por conexão, service role: `chat_contatos`/`chat_mensagens` com `origem='importado'`, `criado_em` = instante real da API; recalcula `ultima_msg_em/preview` e `ultima_recebida_em`; nunca incrementa `nao_lidas`; grava `chat_conexoes.historico_*`), frontend `src/lib/data/chat.ts` (contatos/config/agentes via RLS)
+- **Ordem das mensagens:** `useChatMensagens` (`chat.ts`) ordena por `criado_em` e depois `id` (`compararMensagens` também no realtime) — histórico importado depois tem `id` maior que mensagens mais novas. Índice `chat_mensagens_contato_criado_idx (contato_id, criado_em, id)`.
 - **Readers:** `src/pages/admin/Chat.tsx` via hooks de `src/lib/data/chat.ts`; realtime na publication `supabase_realtime`
 - **RPCs:** `public.chat_incrementa_nao_lidas` (service_role only), `public.chat_zerar_nao_lidas` (authenticated, valida `app_auth.assert_tenant_access`)
 - **Regra:** port 1:1 do módulo campanhas do Carreta Oftalmo — mudanças estruturais devem preservar o mapeamento `campanhas_*` → `chat_*` (ver ARCHITECTURE §22.14)
+
+### public.chat_conexoes / chat_provedor_rota / chat_templates / chat_config_segredos (migrations 2026-11-02, aplicação pendente)
+
+- **chat_conexoes** — token protegido: `authenticated` sem GRANT. Writers: `chat_conexao_salvar` (admin), `chat_conexao_status` (admin), `chat_conexao_token` (system admin; grava `token_visto_*`), `chat_conexao_verificada` (service_role; edge `chat-conexao-testar`, Onda 2). Readers: `chat_conexoes_listar(p_tenant)` (sem token), `chat_contato_conexao(p_contato)`, `chat_conexao_rotas(p_id)`; service_role: `chat_conexao_por_token(p_tenant, p_token)`, `chat_conexoes_oficiais_sync(p_tenant)` (devolvem `base_url` efetiva; a segunda devolve token), `chat-webhook`/`chat-enviar` (tabela direto). **Front (Onda 3, só RPC — nada lê a tabela direto, token nunca chega ao navegador):** `src/lib/data/chatConexoes.ts` chama `chat_conexoes_listar` (`useChatConexoes`, reexportado por `chat.ts`), `chat_conexao_salvar` (`useSalvarConexao`), `chat_conexao_status` (`useDefinirConexaoAtiva`), `chat_conexao_token` (`useRevelarToken`, sob clique) e `chat_conexao_rotas` (`useConexaoRotas`); consumidores `components/chat-config/CardConexoes.tsx`, `FormularioConexao.tsx`, `DialogoCriarConexaoQr.tsx`. Edge functions chamadas de lá: `chat-conexao-testar` (`useTestarConexao`; grava verificação via `chat_conexao_verificada`) e `chat-conexao-criar` (`useCriarConexaoWhaticket`/`useQrConexao`). Os hooks antigos `useCriarConexao`/`useAtualizarConexao` (PostgREST direto em `chat.ts`) e `CardNumeros.tsx` foram removidos.
+- **chat_contatos.conexao_token** — casa por VALOR com `chat_conexoes.token`; `chat_conexao_salvar` reescreve ao trocar o token; `chat-historico-importar` grava o token da conexão nos contatos importados (e preenche quando estava nulo; nunca sobrescreve outro token). **chat_contatos.ultima_recebida_em** — writers: `chat-webhook` (Onda 2) e `chat-historico-importar` (máximo entre banco e lote); backfill na migration; reader: `chat_contato_conexao` (janela 24h).
+- **chat_conexoes.historico_importado_em / historico_lote_em / historico_resumo** (migration `20261103130000`) — writer: só `chat-historico-importar` (service role; `historico_lote_em` é o lock com heartbeat de 5 min). Nenhum reader no front ainda (`chat_conexoes_listar` não devolve). Front: `useImportarHistorico` (`chatConexoes.ts`) → `DialogoImportarHistorico.tsx` / `CardConexoes.tsx`, laço por `proximo_cursor`; invalida `["chat","contatos"]` e a lista de conexões ao terminar.
+- **chat_provedor_rota** — seed na migration (whaticket × oficial × texto_livre/template/midia); leitura authenticated; reader: `chat_conexao_rotas`, edge functions (referência).
+- **chat_templates** — writer: só service_role (`chat_template_upsert` no sync; edge `chat-template-criar` grava `origem='plataforma'`, `painel_template_id`, `submetido_em`). Writers (edge functions, service_role): `chat-templates-sync` (espelha `/api/whatsapptemplates`; também por cron), `chat-template-criar` (criar/submeter no Painel; `acao: testar_painel`/WABAs). Readers: RLS select por membro; front `src/lib/data/chatTemplates.ts` via `chat_templates_listar(p_conexao)` (`useTemplatesConexao` → `chat-templates/TemplatesConexao.tsx`), `chat_templates_aprovados(p_contato)` (`useTemplatesAprovados` → `SeletorTemplates.tsx`) e `chat_contato_conexao(p_contato)` (`useContatoConexao` → `pages/admin/Chat.tsx`, `ChatDetailsSheet.tsx`: conexão oficial + janela 24h). Envio: `chat-template-enviar` (`useEnviarTemplate`).
+- **chat_mensagens.template_nome / template_componentes** — writer: edge `chat-template-enviar` (Onda 2); reader: `useChatMensagens` (`src/lib/data/chat.ts`, no select e no INSERT do realtime) → bolha de template em `pages/admin/Chat.tsx` (campo ausente/null = mensagem normal).
+- **409 `janela_24h_fechada`** — writer: edge `chat-enviar` (conexão oficial fora da janela); reader: `useEnviarMensagem` lança `ChatTemplateErro` (`src/lib/data/chatErros.ts`) com o `codigo`; `Chat.tsx` abre o seletor de templates via `ehErroJanelaFechada`.
+- **chat_config.painel_email + chat_config_segredos** — writer navegador só `chat_config_definir_painel` (admin); reader `chat_config_painel_status` (sem segredo; front: `usePainelStatus` único em `chatConexoes.ts`, reexportado por `chatTemplates.ts`, chave `["chat","painel",tenant]`); service_role (edge `chat-template-criar`) lê senha e grava `painel_jwt`/`painel_jwt_em`.
 
 ---
 
@@ -1086,7 +1098,27 @@ Contrato completo em `docs/JOURNEY_ISOLATION.md`. **Antes de mudar:** status env
 - Exceção: `journeys.safe_timestamptz`, usada pela trigger SECURITY INVOKER `trg_journey_status_lifecycle` na ativação pelo navegador.
 - Ver R63.
 
-## Redes sociais — edge fn `social-insights` (leitura, 2026-11-02)
+---
+
+## Redes sociais (Windsor.ai) — ARCHITECTURE §14.3 (Onda 1, aplicado em produção em 2026-11-03)
+
+### integrations.social_accounts
+- **Writers (só service role):** edge `social-accounts-sync` (insert, ou update da linha do mesmo tenant para `active` com `connected_by`/`connected_at`), edge `social-disconnect` (`status='disconnected'`), seed `supabase/scripts/social_seed_maconequi.sql`. Nenhum writer `authenticated` (sem policy e sem GRANT de escrita).
+- **Readers:** `api.social_accounts_list(p_tenant_id)` (aba Configurações › Redes sociais, `src/components/settings/SocialAccountsTab.tsx` via `src/lib/data/socialAccounts.ts`, query key `["social-accounts", tenantId]`; status da aba em `settings-sections.tsx`; e a edge fn `social-insights` que alimenta a UI `/admin/social`, ver subseção abaixo), RLS select por `is_tenant_member`, edges `social-accounts-sync` (contas `active` de todos os tenants por connector, para excluir das candidatas) e `social-disconnect`.
+- **Chamadores das edge fns:** só `src/lib/data/socialAccounts.ts` (`useSocialConnectUrl` → `social-connect-url`, `useSocialAccountsSync` → `social-accounts-sync`, `useSocialDisconnect` → `social-disconnect`); o estado "aguardando autorização" (`accounts_before` + `snapshot`) fica em `sessionStorage` por 7 dias.
+- **Sem writer ainda:** `last_sync_at`, `error_message`, `status='error'`, `metadata` (reservados para a coleta de métricas).
+
+### Edge functions (JWT ON, owner/admin do tenant ou system admin)
+- `social-connect-url` → Windsor `connect-info` + `ds-accounts`; devolve `accounts_before` (tags) + `snapshot`.
+- `social-accounts-sync` → Windsor `ds-accounts`; lê/grava `integrations.social_accounts`.
+- `social-disconnect` → só `integrations.social_accounts`.
+- Helpers: `_shared/windsor.ts` (fetch Windsor, `requireTenantAdmin`, lê `core.tenant_users`, `core.system_admins`, `core.tenants`), `_shared/socialAccounts.ts` (puro: `PROVIDER_TO_CONNECTOR`, tags/snapshot HMAC, candidatas; testes em `socialAccounts.test.ts`).
+- **Contrato compartilhado:** `accounts_before` + `snapshot` saem de `social-connect-url` e voltam intactos em `social-accounts-sync`; mudar o formato das tags/snapshot (`SNAPSHOT_VERSION`) invalida fluxos em andamento.
+
+### core.features `social`
+- Inserida pela migration `20261102150000` (module `social`, sort_order 42, ícone `share-2`); `core.tenant_features` só para a Maconequi.
+
+### Edge fn `social-insights` (leitura, 2026-11-02)
 
 Leitura só (ARCHITECTURE §22.18). Nenhum writer no banco: a função só consulta e repassa a Windsor.ai.
 
@@ -1097,3 +1129,29 @@ Leitura só (ARCHITECTURE §22.18). Nenhum writer no banco: a função só consu
 | Frontend | `src/lib/data/socialInsights.ts` → `src/pages/admin/Social.tsx` e `src/components/social/*` (/admin/social, feature `social`) |
 
 Mudou o nome/forma de `integrations.social_accounts` (colunas `account_id`, `windsor_connector`, `status`) ou os campos do conector da Windsor → revisar a função e os tipos de linha em `socialInsights.ts`.
+
+### Edge fn `social-ads-insights` (Meta Ads, leitura, 2026-11-03 — NÃO deployada)
+
+Leitura só (ARCHITECTURE §22.18, bullet Meta Ads). Nenhum writer no banco. Roteiro: `supabase/scripts/social_meta_ads_deploy.md`.
+
+| Papel | Quem |
+|---|---|
+| Lê | `core.tenant_users` (membership), `core.system_admins`, `integrations.social_accounts` (SÓ `account_id`, `account_name`, filtro `tenant_id` + `windsor_connector='facebook'` + `status='active'`) |
+| Externo | `GET https://connectors.windsor.ai/facebook` com `WINDSOR_API_KEY` (secret) e `select_accounts=<account_id>`; sempre `date_from`/`date_to` |
+| Helpers | `_shared/socialAds.ts` (puro: `REPORTS_ADS`/`ACOES`, validação de período e de `campaign_id`/`adset_id`, `filtrarLinhasAds`, `montarUrlWindsor`, `classificarRespostaWindsor`, `semChave`; testes em `socialAds.test.ts`) |
+| Frontend | `src/lib/data/socialAdsInsights.ts` (reaproveita `invocar`, `mapearResposta`, `FnErro`, `useTenantId`, `retrySeTransitorio` de `socialInsights.ts`, que passaram a ser exportados/parametrizados pelo nome da fn) → `src/components/social/MetaAdsTab.tsx`, `MetaAdsKpis.tsx`, `MetaAdsSpendChart.tsx`, `MetaAdsCampaignsTable.tsx`, `MetaAdsCampaignSheet.tsx`, `metaAdsFormat.ts`; aba em `src/pages/admin/Social.tsx` (`?tab=meta-ads`); botão "Ver análises" do canal `meta_ads` em `src/components/settings/SocialAccountsTab.tsx` |
+
+Mudou a lista de campos em `REPORTS_ADS`/`ACOES` → revisar os tipos de linha e as puras de `socialAdsInsights.ts` (a derivação de resultados por objetivo lê nomes de campo literais). Mudou `periodo.ts` (`intervaloAteOntem`, `diasDoIntervalo`, `rotuloIntervalo`) → afeta também a aba Instagram.
+
+### Edge fns `social-comment-reply` e `social-comment-hide` (escrita, deployadas em 2026-11-03)
+
+Escrita no Instagram via Windsor.ai (ARCHITECTURE §14.3 "Escrita em comentários"). Nenhum writer no banco: só leem `integrations.social_accounts` para conferir a conta e chamam a Windsor. Roteiro de deploy: `supabase/scripts/social_comentarios_deploy.md`.
+
+| Papel | Quem |
+|---|---|
+| Lê | `core.tenant_users` (owner/admin), `core.system_admins`, `core.tenants` (via `requireTenantAdmin`); `integrations.social_accounts` (filtro `tenant_id` + `windsor_connector='instagram'` + `account_id` + `status='active'`, colunas `account_id, windsor_connector, status`) |
+| Externo | `POST https://mcp.windsor.ai/` (JSON-RPC `tools/call` → `execute_action`, Bearer `WINDSOR_API_KEY`, resposta SSE) — ações `reply_to_comment`, `hide_comment`, `unhide_comment`. Uma chamada por invocação, sem retry |
+| Helpers | `_shared/windsor.ts` (`windsorExecuteAction`, `WindsorError` com `acao_recusada`/`windsor_rate_limit`, `windsorErrorResponse` 422/429), `_shared/socialComments.ts` (puro: `validarTextoComentario`, `validarCommentId`, `contaAtivaDoTenant`, `extrairIdComentario`, `parseCorpoMcp`, `interpretarRespostaMcp`, `motivoRecusa`; testes em `socialComments.test.ts`) |
+| Frontend | `src/lib/data/socialActions.ts` (`useSocialCommentReply` → `social-comment-reply`, `useSocialCommentHide` → `social-comment-hide`; reaproveita `lerErroFn`/`FnErro`/`rotuloErroSocial`/`socialReportKeyPrefix` de `socialInsights.ts`) → `src/components/social/useCommentActions.ts` (único chamador dos hooks; estado compartilhado) → `CommentThread.tsx` (`ListaFios`/`FormResposta`), usado por `InstagramPostSheet.tsx` e `InstagramCommentsPanel.tsx` (alternância em `InstagramPostsTable.tsx`) |
+
+Contratos acoplados: o front valida o texto com `validarTextoComentario` próprio em `socialActions.ts` (2200 code points) — mudar o limite exige mudar os dois lados; `reply_id` pode vir `null` (o front gera id local). `useSocialCommentReply` invalida `socialReportKeyPrefix(tenantId, "comments")`: mudar a chave `K.report` em `socialInsights.ts` quebra a invalidação. `WindsorError`/`windsorErrorResponse` são compartilhados com `social-connect-url`/`social-accounts-sync`/`social-disconnect`: os códigos novos não alteram os existentes.
