@@ -1,7 +1,7 @@
 # KreatorsHub — Security Architecture & Compliance Roadmap
 
 ## Estado: Sprint 5 — Completo ✅ | Auditoria factual: 2026-03-20
-## Última atualização: 2026-10-29 (§12.6: SECURITY DEFINER expostas à anon key)
+## Última atualização: 2026-11-04 (§6.4/§26: Redes sociais, link co-user da Windsor e `integrations.social_connect_links` só service role)
 ## Versão: 2.0
 
 ---
@@ -403,7 +403,8 @@ CREATE POLICY "service_role_all" ON schema.table
 **Estado atual:**
 - Env vars em Railway (não rotacionadas)
 - Supabase secrets em Edge Functions
-- `WINDSOR_API_KEY` (Windsor.ai, redes sociais): secret global do projeto, uma chave para todos os tenants; lida SÓ em edge function (`social-insights`, `social-ads-insights` (Meta Ads, não deployada), as de conexão e as de escrita `social-comment-reply`/`social-comment-hide`), nunca gravada no banco, nunca logada nem devolvida ao cliente. A mesma chave é o Bearer do servidor MCP da Windsor (`https://mcp.windsor.ai/`) nas ações de escrita. O isolamento por tenant vem do `account_id` em `integrations.social_accounts`: passado em `select_accounts` na leitura e, na escrita, conferido como conta `active` do tenant antes de ir em `execute_action.account` (ARCHITECTURE §14.3/§22.18).
+- `WINDSOR_API_KEY` (Windsor.ai, redes sociais): secret global do projeto, uma chave para todos os tenants; lida SÓ em edge function (`social-insights`, `social-ads-insights` (Meta Ads), as de conexão e as de escrita `social-comment-reply`/`social-comment-hide`), nunca gravada no banco, nunca logada nem devolvida ao cliente. A mesma chave é o Bearer do servidor MCP da Windsor (`https://mcp.windsor.ai/`) nas ações de escrita. O isolamento por tenant vem do `account_id` em `integrations.social_accounts`: passado em `select_accounts` na leitura e, na escrita, conferido como conta `active` do tenant antes de ir em `execute_action.account` (ARCHITECTURE §14.3/§22.18).
+- `integrations.social_connect_links.access_token` (2026-11-04): token do link co-user da Windsor (convite de uso único para um tenant ligar contas na conta Windsor da plataforma; é também o filtro que atribui conta → tenant). Segredo operacional: tabela com RLS enable+force, `revoke all` de public/anon/**authenticated** (nem SELECT) e grant/policy só para service_role. Nunca logado inteiro (só `…` + 4 últimos, `tokenSuffix`/`redactWindsorKey`), nunca devolvido como campo; o navegador só recebe a `connect_url` do link que o próprio admin acabou de gerar.
 - Algumas credenciais em `integrations.accounts.config` (JSONB)
 
 **Alvo:**
@@ -2103,7 +2104,21 @@ Ações que geram audit log obrigatório:
 
 ## 26. Changelog
 
-### 2026-11-03 — Redes sociais: leitura de Meta Ads (`social-ads-insights`, escrita, NÃO deployada)
+### 2026-11-04 — Redes sociais: conexão pelo link co-user da Windsor (escrito, NÃO aplicado/deployado)
+- **Incidente:** `GET /api/mcp/connectors/{c}/connect-info` devolve `connect_url` (`/connect?connector=…&user=…`) que é **link de login temporário da conta Windsor dona da chave** (a da plataforma). Sem sessão ele faz 302 para `/login` da Windsor; um usuário do Instituto Socrates caiu nessa tela. Lição: **`connect-info.connect_url` nunca é mostrado a tenant** — é credencial de acesso à NOSSA conta Windsor (se houvesse sessão válida no navegador, daria acesso a todas as contas de todos os tenants). `windsorConnectInfo` foi removido.
+- **Link certo:** `generate-co-user-url/?allowed_sources=<connector>` → `https://onboard.windsor.ai/co-user-login?access_token=…`: o cliente autoriza só a fonte permitida, sem login. `parseCoUserUrl` recusa qualquer URL que não seja `https://onboard.windsor.ai/co-user-login` com token e a fonte pedida.
+- **Token só no banco, só service role:** `integrations.social_connect_links` (RLS enable+force; `revoke all` de public, anon e authenticated; grants + `service_role_bypass` só para service_role). O token é a chave da atribuição conta → tenant (`co-user-linked-accounts/?access_token=`), então vazar o de um tenant permitiria ver/reivindicar contas dele. `accountsForLink` descarta grupos com token alheio caso a Windsor ignore o filtro.
+- **Sem seguir redirect com a chave:** `windsorRequest` usa `redirect: "manual"`; 3xx vira `windsor_indisponivel {motivo:"redirect"}` e o `Location` é logado sem query. Antes, um 308 de barra final ou um redirect para `/login` levaria `?api_key=` adiante.
+- **Logs:** `redactWindsorKey(texto, key, tokens)` remove a chave, `api_key=…` e reduz `access_token=…`/`"access_token":"…"`/tokens conhecidos a `…` + 4 últimos.
+- **Desconectar desvincula na Windsor** (`DELETE co-user-linked-accounts/`): conta desconectada deixa de ficar acessível pela conta da plataforma. Falha da Windsor não impede o `disconnected` (fica registrado em `metadata.windsor_unlink`).
+- **Fim do snapshot HMAC:** a atribuição por token substitui as tags/snapshot assinados da Onda 1 (entrada de 2026-11-02 abaixo).
+
+### 2026-11-03/04 — Redes sociais: Meta Ads v2 (`social-ads-insights` com `account_id`/`ad_preview`, escrita, NÃO deployada)
+- **Conta escolhida pelo cliente, mas só entre as do tenant:** `account_id` opcional no body (`^(act_)?[0-9]{1,40}$`, senão 400) entra como filtro adicional da mesma query (`tenant_id` + `windsor_connector='facebook'` + `status='active'`); id de conta de outro tenant ou inativa responde `conta_nao_conectada` (`detalhe: "conta_nao_encontrada"`), sem revelar se existe. Sem `account_id`, ordem determinística (`connected_at desc, id asc`) — antes o `limit(1)` sem `order` trocava de conta sozinho.
+- **Prévia de anúncio em iframe:** o report `ad_preview` exige `ad_id` (400 sem ele), para nunca devolver as URLs de prévia da conta inteira; devolve URLs geradas pelo Meta (`business.facebook.com/ads/api/preview_iframe.php`, válidas 24 h) que o front só põe no `src` do `<iframe>` se forem `https:` (`javascript:`/`data:` do provedor são descartados); links e imagens só `http(s):`. O iframe é cross-origin sem `sandbox` (a página do Meta precisa dos próprios scripts; a origem do app fica isolada pela same-origin policy), `referrerPolicy="no-referrer"`. Cache de 6 h só em memória (react-query); nada gravado no banco nem em `localStorage`. O `ad_preview_shareable_link` (fb.me, exige login no Business Suite) saiu da UI.
+- **Seletor de conta no cliente:** a escolha fica em `localStorage` por tenant (só o `account_id`, que não é segredo) e é revalidada contra `api.social_accounts_list` antes de ser enviada.
+
+### 2026-11-03 — Redes sociais: leitura de Meta Ads v1 (`social-ads-insights`, em produção desde 2026-11-03)
 - **Mesmo modelo da `social-insights`:** `verify_jwt = true`, tenant do body validado em `core.tenant_users`/`core.system_admins`, conta `facebook` `active` do tenant via service role, `select_accounts=<account_id>` como isolamento, uma chamada à Windsor por invocação, chave só no secret e redigida (`semChave` também remove a chave URL-encoded e qualquer `api_key=`).
 - **Textos de erro da Windsor não vazam:** `account_not_available` e `no_accounts_configured` listam, no corpo da Windsor, as contas conectadas de todos os tenants e o usuário Windsor da plataforma; a função intercepta os dois códigos antes de qualquer repasse e responde só `{ account_id }` do próprio tenant. `windsor_http_*` repassa no máximo 300 chars redigidos.
 - **Filtros validados:** `campaign_id`/`adset_id` só `[0-9]{1,40}` (400 `campos_obrigatorios`), aplicados na função após a resposta da Windsor (a Windsor não recebe filtro do cliente).
