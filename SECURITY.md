@@ -2104,7 +2104,7 @@ Ações que geram audit log obrigatório:
 
 ## 26. Changelog
 
-### 2026-11-04 — Redes sociais: Google Ads na `social-ads-insights` (escrito, NÃO deployado nem commitado)
+### 2026-11-04 — Redes sociais: Google Ads na `social-ads-insights` (commit 596ae14; fn v3 em produção desde 2026-11-04 15:05 UTC)
 - **Mesmo modelo, provedor pelo body:** `verify_jwt = true`, tenant do body validado em `core.tenant_users`/`core.system_admins`, conta `active` do tenant via service role, `select_accounts=<account_id>`, uma chamada à Windsor por invocação, chave só no secret e redigida. O `connector` do body só aceita `facebook` ou `google_ads` (`resolverProvedorAds`; qualquer outro valor → 400 `connector_invalido` antes de qualquer consulta), e a conta é lida com `windsor_connector` igual ao connector pedido: um tenant não lê conta Google com `connector: "facebook"` nem vice-versa.
 - **Filtros validados por provedor:** `campaign_id`/`adset_id`/`ad_id` (Meta) e `campaign_id`/`ad_group_id` (Google) só como dígitos `[0-9]{1,40}`, aplicados na função sobre as linhas da conta do tenant; filtro obrigatório ausente (Meta `ad_preview` sem `ad_id`) continua 400. `account_id` com hífens (`999-999-9999`) aceito só para Google (`validarAccountIdGoogle`); `act_` só para Meta.
 - **Erros da Windsor nunca repassados:** `no_accounts_configured`/`account_not_available` viram `conta_indisponivel_windsor` (os textos da Windsor listam contas de outros tenants); demais respostas passam por `semChave` e são truncadas.
