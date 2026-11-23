@@ -1068,7 +1068,7 @@ Leitura só (migration `20261028120000_account_overview_rpc`). Nenhum writer.
 
 Mudou coluna/semântica de qualquer tabela acima (ex.: limites novos em `core.plans`) → revisar a RPC e o contrato do front.
 
-## Fila de jornadas — espera por pré-condição (Fase 0, 29/10/2026, em produção)
+## Fila de jornadas — espera por pré-condição (Fase 0, 29/10/2026) e espera explícita (Fase 0.5, 24/11/2026), em produção
 
 Contrato completo em `docs/JOURNEY_ISOLATION.md`. **Antes de mudar:** status enviáveis de campanha, valores de `wait_reason`, chave de dedupe `enrollment_<id>` ou a semântica de `next_execution_at` → revisar todos os readers e writers abaixo.
 
@@ -1077,8 +1077,19 @@ Contrato completo em `docs/JOURNEY_ISOLATION.md`. **Antes de mudar:** status env
 | Papel | Quem |
 |---|---|
 | Writers (espera) | `journeys.apply_enrollment_blocker`, chamada por `enqueue_ready_waits`, `sweep_orphan_enrollments` e pela trigger `trg_execution_campaign_not_ready` (AFTER INSERT em `journey_executions`, `send_email` + `campaign_not_ready`) |
-| Writers (limpeza) | `journeys.release_campaign_waits`, chamada pela trigger `trg_campaign_release_journey_waits` e pela rede de segurança do `enqueue_ready_waits`; `journeys.fail_campaign_waits`, chamada pela trigger `trg_campaign_delete_journey_waits` e pelo cron; trigger `trg_enrollment_clear_stale_wait`, quando o worker avança de nó ou encerra a inscrição |
-| Readers | `enqueue_ready_waits` e `sweep_orphan_enrollments` (ignoram quem tem espera); `journeys.enrollment_blocker` (diagnóstico); futuro "agora nesta etapa" do canvas (Fase 1) |
+| Writers (limpeza) | `journeys.release_campaign_waits` (só jornadas `active`), chamada pela trigger `trg_campaign_release_journey_waits` e pela rede de segurança do `enqueue_ready_waits`; `journeys.fail_campaign_waits`, chamada pela trigger `trg_campaign_delete_journey_waits` e pelo cron; `journeys.consume_due_wait` (Fase 0.5); trigger `trg_enrollment_wait_state`, quando a inscrição sai do nó da espera ou é encerrada (substituiu `trg_enrollment_clear_stale_wait` em 24/11/2026) |
+| Readers | `enqueue_ready_waits` (acorda timer/send_spacing vencidos; ignora as demais esperas) e `sweep_orphan_enrollments` (ignora quem tem espera); `journeys.consume_due_wait`; `journeys.enrollment_blocker` (diagnóstico); futuras contagens por nó e prévia de ativação (Ondas 3 e 4) |
+
+**`journeys.journey_enrollments.wait_node_id` / `wait_until` e os valores `timer` / `send_spacing` de `wait_reason`** (Fase 0.5, R67)
+
+| Papel | Quem |
+|---|---|
+| Writers (espera) | `journeys.start_enrollment_wait` (worker, Onda 2); trigger `trg_enrollment_wait_state` / `trg_enrollment_wait_state_ins`, que converte a escrita legada (`next_execution_at` num nó `wait`, feita pelo worker em `processJourneyNode.ts` ~linha 361 e pela edge `process-journey` sem chamador) em `timer` e mantém o espelho `next_execution_at = wait_until`; `apply_enrollment_blocker`, `trg_execution_campaign_not_ready` (gravam `wait_node_id` em `campaign_not_ready`); script `supabase/scripts/2026-11-24_journey_timer_wait_conversion.sql` (uma vez, foto em `journeys._wait_conv_20261124`) |
+| Writers (limpeza) | `journeys.consume_due_wait` (CAS no nó; timer grava `wait_completed`); trigger (saída do nó, status não active, `next_execution_at` zerado pelo legado); `release_campaign_waits`, `fail_campaign_waits`, `apply_enrollment_blocker` (fatal) |
+| Readers | `journeys.enqueue_ready_waits` (índice `idx_enrollments_wait_due`; payload `wait_node_id`/`wait_until`); `journeys.consume_due_wait`; o worker atual continua lendo o espelho `next_execution_at` (`resolveResumedWait`, R65); futuras RPCs de contagem/prévia (índice `idx_enrollments_journey_node_active`) |
+| Rollback | `supabase/scripts/2026-11-24_journey_wait_state_rollback.sql`: timer/send_spacing voltam a ser legado com o mesmo `next_execution_at` |
+
+**Antes de mudar `next_execution_at`:** durante a transição ele é espelho de `wait_until` para timer/send_spacing. Escrever só um dos dois funciona (a trigger sincroniza), mas zerar `next_execution_at` no mesmo nó encerra a espera.
 
 **Portão `journeys.evaluate_enrollment_blocker`**
 - Lê `journeys.journeys.status`, o nó atual (versão congelada → grafo vivo) e `email.email_campaigns.status`.
@@ -1097,9 +1108,10 @@ Contrato completo em `docs/JOURNEY_ISOLATION.md`. **Antes de mudar:** status env
 - O claim (`claim_next_jobs`/`claim_next_job`) é compartilhado com o worker `email-campaign`, com a mesma assinatura e retorno.
 - A reserva anti-inanição vale por `job_type`.
 - A dedupe de `process_enrollment` usa a chave única `enrollment_<id>`, nos produtores `enqueue_ready_waits` e `sweep_orphan_enrollments`.
+- `enqueue_ready_waits` cria no máximo 100 `process_enrollment` por jornada por chamada (200/min) desde a Fase 0.5. O payload traz `reason: 'wait_due'`, `wait_node_id` e `wait_until`, e nenhum consumidor lê `reason`.
 
 **Permissões**
-- Todas as funções de `journeys` só têm EXECUTE para `postgres` e `service_role`.
+- Todas as funções de `journeys` só têm EXECUTE para `postgres` e `service_role`. Inclui `consume_due_wait`, `start_enrollment_wait` e `trg_enrollment_wait_state` (SECURITY DEFINER, porque o navegador também faz UPDATE em `journey_enrollments`).
 - Exceção: `journeys.safe_timestamptz`, usada pela trigger SECURITY INVOKER `trg_journey_status_lifecycle` na ativação pelo navegador.
 - Ver R63.
 
