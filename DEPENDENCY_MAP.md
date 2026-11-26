@@ -1040,11 +1040,20 @@ ou RLS destas tabelas precisa conferir estes leitores.
 
 ### workers/shared/src/sentry.ts — Helper compartilhado
 
-- **Callers:**
-  - `workers/journeys/src/index.ts` — `initSentryWorker` no startup, `flushSentry` no shutdown. Primeiro consumer.
-  - Workers futuros podem importar `captureWorkerException` para alertar incidentes.
-- **Behavior:** No-op silencioso se `SENTRY_DSN_WORKERS` ausente. Importação dinâmica de `@sentry/node` — workers que não chamam Sentry não pagam custo de bundle.
-- **Env vars:** `SENTRY_DSN_WORKERS`, `SENTRY_ENVIRONMENT`, `RELEASE_SHA` (todos opcionais — sem DSN, handler escreve em `platform_alert_state` + log e segue).
+- **Boot (`startWorkerSentry(nome)` ou `initSentryWorker`), um por serviço Railway (D48, 2026-11-26):**
+  - `workers/journeys/src/index.ts` — `initSentryWorker` (serviços `journeys-worker` e `plataform-scheduler`), `flushSentry` no shutdown.
+  - `workers/ingestion/src/index.ts` (`ingestion-worker`), `workers/historical-sync/src/index.ts` (`historical-sync-worker`), `workers/email-campaign/src/index.ts` (`email-campaign-worker`), `workers/journeys-event/src/index.ts` (`journeys-event-worker`), `workers/analytics/src/index.ts` (`analytics-worker` e `analytics-backfill-worker`), `workers/pull-sync/src/index.ts` (`pull-sync-worker`), `workers/email-sync/src/index.ts` (`email-nylas-worker`) — `startWorkerSentry` no início de `main()`; `config_error`, `db_init_error` e `fatal_error` reportam como `fatal` e fazem `flushSentry` antes do `process.exit(1)`.
+- **Emissores (`reportWorkerError` = só Sentry, a linha de log fica no chamador; `captureWorkerException` = log + Sentry):**
+  - `workers/shared/src/process-guards.ts` — `unhandled_rejection` (error) e `uncaught_exception` (fatal, flush antes de sair). Os handlers equivalentes do SDK estão desligados para não duplicar.
+  - Falha de job/sincronização: `job_failed` (ingestion `worker.ts`, historical-sync `loop.ts`, email-sync `loop.ts`, analytics `loop.ts`, journeys-event `index.ts` — retry = warning, blocked = error), `job_handler_error` e `unknown_job_type` (email-campaign), `sync_failed` (pull-sync `worker.ts`), `segment_eval_job_error` (analytics `segment-eval-worker.ts`). Agrupamento por `groupBy` (handler/job_type/provider) + mensagem normalizada.
+  - Falha de infraestrutura do loop: `claim_error`, `loop_error`, `worker_loop_error`, `backfill_loop_error`, `segment_eval_loop_error`.
+  - `workers/journeys/src/handlers/queueHealthCheck.ts` (`queue_stall`) e `healthCheck.ts` (`event_driven_health`) — `captureWorkerException` com `dedupedByCaller: true` (o dedup já está em `worker.queue_alert_state` / `analytics.platform_alert_state`).
+  - `workers/journeys/src/handlers/processJourneyNode.ts` — `journey_send_cascade_guard_*`.
+- **Cota (`allowSentryEvent`):** todo evento passa por ela, inclusive o que o SDK captura sozinho (`beforeSend`). Por processo: 5 por chave (alert_type + mensagem normalizada) a cada 10 min, 60 por 10 min, 10 por chave por dia, 30 por dia. `dedupedByCaller` pula só os limites diários.
+- **Tags de todo evento:** `worker_name`, `service` (`RAILWAY_SERVICE_NAME`), `replica` (`RAILWAY_REPLICA_ID`, também `server_name`), `version` (12 primeiros de `RAILWAY_GIT_COMMIT_SHA`, que vira o `release`), `alert_type`, e `handler`/`job_type`/`provider`/`tenant_id` quando houver.
+- **Behavior:** No-op silencioso se `SENTRY_DSN_WORKERS` ausente (loga `sentry_disabled`, worker sobe normal). Importação dinâmica de `@sentry/node`.
+- **Env vars:** `SENTRY_DSN_WORKERS` (nos 10 serviços), `SENTRY_ENVIRONMENT`, `RELEASE_SHA` (opcionais), `RAILWAY_*` (injetadas pelo Railway).
+- **Não reporta (só log):** erros por item dentro dos handlers (ex.: `[segment-evaluator] Unknown operator`, envio individual de email), `job_blocked*` esperados (token expirado, `MapperError`).
 
 ---
 
