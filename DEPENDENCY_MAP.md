@@ -27,7 +27,8 @@ Frontend e worker compartilham `workers/shared/src/email-renderer-version.ts`. P
 
 | Tabela-fila | Worker consumidor | Claim RPC | Job types aceitos |
 |---|---|---|---|
-| `integrations.jobs` | ingestion-worker | `worker.claim_jobs(worker_id, handler_list)` | `commerce:process_batch`, `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment` |
+| `integrations.jobs` | ingestion-worker (dono único de `eduzz:*` de webhook desde 2026-11-04, R68) | `worker.claim_jobs(worker_id, handler_list)` | `commerce:process_batch`, `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment`, `eduzz:process_commission`, `eduzz:process_learning`, `eduzz:ping`, `eduzz:unknown`, `emailify:create_campaign` |
+| `integrations.jobs` | integrations-worker (edge, disparada por `integrations.invoke_worker()` a cada webhook) | `worker.claim_jobs(p_provider NULL, p_handlers = handlers sendgrid)` | só `sendgrid:*` |
 | `integrations.jobs` | historical-sync-worker | `worker.claim_jobs(worker_id, handler_list)` | `eduzz:import_sales_page`, `eduzz:import_products`, `eduzz:enrich_sales`, `eduzz:enrich_invoice`, `eduzz:get_sales_count`, `sympla:historical_sync`, `typeform:sync_forms`, `typeform:sync_responses`, `typeform:enrich_themes`, `typeform:promote_forms`, `typeform:promote_responses`, `typeform:backfill_settings` |
 | `integrations.jobs` | email-sync-worker | `worker.claim_jobs(worker_id, handler_list)` | `nylas:deep_sync`, `nylas:deep_sync_folder`, `nylas:initial_sync`, `nylas:apply_message_ops`, `nylas:sync_folders`, `cache_attachments_scan`, `cache_attachment_batch`, `cleanup_jobs` |
 | `integrations.sync_schedules` | pull-sync-worker | `integrations.claim_sync_schedules(worker_id, providers)` | N/A (schedule-based por provider: `sympla`, `doare`, `typeform`) |
@@ -515,7 +516,7 @@ Fonte ÚNICA da seleção do backfill — mudar aqui muda worker, preview e dry-
   - `src/pages/admin/ProductCustomers.tsx:350` — product customers
   - `src/components/segments/useSegmentOptions.ts:21` — segment product options
   - `workers/analytics/src/handlers/linkProducts.ts:97` — product linking pipeline
-  - `supabase/functions/eduzz-processor-worker/handlers/eduzz.ts:224` — lookup by `external_transaction_id`
+  - `supabase/functions/eduzz-processor-worker/handlers/eduzz.ts:224` — lookup by `external_transaction_id` (código morto: o `index` dessa função é um stub 410)
   - SQL views/functions: `build_segment_where_clause_v2`, `v_segment_base` — segment evaluation
 - **Regra:** Idempotência via `(tenant_id, source_name, external_transaction_id)`. ON CONFLICT DO UPDATE apenas para transições válidas de status.
 
