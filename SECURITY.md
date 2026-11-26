@@ -1,7 +1,7 @@
 # KreatorsHub — Security Architecture & Compliance Roadmap
 
 ## Estado: Sprint 5 — Completo ✅ | Auditoria factual: 2026-03-20
-## Última atualização: 2026-11-05 (§26: dados sociais — fase 2: edge fn social-ingest com Bearer service role ou JWT role=service_role; fila integrations.jobs; RPCs de fila só service_role); 2026-11-05 (§26: Ads Intelligence — schema `ads` com RLS por tenant e FORCE, escrita só por RPC `security definer`, `api.ads_*` R56, edge fn `ads-sync` com Bearer service role ou JWT `role=service_role`, bloco R63 em todas as migrations, schema `ads` exposto ao PostgREST); 2026-11-04 (§26: dados sociais em tabelas nossas — fase 1: migrations 20261105120000/120100 escritas, RLS/RPCs só service role; provider_source); 2026-11-04 (§26: Redes sociais, histórico diário `integrations.social_account_daily` + edge fn `social-snapshot` com Bearer service role; `account_id` validado na `social-insights`)
+## Última atualização: 2026-11-26 (jornadas Onda 3: 4 RPCs `api.journey_*`/`campaign_release_preview` R56/R63, tabela `journeys.journey_pause_windows` só service role); 2026-11-05 (§26: dados sociais — fase 2: edge fn social-ingest com Bearer service role ou JWT role=service_role; fila integrations.jobs; RPCs de fila só service_role); 2026-11-05 (§26: Ads Intelligence — schema `ads` com RLS por tenant e FORCE, escrita só por RPC `security definer`, `api.ads_*` R56, edge fn `ads-sync` com Bearer service role ou JWT `role=service_role`, bloco R63 em todas as migrations, schema `ads` exposto ao PostgREST); 2026-11-04 (§26: dados sociais em tabelas nossas — fase 1: migrations 20261105120000/120100 escritas, RLS/RPCs só service role; provider_source); 2026-11-04 (§26: Redes sociais, histórico diário `integrations.social_account_daily` + edge fn `social-snapshot` com Bearer service role; `account_id` validado na `social-insights`)
 ## Versão: 2.0
 
 ---
@@ -2103,6 +2103,14 @@ Ações que geram audit log obrigatório:
 # PARTE G — HISTÓRICO
 
 ## 26. Changelog
+
+### 2026-11-26 — Jornadas: prévia de ativação/liberação e inclusão da pausa (migration `20261126174321`, APLICADA; ARCHITECTURE R71/R72)
+
+- **4 RPCs novas em `api`** (`journey_activation_preview`, `campaign_release_preview`, `journey_pause_catchup_preview`, `journey_pause_catchup_enroll`): `security definer`, `set search_path = ''`, tenant por `app_auth.assert_tenant_access` (R56; o erro vira `42501`), jornada/campanha de outro tenant = `P0002` (não vaza existência), EXECUTE só `authenticated`/`service_role`. As 3 prévias são somente leitura (qualquer membro, inclusive viewer). A inclusão escreve: exige membro não-viewer ou system admin (`42501`), jornada `event_entry` `active` (`55000`), advisory lock por jornada; inscreve só pela regra R71 e grava `context_json.catchup.by = auth.uid()`.
+- **Internas só backend:** `journeys.event_entry_check`, `event_entry_decisions`, `enroll_from_event`, `sends_reachable_without_wait`, `pause_catchup_candidates`, `preview_local_ts` e a trigger `trg_journey_record_pause_window` (security definer). `revoke all … from public, anon, authenticated`; `grant execute` a `service_role` (o worker usa `postgres`).
+- **`journeys.journey_pause_windows`:** RLS ligada sem política, `revoke all` de public/anon/authenticated, `select/insert/update/delete` só `service_role`.
+- **Bloco R63** no fim da migration: aborta se anon executa qualquer função nova, se authenticated executa alguma interna, se falta `security definer`/`search_path` vazio, ou se anon/authenticated leem a tabela de janelas.
+- **Verificado em produção (26/11):** anon → `permission denied for function`; authenticated de outro tenant → `42501 tenant_access_denied` nas 4 RPCs; authenticated sem EXECUTE em `enroll_from_event` e sem SELECT na tabela de janelas. Testes: `supabase/tests/journey_wave3_roles.sql`.
 
 ### 2026-11-05 — Redes sociais: ingestão em tabelas nossas — fase 2 (migration `20261105130000`, edge fn `social-ingest`; escrito, NÃO aplicado/deployado)
 

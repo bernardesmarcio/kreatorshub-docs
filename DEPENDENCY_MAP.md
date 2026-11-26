@@ -3,7 +3,7 @@
 > **REGRA R37**: Antes de alterar qualquer item listado aqui, verificar TODOS os readers/writers.
 > Atualizar este arquivo sempre que adicionar novo consumidor.
 >
-> Gerado em: 2026-03-19 · Última atualização: 2026-11-05 (dados sociais fase 2: edge fn `social-ingest` passa a writer de `social_media_posts`/`_post_daily`/`social_audience_snapshot`/`social_ingest_runs`/breakdown de `social_account_daily`/`social_accounts.profile`; fila `social:ingest` (migration `20261105130000`); gancho na `social-accounts-sync`; `_shared/adsBreakdowns.ts`/`adsWindows.ts`; escrito, NÃO aplicado/deployado); 2026-11-05 (Ads Intelligence: schema `ads`, edge `ads-sync`, RPCs `api.ads_*`, Insights Center); 2026-11-04 (dados sociais fase 1: `integrations.social_media_posts`/`_post_daily`/`social_audience_snapshot`/`social_ingest_runs`, `ads.metrics_window`, `_shared/socialProvider.ts` + `windsorProvider.ts`; migrations escritas, NÃO aplicadas); 2026-10-29 (consentimento manual: `api.set_email_consent` limpa grupos inativos; push: 2026-10-20, não aplicado) · Frontend mobile: 2026-10-21 (casca e navegação, kit mobile, leitores novos; acompanha ARCHITECTURE v10.0 §25)
+> Gerado em: 2026-03-19 · Última atualização: 2026-11-26 (Fase 0.5 Onda 3 de jornadas: regra de entrada por evento em SQL — `journeys.event_entry_check`/`event_entry_decisions`/`enroll_from_event`, chamadas pelo `processEventJob` e pela inclusão da pausa; `journeys.journey_pause_windows`; prévias `api.journey_activation_preview`, `api.campaign_release_preview`, `api.journey_pause_catchup_preview`; inclusão `api.journey_pause_catchup_enroll`; migration `20261126174321`, R71/R72); 2026-11-05 (dados sociais fase 2: edge fn `social-ingest` passa a writer de `social_media_posts`/`_post_daily`/`social_audience_snapshot`/`social_ingest_runs`/breakdown de `social_account_daily`/`social_accounts.profile`; fila `social:ingest` (migration `20261105130000`); gancho na `social-accounts-sync`; `_shared/adsBreakdowns.ts`/`adsWindows.ts`; escrito, NÃO aplicado/deployado); 2026-11-05 (Ads Intelligence: schema `ads`, edge `ads-sync`, RPCs `api.ads_*`, Insights Center); 2026-11-04 (dados sociais fase 1: `integrations.social_media_posts`/`_post_daily`/`social_audience_snapshot`/`social_ingest_runs`, `ads.metrics_window`, `_shared/socialProvider.ts` + `windsorProvider.ts`; migrations escritas, NÃO aplicadas); 2026-10-29 (consentimento manual: `api.set_email_consent` limpa grupos inativos; push: 2026-10-20, não aplicado) · Frontend mobile: 2026-10-21 (casca e navegação, kit mobile, leitores novos; acompanha ARCHITECTURE v10.0 §25)
 
 ---
 
@@ -447,7 +447,7 @@ Antes de implementar qualquer novo pipeline, responder:
 ### journeys.processing_jobs
 
 - **Producers:**
-  - `workers/journeys-event/src/handlers/processEventJob.ts:221` — `process_enrollment`
+  - `journeys.enroll_from_event(journey, event, extra, reason)` (2026-11-26, R71) — `process_enrollment` prioridade 8 no MESMO comando do INSERT da inscrição. Callers: `workers/journeys-event/src/handlers/processEventJob.ts` (reason `event_entry`) e `api.journey_pause_catchup_enroll` (reason `pause_catchup`). Antes era o `sql.begin` do próprio `processEventJob.ts`.
   - `workers/journeys-event/src/handlers/processBackfillJob.ts` (`processBackfillJob`, CTE `jobs`) — `process_enrollment` priority 3 com `reason='backfill'` (no mesmo statement do INSERT da inscrição)
   - `supabase/functions/check-journey-entries/index.ts:364` — via `journeys.enqueue_job` RPC
   - `supabase/functions/trigger-form-journey/index.ts:319` — via `journeys.enqueue_job` RPC
@@ -482,6 +482,45 @@ Fonte ÚNICA da seleção do backfill — mudar aqui muda worker, preview e dry-
   - `api.preview_journey_backfill(tenant_id, journey_id, from)` — contagem do diálogo de ativação (`src/pages/admin/JourneyBuilder.tsx`, só jornadas por evento)
 - **Lê:** `journeys.journeys` (trigger_config.conditions), `commerce.products`, `commerce.transactions` (purchase: `status='paid'`), `journeys.journey_events` (demais eventos), `crm.parties` (party por email quando a fonte não tem), `journeys.journey_enrollments` (dedupe por email/party, qualquer status).
 
+### journeys.event_entry_check() / event_entry_decisions() / enroll_from_event() (2026-11-26, R71)
+
+Regra de entrada por evento do push path, numa fonte só (antes em memória no `processEventJob.ts`). Mudar a regra aqui muda o worker e a inclusão da pausa juntos. O backfill ("incluir base") continua com regra própria em `backfill_batch_candidates()` (D52).
+
+- **`event_entry_check(tenant, journey, allow_reentry, trigger_config, email, event_data)`** → NULL ou `filtered_product|filtered_campaign|filtered_link|already_enrolled`. Lê `commerce.products` (produto do evento por id ou nome, só do tenant) e `journeys.journey_enrollments` (email exato, qualquer status, só sem `allow_reentry`).
+  - **Callers:** `event_entry_decisions()`, `pause_catchup_candidates()`.
+- **`event_entry_decisions(event_id, tenant_id)`** → `(journey_id, decision)` para cada jornada `active` `event_entry` do mesmo `event_type` (`idx_journeys_event_routing`); `outside_window` se o evento é anterior a `last_activated_at`.
+  - **Caller:** `workers/journeys-event/src/handlers/processEventJob.ts` (1 query por evento).
+- **`enroll_from_event(journey, event, extra_context, job_reason)`** → id ou NULL (inscrição ativa já existe). Writer de `journey_enrollments` (versão mais recente, context `enrolled_via=event_worker_push` + `event_*` + `trigger_payload` + extra) e de `processing_jobs`.
+  - **Callers:** `processEventJob.ts`, `api.journey_pause_catchup_enroll`.
+- Todas só `postgres`/`service_role` (R63).
+
+### journeys.journey_pause_windows (2026-11-26, R72)
+
+Janela `[paused_at, resumed_at)` de cada pausa. `trg_journey_status_lifecycle` zera `paused_at` ao reativar; sem esta tabela a janela se perdia.
+
+- **Writers:**
+  - Trigger `trg_journey_record_pause_window` (AFTER UPDATE OF status em `journeys.journeys`, `paused` → `active` com `paused_at`) — INSERT, ON CONFLICT `(journey_id, paused_at)` DO NOTHING; erro vira WARNING (nunca derruba a ativação).
+  - `api.journey_pause_catchup_enroll` — UPDATE `catchup_at`/`catchup_by`/`catchup_enrolled`.
+  - Migration `20261126174321` — semente `audit_backfill` a partir de `audit.trail` (90 dias).
+- **Readers:** `api.journey_pause_catchup_preview`, `api.journey_pause_catchup_enroll`.
+- Sem acesso de anon/authenticated (RLS ligada, sem política, REVOKE).
+
+### journeys.pause_catchup_candidates() (2026-11-26, R72)
+
+Quem entrou no gatilho durante a pausa: `journey_events` do `trigger_event_type` em `[from, to)` (`idx_journey_events_window`) avaliados por `event_entry_check` + exclusões da inclusão tardia.
+
+- **Lê:** `journeys.journeys`, `journeys.journey_events`, `journeys.journey_enrollments` (já inscrito por email minúsculo/party; ativa; posterior ao evento; mesmo `event_id`), `commerce.transactions` (estorno: `refunded|chargeback|cancelled`), `email.unsubscribes` + `email.unsubscribe_groups` (global ou grupo inativo), `email.suppression_list` (ativa, não vencida), `commerce.products` (via a regra).
+- **Callers:** `api.journey_pause_catchup_preview`, `api.journey_pause_catchup_enroll`.
+
+### Prévias de ativação/liberação (2026-11-26, Onda 3)
+
+- **`api.journey_activation_preview(tenant, journey)`** (somente leitura): lê `journey_enrollments` ativas (todas, inclusive legadas sem `wait_reason`; `idx_enrollments_journey_node_active`), `journey_versions`, `journey_executions` (última success no nó atual; `idx_executions_journey_node_status`), `email.email_campaigns`, `journeys.enrollment_node()` e `journeys.sends_reachable_without_wait()`.
+  - **Caller:** `src/components/journey-builder/journey-activation.ts` (`fetchActivationPreview`) ← `JourneyActivationDialog` (builder `JourneyCanvasBuilder`, lista `Journeys.tsx`, `JourneyStatusSwitch`), só jornada pausada.
+- **`api.campaign_release_preview(tenant, campaign)`** (somente leitura): lê `journey_enrollments` (`campaign_not_ready` por `idx_enrollments_wait_ref` + legadas no nó `send_email` da campanha), `journeys.journeys`/`journey_versions`, `sends_reachable_without_wait()`.
+  - **Caller:** `src/components/email/campaign-release-confirm.ts` (`confirmCampaignRelease`) ← `CampaignEditor.tsx` (`saveHtmlMutation`, `savePlainTextMutation`, `saveRawHtmlMutation`, só ao promover draft → ready no salvar explícito) e `CampaignSend.tsx` (`handleSaveForAutomation`, `requestSend`, cancelamento de agendado).
+- **`api.journey_pause_catchup_preview` / `api.journey_pause_catchup_enroll`** — caller `journey-activation.ts` (`fetchPauseCatchupPreview`, `runPauseCatchup`) ← `JourneyActivationDialog` (checkbox desmarcado por padrão; inclusão só depois da reativação gravada).
+- **`journeys.sends_reachable_without_wait(nodes, edges, from, assume_sendable)`** — interna (sem EXECUTE para authenticated); lê `email.email_campaigns`.
+
 ### journeys.journeys.enroll_window_from (2026-10-16)
 
 - **Writer:** `journeys.trg_journey_status_lifecycle` (BEFORE UPDATE, transição → `active`): `enroll_from_date` > `1970-01-01` (enroll_existing) > `last_activated_at`.
@@ -497,7 +536,7 @@ Fonte ÚNICA da seleção do backfill — mudar aqui muda worker, preview e dry-
   - `workers/journeys/src/handlers/checkEventEntries.ts:196` — INSERT: event-triggered enrollment
   - `workers/journeys/src/handlers/checkSegmentEntries.ts:224` — INSERT: segment-triggered enrollment
   - `workers/journeys/src/handlers/checkFormEntries.ts:166` — INSERT: form-triggered enrollment
-  - `workers/journeys-event/src/handlers/processEventJob.ts:196` — INSERT: event worker enrollment
+  - `journeys.enroll_from_event()` — INSERT ON CONFLICT DO NOTHING: event worker enrollment (caller `workers/journeys-event/src/handlers/processEventJob.ts`) e inclusão da pausa (caller `api.journey_pause_catchup_enroll`, `context_json.catchup`) — R71/R72, 2026-11-26
   - `workers/journeys-event/src/handlers/processBackfillJob.ts` (CTE `ins`) — INSERT … SELECT FROM `journeys.backfill_batch_candidates()` ON CONFLICT DO NOTHING: backfill enrollment (`context_json.enrolled_via='backfill'`)
   - `supabase/functions/check-journey-entries/index.ts:309` — INSERT: edge function enrollment
   - `supabase/functions/trigger-form-journey/index.ts:238,253,269,285` — UPSERT: form-triggered edge function
@@ -508,6 +547,9 @@ Fonte ÚNICA da seleção do backfill — mudar aqui muda worker, preview e dry-
   - `workers/journeys/src/handlers/checkSegmentEntries.ts:96,187` — SELECT dedup
   - `workers/journeys/src/handlers/checkFormEntries.ts:81` — SELECT dedup
   - `journeys.backfill_batch_candidates()` — NOT EXISTS por `lower(customer_email)` (índice `idx_journey_enrollments_journey_email_lower`) e por `party_id`
+  - `journeys.event_entry_check()` — "já inscrito" por email exato sem `allow_reentry` (push path e inclusão da pausa)
+  - `journeys.pause_catchup_candidates()` — já inscrito por email minúsculo/party, ativa, posterior ao evento, mesmo `event_id`
+  - `api.journey_activation_preview` / `api.campaign_release_preview` — prévias (somente leitura), contam as legadas sem `wait_reason`
   - `workers/journeys/src/handlers/processJourneyNode.ts:57,141,1707` — SELECT by id, status, context
   - `supabase/functions/check-journey-entries/index.ts:116` — SELECT dedup
   - `src/pages/admin/JourneyAnalytics.tsx:246-288` — SELECT for analytics display
