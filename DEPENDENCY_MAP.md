@@ -22,6 +22,8 @@ Frontend e worker compartilham `workers/shared/src/email-renderer-version.ts`. P
 
 > **REGRA R33**: Job enfileirado na tabela/worker errado fica pending infinitamente sem erro.
 > Antes de enfileirar: (1) confirmar a tabela-fila correta, (2) confirmar que o job_type está na allowlist do worker consumidor.
+>
+> **REGRA R70 (2026-11-26)**: a fonte de verdade de "quem consome cada job_type (e sob qual `provider`)" é o registro `workers/shared/src/jobOwnership.ts` (`JOB_OWNERS`). Esta tabela é o resumo legível. Ingestion, historical-sync, email-campaign e journeys não sobem se reivindicarem tipo não declarado ou de outro dono, ou se faltar um provider dos seus tipos (`assertJobOwnership`). O teste `workers/journeys/src/__tests__/jobOwnership.test.ts` compara o registro com o código de todos os consumidores (workers e Edge Functions) e com todo par literal `(handler, provider)` enfileirado em `integrations.jobs`. O monitor de filas (`worker.queue_stall_report` + `queueHealthCheck`, a cada 5 min no platform-scheduler) alerta job vencido sem dono após 15 min.
 
 ### Roteamento por tabela-fila
 
@@ -30,6 +32,9 @@ Frontend e worker compartilham `workers/shared/src/email-renderer-version.ts`. P
 | `integrations.jobs` | ingestion-worker (dono único de `eduzz:*` de webhook desde 2026-11-04, R68) | `worker.claim_jobs(worker_id, handler_list)` | `commerce:process_batch`, `eduzz:process_invoice`, `eduzz:process_contract`, `eduzz:process_cart_abandonment`, `eduzz:process_commission`, `eduzz:process_learning`, `eduzz:ping`, `eduzz:unknown`, `emailify:create_campaign` |
 | `integrations.jobs` | integrations-worker (edge, disparada por `integrations.invoke_worker()` a cada webhook) | `worker.claim_jobs(p_provider NULL, p_handlers = handlers sendgrid)` | só `sendgrid:*` |
 | `integrations.jobs` | historical-sync-worker | `worker.claim_jobs(worker_id, handler_list)` | `eduzz:import_sales_page`, `eduzz:import_products`, `eduzz:enrich_sales`, `eduzz:enrich_invoice`, `eduzz:get_sales_count`, `sympla:historical_sync`, `typeform:sync_forms`, `typeform:sync_responses`, `typeform:enrich_themes`, `typeform:promote_forms`, `typeform:promote_responses`, `typeform:backfill_settings` |
+| `integrations.jobs` | nylas-sync (edge) | `worker.claim_jobs(p_provider='nylas', p_handlers NULL)` — **sem filtro de handler**: reivindica também os tipos do email-sync-worker (D47) | `nylas:sync_message`, `nylas:update_message`, `nylas:initial_sync`, `nylas:deep_sync`, `nylas:backfill_bodies`, `nylas:grant_*`, `nylas:track_open`, `nylas:track_click`, `nylas:unknown` |
+| `integrations.jobs` | apidozap / doare-sync (edge) | `worker.claim_jobs(p_provider='apidozap'|'doare')` | `apidozap:*` / `doare:sync_donations` |
+| `integrations.jobs` | ads-sync, ads-digest, ads-actions, social-ingest (edge) | `worker.claim_jobs(p_provider NULL, p_handlers=[1 handler])` | `ads:sync`, `ads:digest`, `ads:action`, `social:ingest` |
 | `integrations.jobs` | email-sync-worker | `worker.claim_jobs(worker_id, handler_list)` | `nylas:deep_sync`, `nylas:deep_sync_folder`, `nylas:initial_sync`, `nylas:apply_message_ops`, `nylas:sync_folders`, `cache_attachments_scan`, `cache_attachment_batch`, `cleanup_jobs` |
 | `integrations.sync_schedules` | pull-sync-worker | `integrations.claim_sync_schedules(worker_id, providers)` | N/A (schedule-based por provider: `sympla`, `doare`, `typeform`) |
 | `analytics.processing_jobs` | analytics-worker APENAS | `analytics.claim_next_jobs(worker_id, batch)` | `refresh_features`, `refresh_rfm`, `refresh_reactivation`, `refresh_segments`, `compute_clusters`, `compute_lookalikes`, `compute_cluster_subgroups`, `sync_customers`, `compute_lookalike_audience`, `link_products`, `project_traits`, `sync_field_definitions` |
@@ -48,6 +53,7 @@ Frontend e worker compartilham `workers/shared/src/email-renderer-version.ts`. P
 | Job sem `capability` em `integrations.jobs` | Worker filtra por capability e ignora o job | R31 |
 | `commerce:process_batch` enviado para analytics | analytics-worker não tem handler, job pending | R33 |
 | Qualquer job novo sem verificar allowlist | Pending sem erro até alguém investigar | R33 |
+| Job filho com `provider` que nenhum consumidor reivindica (ex.: `eduzz:enrich_invoice` com `provider='eduzz-processor-worker'`, 2026-09-02 → 2026-11-26, 11,4k jobs) | Pending sem erro; agora alerta `unowned` em 15 min | R68, R70 |
 
 ### Regra para novo job_type
 
@@ -56,6 +62,7 @@ Frontend e worker compartilham `workers/shared/src/email-renderer-version.ts`. P
 3. Verificar allowlist (`ENABLED_JOB_TYPES` / `ENABLED_HANDLERS` / handler map) do worker
 4. Se per-entity: verificar se unique index de coalescing não bloqueia (R32)
 5. Adicionar mapeamento nesta tabela
+6. Declarar o tipo (fila, dono, providers, limites) em `workers/shared/src/jobOwnership.ts` e rodar o teste de registro (R70)
 
 ---
 
@@ -393,6 +400,15 @@ Antes de implementar qualquer novo pipeline, responder:
 ---
 
 ## Filas
+
+### Monitor de filas paradas (R70, 2026-11-26)
+
+- **Leitor de todas as filas:** `worker.queue_stall_report(p_min_age, p_cap)` (SECURITY INVOKER, só postgres/service_role) lê `integrations.jobs`, `journeys.processing_jobs`, `journeys.event_processing_jobs`, `journeys.backfill_jobs`, `analytics.processing_jobs`, `analytics.segment_eval_queue`, `push.fila` e `core.export_jobs`. Devolve, por fila × job_type × provider, o job vencido mais antigo (`overdue`) e o claim mais antigo (`running`). Varredura por salto em índice parcial: `idx_jobs_stall_pending` e `idx_processing_jobs_stall_pending` (novos), mais os índices de claim existentes.
+- **Chamador:** platform-scheduler (`workers/journeys/src/handlers/queueHealthCheck.ts`, a cada 5 min, junto do D-CRON-3).
+- **Writer:** `worker.queue_alert_state`, uma linha por `fila|tipo|provider|motivo`, só o platform-scheduler grava.
+- **Classificação:** pelo registro `JOB_OWNERS` (`unowned` / `overdue` / `stuck_running`), com limites por tipo.
+- **Canal:** Sentry (`SENTRY_DSN_WORKERS`) mais a linha de log `queue_stall`. Sem DSN, só o log (D48).
+- **Ao mudar uma fila** (status, coluna de vencimento, nova fila): atualizar a função, o fixture `supabase/tests/queue_stall_monitor_fixture.sql` e o registro.
 
 ### integrations.jobs
 
